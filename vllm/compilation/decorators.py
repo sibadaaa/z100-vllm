@@ -266,7 +266,7 @@ def _model_hash_key(fn: Callable[..., Any]) -> str:
 def _verify_source_unchanged(
     source_info: "SourceInfo", vllm_config: VllmConfig
 ) -> None:
-    from .caching import _compute_code_hash, _compute_code_hash_with_content
+    from .caching import _compute_code_hash_with_content, _read_traced_file
 
     file_contents = {}
     for source in source_info.inlined_sources:
@@ -274,8 +274,17 @@ def _verify_source_unchanged(
         file = inspect.getfile(module)
         vllm_config.compilation_config.traced_files.add(file)
         file_contents[file] = source.content
+    logger.debug(
+        "Traced files (to be considered for compilation cache):\n%s",
+        "\n".join(sorted(file_contents)),
+    )
     expected_checksum = _compute_code_hash_with_content(file_contents)
-    actual_checksum = _compute_code_hash(set(file_contents.keys()))
+    # `source.content` comes from `inspect.getsource`, so the on-disk side must
+    # be read the same way (see `_read_traced_file`); a raw read reports every
+    # file without a trailing newline as modified.
+    actual_checksum = _compute_code_hash_with_content(
+        {file: _read_traced_file(file) for file in file_contents}
+    )
     if expected_checksum != actual_checksum:
         raise RuntimeError(
             "Source code has changed since the last compilation. Recompiling the model."

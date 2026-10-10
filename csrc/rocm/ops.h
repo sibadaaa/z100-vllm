@@ -2,6 +2,8 @@
 
 #include <torch/all.h>
 
+#include "rocm/w8a8_sdot4.h"
+
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 

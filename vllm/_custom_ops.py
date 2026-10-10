@@ -18,6 +18,14 @@ from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
+# Whether this build registered the ROCm skinny GEMM ops
+# (_rocm_C::LLMM1 / wvSplitK / wvSplitKQ / wvSplitKrc / wvSplitK_int4_g).
+# csrc/rocm/skinny_gemms*.cu is excluded for architectures those kernels do not
+# support (gfx1250 and gfx906), in which case torch.ops._rocm_C has none of
+# these attributes. Probe once with getattr so callers can fall back to a
+# Triton/torch GEMM instead of raising AttributeError at request time.
+ROCM_SKINNY_GEMM_ENABLED = hasattr(torch.ops._rocm_C, "LLMM1")
+
 current_platform.import_kernels()
 
 if TYPE_CHECKING:
@@ -843,6 +851,34 @@ if hasattr(torch.ops._C, "gptq_gemm"):
 
 def gptq_shuffle(q_weight: torch.Tensor, bit: int) -> None:
     torch.ops._C.gptq_shuffle(q_weight, bit)
+
+
+def w8a8_sdot4_gemv(
+    x_q: torch.Tensor,
+    w: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    nthreads: int = 64,
+) -> torch.Tensor:
+    """gfx906 decoding GEMV (`v_dot4_i32_i8`); M must be <= 8."""
+    return torch.ops._rocm_C.w8a8_sdot4_gemv(
+        x_q, w, x_s, w_s, bias, out_dtype, nthreads
+    )
+
+
+def w8a8_sdot4_gemm(
+    x_q: torch.Tensor,
+    w: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    cfg: int = 0,
+) -> torch.Tensor:
+    """gfx906 tiled prefill GEMM (`v_dot4_i32_i8`). `cfg=0` picks the tile."""
+    return torch.ops._rocm_C.w8a8_sdot4_gemm(x_q, w, x_s, w_s, bias, out_dtype, cfg)
 
 
 def gptq_gemm_rdna3(

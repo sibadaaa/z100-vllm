@@ -210,6 +210,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.humming import (
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.gfx906_sdot4 import (
+    Gfx906Sdot4Int8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     BlockWiseTorchFP8ScaledMMLinearKernel,
     ChannelWiseTorchFP8ScaledMMLinearKernel,
@@ -415,7 +418,11 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
         TritonInt8ScaledMMLinearKernel,
         HummingInt8ScaledMMLinearKernel,
     ],
-    PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
+    PlatformEnum.ROCM: [
+        Gfx906Sdot4Int8ScaledMMLinearKernel,
+        AiterInt8ScaledMMLinearKernel,
+        TritonInt8ScaledMMLinearKernel,
+    ],
     PlatformEnum.XPU: [TritonInt8ScaledMMLinearKernel],
 }
 

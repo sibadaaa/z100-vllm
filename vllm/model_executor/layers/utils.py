@@ -436,9 +436,13 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     k = weight.shape[1]
 
-    # For FP16/BF16 without bias and k % 8 == 0, prefer skinny GEMV kernel
+    # For FP16/BF16 without bias and k % 8 == 0, prefer skinny GEMV kernel.
+    # LLMM1 only exists when csrc/rocm/skinny_gemms.cu was compiled, i.e. not
+    # on gfx1250/gfx906; gate on the probed capability instead of raising
+    # AttributeError at request time.
     if (
-        x.dtype in [torch.float16, torch.bfloat16]
+        ops.ROCM_SKINNY_GEMM_ENABLED
+        and x.dtype in [torch.float16, torch.bfloat16]
         and bias is None
         and m % 4 == 0
         and n == 1

@@ -38,7 +38,15 @@
 #ifdef USE_ROCM
   #define FINAL_MASK 0xffffffffffffffffULL
 
-  #if defined(HIP_VERSION) && HIP_VERSION < 70000000
+  // HIP before 7.0 does not document __syncwarp, but the definition lives in
+  // <hip/amd_detail/amd_warp_sync_functions.h> behind
+  // HIP_ENABLE_WARP_SYNC_BUILTINS. DTK 26.04 reports HIP 6.3 and defines that
+  // macro, so it already declares __syncwarp and the fallback below becomes a
+  // hard redefinition error. Key off the guard macro the HIP header itself
+  // uses; when HIP_ENABLE_WARP_SYNC_BUILTINS is unset (community ROCm 6.x) the
+  // fallback is emitted exactly as before.
+  #if defined(HIP_VERSION) && HIP_VERSION < 70000000 && \
+      !defined(HIP_ENABLE_WARP_SYNC_BUILTINS)
 // On ROCm versions before 7.0, __syncwarp isn't defined. The below
 // implementation is copy/pasted from the implementation in ROCm 7.0
 __device__ inline void __syncwarp() {

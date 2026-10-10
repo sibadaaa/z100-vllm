@@ -17,6 +17,14 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from .hygon_dtk import (
+    dcu_device_memory_total_bytes,
+    dcu_device_unique_id,
+    gcn_arch,
+    gfx906_bf16_enabled,
+    is_hygon_dtk,
+    normalize_gcn_arch,
+)
 from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
 
 if TYPE_CHECKING:
@@ -45,7 +53,10 @@ try:
         amdsmi_topo_get_numa_node_number,
     )
 except ImportError as e:
+    _HAS_AMDSMI = False
     logger.warning("Failed to import from amdsmi with %r", e)
+else:
+    _HAS_AMDSMI = True
 
 try:
     import vllm._C  # noqa: F401
@@ -161,6 +172,10 @@ _sync_hip_cuda_env_vars()
 def with_amdsmi_context(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if not _HAS_AMDSMI:
+            # Hygon DCU (DTK) images may not ship the amdsmi python module;
+            # the wrapped function is expected to fall back on its own.
+            return fn(*args, **kwargs)
         amdsmi_init()
         try:
             return fn(*args, **kwargs)
@@ -193,15 +208,39 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 
 
 def _get_gcn_arch() -> str:
-    """Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
-    Called once at module level; result stored in _GCN_ARCH.
+    """Resolve the GCN arch of device 0.
+
+    On Hygon DCU (DTK) hosts ``amdsmi`` may be missing or report a bogus
+    arch such as ``gfx18446744073709551615``, so the DTK helper validates
+    every source before accepting it. On community ROCm hosts the
+    historical amdsmi-first order is kept. Called once at module load;
+    the result is stored in ``_GCN_ARCH``.
     """
+    if is_hygon_dtk() or envs.VLLM_DCU_GCN_ARCH:
+        arch = gcn_arch()
+        if arch is not None:
+            return arch
+        raise RuntimeError(
+            "Could not determine the GCN arch on this Hygon DCU (DTK) host. "
+            "Set it explicitly, e.g. VLLM_DCU_GCN_ARCH=gfx906."
+        )
+
     try:
-        return _query_gcn_arch_from_amdsmi()
+        raw_arch = _query_gcn_arch_from_amdsmi()
+        arch = normalize_gcn_arch(raw_arch)
+        if arch is not None:
+            return arch
+        logger.warning_once(
+            "amdsmi reported the invalid GCN arch %r; falling back to torch.",
+            raw_arch,
+        )
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-    # Ultimate fallback: use torch.cuda (will initialize CUDA)
-    return torch.cuda.get_device_properties("cuda").gcnArchName
+    # Ultimate fallback: use torch.cuda (will initialize CUDA). An integer
+    # device index is used on purpose: passing the string "cuda" deadlocks
+    # on DTK's torch.
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    return normalize_gcn_arch(arch)
 
 
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
@@ -236,11 +275,23 @@ def on_gfx906() -> bool:
 def _rocm_supported_dtypes() -> list[torch.dtype]:
     """Supported dtypes for the current ROCm device.
 
-    gfx906 lacks native bfloat16, so returns fp16/fp32 there; other
-    GFX9 (gfx90a+) additionally include bfloat16.
+    gfx906 (Vega20 / Hygon DCU Z100) has no bf16 instructions at all: the
+    ISA provides neither a bf16 conversion nor a bf16 dot product, so any
+    bf16 math is emulated in software. Emulation can still be numerically
+    correct, so on **Hygon DCU (DTK)** gfx906 bf16 is offered only when the
+    device probe (see ``vllm.platforms.hygon_dtk``) confirms it, or when the
+    user forces it with ``VLLM_DCU_BF16=1``. float16 stays first, so
+    ``--dtype auto`` keeps preferring the natively accelerated dtype.
+
+    The branch is deliberately scoped to ``is_hygon_dtk()``: on a community
+    ROCm gfx906 host (MI50 / Radeon VII) the dtype list must stay exactly as
+    it was before this adaptation.
     """
     if _ON_GFX906:
-        return [torch.float16, torch.float32]
+        dtypes = [torch.float16, torch.float32]
+        if is_hygon_dtk() and gfx906_bf16_enabled():
+            dtypes.insert(1, torch.bfloat16)
+        return dtypes
     return [torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -442,6 +493,17 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
+    #
+    # gfx906 (Vega20 / Hygon Z100) matches on_cdna() because "gfx9" is a
+    # substring of "gfx906", but the kernel in csrc/rocm/attention.cu is
+    # MFMA-only: for arches outside __HIP__GFX9__ its body degrades to
+    # UNREACHABLE_CODE (csrc/rocm/attention.cu:3293-3307), so selecting this
+    # path on gfx906 hits a device-side assertion (verified on hardware, see
+    # docs/result/z100-05-csrc-kernels-result.md). Fall through to the Triton
+    # paged-attention path instead.
+    if on_gfx906():
+        return False
+
     if on_cdna():
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
@@ -944,6 +1006,16 @@ class RocmPlatform(Platform):
     @with_amdsmi_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         """Query if the set of gpus are fully connected by xgmi (1 hop)."""
+        if not _HAS_AMDSMI:
+            # DTK exposes no XGMI topology query. Report False (i.e. "cannot
+            # confirm"), which makes vLLM keep the standard RCCL allreduce
+            # instead of a peer-to-peer custom allreduce.
+            logger.debug_once(
+                "amdsmi unavailable; assuming GPUs are not fully connected. "
+                "Pass --disable-custom-all-reduce if a peer-to-peer allreduce "
+                "hangs on this Hygon DCU host."
+            )
+            return False
         handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
@@ -962,6 +1034,10 @@ class RocmPlatform(Platform):
     @with_amdsmi_context
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
+        if not _HAS_AMDSMI:
+            if is_hygon_dtk():
+                return "Hygon DCU Z100 (gfx906)" if _ON_GFX906 else "Hygon DCU"
+            return torch.cuda.get_device_name(device_id)
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         handle = amdsmi_get_processor_handles()[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
@@ -973,11 +1049,17 @@ class RocmPlatform(Platform):
     @classmethod
     @with_amdsmi_context
     def get_device_uuid(cls, device_id: int = 0) -> str:
+        if not _HAS_AMDSMI:
+            # DTK ships the device UUID in sysfs; prefer it over initializing
+            # a HIP context just to read an identifier. Indexing mirrors the
+            # amdsmi branch below, which also uses the logical device id.
+            return dcu_device_unique_id(device_id) or ""
+        device_uuid = ""
         try:
             device = amdsmi_get_processor_handles()[device_id]
         except AmdSmiException as error:
             logger.error("amdsmi device query failed ", exc_info=error)
-            return ""
+            return dcu_device_unique_id(device_id) or ""
         try:
             device_uuid = amdsmi_get_gpu_device_uuid(device)
         except AmdSmiException as error:
@@ -997,10 +1079,19 @@ class RocmPlatform(Platform):
             return _query_total_memory_from_amdsmi(physical_device_id)
         except Exception as e:
             logger.debug("Failed to get total memory via amdsmi: %s", e)
-            logger.warning_once(
-                "Failed to get total memory via amdsmi, falling back to "
-                "torch.cuda. This will initialize CUDA."
-            )
+        # Hygon DCU (DTK): the sysfs node is context-free as well, so keep the
+        # `fork`-friendly path instead of initializing CUDA through torch.
+        try:
+            physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        except Exception:
+            physical_device_id = device_id
+        total = dcu_device_memory_total_bytes(physical_device_id)
+        if total:
+            return total
+        logger.warning_once(
+            "Failed to get total memory from sysfs, falling back to "
+            "torch.cuda. This will initialize CUDA."
+        )
         return torch.cuda.get_device_properties(device_id).total_memory
 
     @classmethod

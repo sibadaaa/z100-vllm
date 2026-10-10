@@ -48,7 +48,7 @@ class TorchWNA16LinearKernel(MPLinearKernel):
             )
 
     def _dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
-        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
         c = self.config
 
         unpacked = unpack_quantized_values_into_int32(

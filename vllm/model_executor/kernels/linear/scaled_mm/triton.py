@@ -5,6 +5,7 @@
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
 )
@@ -22,6 +23,8 @@ from .cutlass import CutlassInt8ScaledMMLinearKernel
 from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearLayerConfig,
 )
+
+logger = init_logger(__name__)
 
 
 class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
@@ -161,6 +164,22 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     def is_supported(cls, compute_capability=None):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
             return False, "only CUDA-alike and XPU devices are supported."
+        if current_platform.is_rocm():
+            # gfx906 (Z100) has no FP8 hardware: this path is emulated with
+            # scalar v_fmac_f32 FMA. Numerics are verified (S8b: rel_err
+            # <= 1.465e-07 over 17 shapes), but it is ~36x slower than fp16
+            # (4096^3: 304 ms vs 8.4 ms). Warn once, do not refuse: the user
+            # may still want the FP8 weight footprint.
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                logger.warning_once(
+                    "gfx906 has no native FP8 support; block-scaled FP8 is "
+                    "emulated in software and measured ~36x slower than fp16 "
+                    "(4096^3: 304 ms vs fp16 8.4 ms). Numerics are verified "
+                    "(rel_err <= 1.5e-07), so this is correct but slow; "
+                    "prefer --dtype float16 unless FP8 weight size is required."
+                )
         return True, None
 
     def apply_block_scaled_mm(

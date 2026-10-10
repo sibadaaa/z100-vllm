@@ -72,14 +72,22 @@ function (hipify_sources_target OUT_SRCS NAME ORIG_SRCS)
   # `CMAKE_CURRENT_BINARY_DIR` directory rather than the original csrc dir.
   #
   set(HIP_SRCS)
+  # `HIP_SRC|<original source>` pairs. The finalizer turns them into
+  # OBJECT_DEPENDS entries so that a CUDA source whose content is unchanged but
+  # whose mtime moved still recompiles its own translation unit.
+  set(HIP_TO_ORIG)
   foreach (SRC ${SRCS})
-    string(REGEX REPLACE "\.cu$" "\.hip" SRC ${SRC})
-    string(REGEX REPLACE "cuda" "hip" SRC ${SRC})
-    list(APPEND HIP_SRCS "${CMAKE_CURRENT_BINARY_DIR}/${SRC}")
+    set(HIP_SRC ${SRC})
+    string(REGEX REPLACE "\.cu$" "\.hip" HIP_SRC ${HIP_SRC})
+    string(REGEX REPLACE "cuda" "hip" HIP_SRC ${HIP_SRC})
+    list(APPEND HIP_SRCS "${CMAKE_CURRENT_BINARY_DIR}/${HIP_SRC}")
+    list(APPEND HIP_TO_ORIG
+      "${CMAKE_CURRENT_BINARY_DIR}/${HIP_SRC}|${CMAKE_CURRENT_SOURCE_DIR}/${SRC}")
   endforeach()
 
   set_property(GLOBAL APPEND PROPERTY VLLM_HIPIFY_ALL_SRCS ${SRCS})
   set_property(GLOBAL APPEND PROPERTY VLLM_HIPIFY_ALL_BYPRODUCTS ${HIP_SRCS})
+  set_property(GLOBAL APPEND PROPERTY VLLM_HIPIFY_ALL_HIP_TO_ORIG ${HIP_TO_ORIG})
 
   # Chain hipify targets so they run sequentially. Parallel hipify
   # invocations race on shutil.copytree, overwriting .hip files
@@ -104,6 +112,7 @@ function (vllm_finalize_hipify_target)
 
   get_property(ALL_SRCS GLOBAL PROPERTY VLLM_HIPIFY_ALL_SRCS)
   get_property(ALL_BYPRODUCTS GLOBAL PROPERTY VLLM_HIPIFY_ALL_BYPRODUCTS)
+  get_property(ALL_HIP_TO_ORIG GLOBAL PROPERTY VLLM_HIPIFY_ALL_HIP_TO_ORIG)
 
   if (NOT ALL_SRCS)
     return()
@@ -113,12 +122,51 @@ function (vllm_finalize_hipify_target)
   list(REMOVE_DUPLICATES ALL_BYPRODUCTS)
 
   set(CSRC_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/csrc)
-  add_custom_target(
-    hipify_all
-    COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p ${CMAKE_SOURCE_DIR}/csrc -o ${CSRC_BUILD_DIR} ${ALL_SRCS}
+
+  # `hipify_all` is stamped: the custom command writes `HIPIFY_ALL_STAMP` and
+  # everything else is a byproduct. Without that stamp the custom target's
+  # output never exists, so ninja re-runs hipify (and therefore recompiles every
+  # extension) on every invocation.
+  set(HIPIFY_STAMP ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/hipify_all.stamp)
+
+  # Hipify writes into a staging tree which is then synced into
+  # `CSRC_BUILD_DIR` by content. DTK's hipify output never matches the file
+  # cmake/hipify.py leaves on disk (it rewrites the <ATen/dtk_macros.h> include
+  # that DTK's hipify prepends only *after* hipify decided whether the file
+  # changed), so a plain re-run rewrites every generated file with identical
+  # content and a fresh mtime, which forces a full recompile. Copying only the
+  # files whose content actually changed keeps the mtimes of every other
+  # generated source stable, so compiling stays incremental.
+  set(HIPIFY_STAGE_DIR ${CMAKE_CURRENT_BINARY_DIR}/hipify_stage)
+  file(MAKE_DIRECTORY ${HIPIFY_STAGE_DIR})
+
+  add_custom_command(
+    OUTPUT ${HIPIFY_STAMP}
+    COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p ${CMAKE_SOURCE_DIR}/csrc -o ${HIPIFY_STAGE_DIR}/csrc ${ALL_SRCS}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${HIPIFY_STAGE_DIR}/csrc ${CSRC_BUILD_DIR}
+    COMMAND ${CMAKE_COMMAND} -E touch ${HIPIFY_STAMP}
     DEPENDS ${CMAKE_SOURCE_DIR}/cmake/hipify.py ${ALL_SRCS}
     BYPRODUCTS ${ALL_BYPRODUCTS}
-    COMMENT "Running hipify on all extension source files.")
+    WORKING_DIRECTORY ${HIPIFY_STAGE_DIR}
+    COMMENT "Running hipify on all extension source files."
+    VERBATIM)
+
+  # Touching a CUDA source without changing it still rebuilds that source's
+  # translation unit: the sync above leaves the byte-identical generated file
+  # (and its mtime) alone, which would otherwise silently skip the recompile.
+  set(_HIPIFY_DEPS_SET)
+  foreach (_PAIR ${ALL_HIP_TO_ORIG})
+    string(REPLACE "|" ";" _PAIR_PARTS "${_PAIR}")
+    list(GET _PAIR_PARTS 0 _HIP_SRC)
+    list(GET _PAIR_PARTS 1 _ORIG_SRC)
+    if (NOT _HIP_SRC IN_LIST _HIPIFY_DEPS_SET)
+      list(APPEND _HIPIFY_DEPS_SET ${_HIP_SRC})
+      set_source_files_properties(${_HIP_SRC} PROPERTIES OBJECT_DEPENDS ${_ORIG_SRC})
+    endif()
+  endforeach()
+  unset(_HIPIFY_DEPS_SET)
+
+  add_custom_target(hipify_all DEPENDS ${HIPIFY_STAMP})
 endfunction()
 
 #

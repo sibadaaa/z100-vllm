@@ -258,6 +258,47 @@ endif()
 get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
 
 #
+# Hygon DCU Toolkit (DTK) HIP toolchain workaround.
+#
+# DTK 26.04's clang 18 ships a `<clang>/include/cuda_wrappers/new` wrapper
+# that fails to declare the `__device__` placement new/delete overloads, so
+# every translation unit instantiating `rocprim::uninitialized_array::emplace`
+# (any hipcub `BlockLoad`/`BlockExchange` user) fails with
+# "reference to __host__ function 'operator new' in __host__ __device__
+# function". `csrc/dtk_rocprim_compat.h` re-declares exactly the overloads
+# the upstream ROCm toolchain provides; see that header for the rationale.
+#
+# Gated on the DTK install prefix so CUDA and community ROCm builds are
+# byte-for-byte unaffected: DTK is the only stack that installs under a path
+# matching "dtk" (`ROCM_PATH` comes from setup.py, which resolves it to the
+# detected DTK prefix). `VLLM_DTK_ROCPRIM_COMPAT=0` opts out, and
+# `VLLM_DTK_ROCPRIM_COMPAT=1` forces it on for experiments.
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  set(VLLM_DTK_ROCPRIM_COMPAT "${VLLM_DTK_ROCPRIM_COMPAT}" CACHE STRING
+    "Inject csrc/dtk_rocprim_compat.h (auto: only when ROCM_PATH looks like a Hygon DTK install)")
+  if(VLLM_DTK_ROCPRIM_COMPAT STREQUAL "")
+    if(ROCM_PATH MATCHES "dtk")
+      set(VLLM_DTK_ROCPRIM_COMPAT ON)
+    else()
+      set(VLLM_DTK_ROCPRIM_COMPAT OFF)
+    endif()
+  endif()
+  if(VLLM_DTK_ROCPRIM_COMPAT)
+    set(VLLM_DTK_ROCPRIM_COMPAT_HEADER
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/dtk_rocprim_compat.h")
+    if(NOT EXISTS "${VLLM_DTK_ROCPRIM_COMPAT_HEADER}")
+      message(FATAL_ERROR
+        "VLLM_DTK_ROCPRIM_COMPAT is on but ${VLLM_DTK_ROCPRIM_COMPAT_HEADER} is missing")
+    endif()
+    message(STATUS
+      "DTK rocPRIM placement-new workaround enabled: -include ${VLLM_DTK_ROCPRIM_COMPAT_HEADER}")
+    list(APPEND VLLM_GPU_FLAGS "-include" "${VLLM_DTK_ROCPRIM_COMPAT_HEADER}")
+  else()
+    message(STATUS "DTK rocPRIM placement-new workaround disabled (ROCM_PATH=${ROCM_PATH})")
+  endif()
+endif()
+
+#
 # Set nvcc parallelism.
 #
 if(NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
@@ -1504,19 +1545,24 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
+    "csrc/rocm/w8a8_sdot4.cu"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/attention.cu")
   set(VLLM_ROCM_EXT_FLAGS ${VLLM_GPU_FLAGS})
 
   # skinny_gemms*.cu are built on gfx9/gfx11 ISA (MFMA, dot2/dot4, legacy
-  # s_waitcnt asm) that gfx1250 (gfx12) does not provide. Exclude them from the
-  # gfx1250 build and disable their op registrations (VLLM_SKIP_SKINNY_GEMMS);
-  # vLLM falls back to default/Triton GEMM for those ops on gfx1250.
+  # s_waitcnt asm) that neither gfx1250 (gfx12) nor gfx906 (Vega20, GCN5.1,
+  # no MFMA at all) provides. Exclude them from both builds and disable their
+  # op registrations (VLLM_SKIP_SKINNY_GEMMS); vLLM falls back to
+  # default/Triton GEMM for those ops. On gfx906 they compile only because the
+  # MFMA sections sit behind `__HIP__GFX9__`, so the compiled kernels would be
+  # non-MFMA fallbacks that no caller selects - registering them would just
+  # expose ops with no working gfx906 path.
   list(REMOVE_ITEM VLLM_ROCM_EXT_SRC "csrc/rocm/skinny_gemms.cu")
   list(REMOVE_ITEM VLLM_ROCM_EXT_SRC "csrc/rocm/skinny_gemms_int4.cu")
   set(VLLM_SKINNY_ARCHES ${VLLM_GPU_ARCHES})
-  list(FILTER VLLM_SKINNY_ARCHES EXCLUDE REGEX "gfx1250")
+  list(FILTER VLLM_SKINNY_ARCHES EXCLUDE REGEX "gfx1250|gfx906")
   if(VLLM_SKINNY_ARCHES)
     message(STATUS "Building skinny_gemms for archs: ${VLLM_SKINNY_ARCHES}")
     set(VLLM_SKINNY_SRC
@@ -1536,7 +1582,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_rocm_C_skinny PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
     target_link_libraries(_rocm_C_skinny PRIVATE torch)
   else()
-    message(STATUS "Only gfx1250, skipping skinny_gemms")
+    message(STATUS "Only gfx1250/gfx906, skipping skinny_gemms")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 

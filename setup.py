@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ctypes
+import glob
 import importlib.util
 import json
 import logging
@@ -41,6 +42,79 @@ envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 
+# Hygon DCU Toolkit (DTK) markers. The DTK install layout is the only
+# difference that matters here: same HIP runtime, but the prefix is
+# /opt/dtk, the requirements live in requirements/dcu*.txt and the version
+# tag is `+dtkXX.XX` instead of `+rocmXX`.
+_DTK_INFO_VERSION = Path(".info") / "rocm_version"
+
+
+def _hygon_dtk_prefix() -> str | None:
+    """DTK install prefix on this host, or None when there is no DTK.
+
+    ``vllm`` cannot be imported while ``setup.py`` runs (nothing is
+    installed yet), so the conditions of
+    ``vllm.platforms.hygon_dtk.is_hygon_dtk()`` are duplicated here and must
+    be kept in sync with it:
+
+    * ``<prefix>/.info/rocm_version`` exists, with ``<prefix>`` taken from
+      ``ROCM_PATH``, ``DTKROOT`` or the conventional ``/opt/dtk``;
+    * or ``HYHAL_PATH`` is set;
+    * or a ``hy-smi`` binary exists under ``/opt/dtk*/bin``.
+
+    Returns None for CUDA and for community ROCm installations so that
+    their build behaviour is unchanged.
+    """
+    candidates = [
+        prefix
+        for prefix in (
+            os.environ.get("ROCM_PATH"),
+            os.environ.get("DTKROOT"),
+            "/opt/dtk",
+        )
+        if prefix
+    ]
+    for prefix in candidates:
+        if (Path(prefix) / _DTK_INFO_VERSION).is_file():
+            return prefix
+    if os.environ.get("HYHAL_PATH") or glob.glob("/opt/dtk*/bin/hy-smi"):
+        return os.environ.get("DTKROOT") or "/opt/dtk"
+    return None
+
+
+def _dtk_version() -> str | None:
+    """DTK release string from ``<prefix>/.info/rocm_version`` (e.g. 26.04)."""
+    prefix = _DTK_PREFIX
+    if prefix is None:
+        return None
+    try:
+        return (Path(prefix) / _DTK_INFO_VERSION).read_text().strip() or None
+    except OSError:
+        return None
+
+
+_DTK_PREFIX = _hygon_dtk_prefix()
+_DTK_HIP_FALLBACK_WARNED = False
+
+if _DTK_PREFIX is not None:
+    # DTK's rocm_agent_enumerator reports every arch listed in
+    # /opt/dtk/bin/target.lst ("gfx906;gfx926;gfx928"); building all of them
+    # triples the binary size and can emit ISA the Z100 cannot execute. The
+    # Z100 is gfx906. An explicit PYTORCH_ROCM_ARCH from the caller wins, so
+    # the arch is still overridable for other Hygon boards.
+    _DTK_ARCH = os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx906")
+    logger.info(
+        "Building for DTK %s at %s (PYTORCH_ROCM_ARCH=%s)",
+        _dtk_version(),
+        _DTK_PREFIX,
+        _DTK_ARCH,
+    )
+
+
+def _is_hygon_dtk() -> bool:
+    return _DTK_PREFIX is not None
+
+
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
@@ -59,6 +133,18 @@ elif sys.platform.startswith("linux") and os.getenv("VLLM_TARGET_DEVICE") is Non
     elif torch.version.cuda is not None:
         VLLM_TARGET_DEVICE = "cuda"
         logger.info("Auto-detected CUDA")
+    elif _is_hygon_dtk():
+        # Some DTK torch builds leave torch.version.hip unset even though the
+        # stack is HIP. The DTK install markers are then the only signal.
+        # This branch is deliberately last so that CUDA and community ROCm
+        # hosts keep their original auto-detection.
+        VLLM_TARGET_DEVICE = "rocm"
+        logger.warning(
+            "torch.version.hip is None but DTK %s is installed at %s; "
+            "building for ROCm/HIP.",
+            _dtk_version(),
+            _DTK_PREFIX,
+        )
     else:
         VLLM_TARGET_DEVICE = "cpu"
 
@@ -284,8 +370,13 @@ class cmake_build_ext(build_ext):
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda() and CUDA_HOME is not None:
             cmake_args += [f"-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc"]
-        elif _is_hip() and ROCM_HOME is not None:
-            cmake_args += [f"-DROCM_PATH={ROCM_HOME}"]
+        elif _is_hip():
+            # DTK installs under /opt/dtk. Its torch builds normally report
+            # that as ROCM_HOME; fall back to the detected DTK prefix so the
+            # HIP language is still configured without a /opt/rocm symlink.
+            rocm_path = ROCM_HOME or _DTK_PREFIX
+            if rocm_path is not None:
+                cmake_args += [f"-DROCM_PATH={rocm_path}"]
 
         other_cmake_args = os.environ.get("CMAKE_ARGS")
         if other_cmake_args:
@@ -800,9 +891,25 @@ def _is_cuda() -> bool:
 
 
 def _is_hip() -> bool:
-    return (
-        VLLM_TARGET_DEVICE == "cuda" or VLLM_TARGET_DEVICE == "rocm"
-    ) and torch.version.hip is not None
+    if VLLM_TARGET_DEVICE != "cuda" and VLLM_TARGET_DEVICE != "rocm":
+        return False
+    if torch.version.hip is not None:
+        return True
+    # Some DTK torch builds leave torch.version.hip unset; treat DTK as HIP so
+    # that the HIP build path is taken. Non-DTK hosts are untouched because
+    # _is_hygon_dtk() is False there.
+    if _is_hygon_dtk():
+        global _DTK_HIP_FALLBACK_WARNED
+        if not _DTK_HIP_FALLBACK_WARNED:
+            _DTK_HIP_FALLBACK_WARNED = True
+            logger.warning(
+                "torch.version.hip is None but DTK %s is installed at %s; "
+                "treating this build as ROCm/HIP.",
+                _dtk_version(),
+                _DTK_PREFIX,
+            )
+        return True
+    return False
 
 
 def _is_tpu() -> bool:
@@ -913,10 +1020,17 @@ def get_vllm_version() -> str:
                     version += f"{sep}cu{cuda_version_str}"
     elif _is_hip():
         # ROCm/HIP environment - skip CUDA version checks
-        # Get the Rocm Version
-        rocm_version = get_rocm_version() or torch.version.hip
-        if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
-            version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+        # Hygon DTK versions its stack independently of community ROCm (the
+        # DTK 26.04 image ships a ROCm 6.3-era HIP), so the local version tag
+        # carries the DTK release, matching the vendor wheel naming
+        # (+das.dtk2604).
+        dtk_version = _dtk_version()
+        if dtk_version:
+            version += f"{sep}dtk{dtk_version.replace('.', '')}"
+        else:
+            rocm_version = get_rocm_version() or torch.version.hip
+            if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
+                version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
     elif _is_tpu():
         version += f"{sep}tpu"
     elif _is_cpu():
@@ -980,7 +1094,9 @@ def get_requirements() -> list[str]:
             modified_requirements.append(req)
         requirements = modified_requirements
     elif _is_hip():
-        requirements = _read_requirements("rocm.txt")
+        # DTK replaces torch/triton/amdsmi with vendor wheels and must never
+        # resolve the community ROCm index; see requirements/dcu.txt.
+        requirements = _read_requirements("dcu.txt" if _is_hygon_dtk() else "rocm.txt")
     elif _is_tpu():
         requirements = _read_requirements("tpu.txt")
     elif _is_cpu():

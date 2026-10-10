@@ -111,6 +111,40 @@ class FatreluAndMul(CustomOp):
         return self.forward_cuda(x)
 
 
+def _broken_gfx906_fp16_packed_silu(x: torch.Tensor) -> bool:
+    """Whether ``x`` would take the miscompiled gfx906 fp16 packed SiLU path.
+
+    On Hygon Z100 (gfx906) with DTK 26.04 the vectorized ``__half2`` branch of
+    ``csrc/libtorch_stable/activation_kernels.cu`` (``act_and_mul_kernel`` with
+    ``use_vec``, ``:106``/``:250``) returns inf/NaN for a few percent of the
+    elements whenever the activation is applied to the *gate* half
+    (``packed_compute<..., act_first=true>`` -> ``packed_silu_kernel``, ``:171``).
+    ``_C.silu_and_mul`` and ``_C.silu_and_mul_with_clamp`` are affected, while
+    ``_C.mul_and_silu`` (``act_first`` false), ``_C.gelu_and_mul``, the scalar
+    branch (``d % 8 != 0``) and the bf16/fp32 instantiations are exact; in the
+    eager path the corrupted values propagate to every later layer and make the
+    logits NaN.  See docs/result/z100-07b-eager-nan-result.md.
+
+    Belt and braces only: the root fix lives in csrc, which keeps fp16 off the
+    packed branch on DTK + gfx906 (``dtk_gfx906_fp16_no_packed`` in
+    ``csrc/libtorch_stable/activation_kernels.cu``).  This Python fallback stays
+    for ``_C`` builds that predate that fix; it cannot cover the direct
+    ``torch.ops._C`` call sites in ``fused_moe/activation.py`` and GGUF, which
+    are the reason the csrc fix is the real one.  Keep the regression test on the
+    raw operators (``tests/kernels/test_gfx906_packed_silu_fp16.py``) so the
+    csrc guard itself stays covered.
+    """
+    if x.dtype != torch.float16 or not x.is_cuda:
+        return False
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx906
+    except ImportError:  # pragma: no cover - non-DTK builds
+        return False
+    return on_gfx906()
+
+
 # --8<-- [start:silu_and_mul]
 @CustomOp.register("silu_and_mul")
 class SiluAndMul(CustomOp):
@@ -149,6 +183,13 @@ class SiluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # Fallback only: csrc already keeps fp16 off the packed branch on
+        # DTK + gfx906 (see _broken_gfx906_fp16_packed_silu).
+        if _broken_gfx906_fp16_packed_silu(x):
+            return self.forward_native(x)
+        return self.forward_cuda(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)
@@ -253,6 +294,8 @@ class SiluAndMulWithClamp(CustomOp):
         # Limit the ROCm _C path to the default case to avoid the
         # precision loss MiniMax saw without fp32 intermediates.
         if self.alpha == 1.0 and self.beta == 0.0:
+            if _broken_gfx906_fp16_packed_silu(x):
+                return self.forward_native(x)
             return self.forward_cuda(x)
         return self.forward_native(x)
 

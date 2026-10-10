@@ -348,9 +348,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes <= self.decode_cudagraph_max_bs
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
-            num_actual_tokens = self.vllm_config.pad_for_cudagraph(m.num_actual_tokens)
-            # Token buffers are padded for FULL graph replay, but GDN state,
-            # sequence, query-start, and accepted-token metadata is per request.
+            # m.num_actual_tokens is already padded to the FULL-graph capture
+            # size by the model runner (gpu_model_runner.py
+            # _determine_batch_execution_and_padding ->
+            # CudagraphDispatcher._bs_to_padded_graph_size), so it must be
+            # used as-is here. GDN state, sequence, query-start, and
+            # accepted-token metadata stay per request.
+            num_actual_tokens = m.num_actual_tokens
             batch_size = m.num_reqs
 
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
@@ -397,7 +401,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes == 0
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
-            num_actual_tokens = self.vllm_config.pad_for_cudagraph(m.num_actual_tokens)
+            # Already padded by the model runner for FULL graph replay (see the
+            # spec-decode branch above).
+            num_actual_tokens = m.num_actual_tokens
             batch_size = m.num_reqs
 
             self.non_spec_state_indices_tensor[:num_decodes].copy_(

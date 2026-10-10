@@ -315,3 +315,14 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# --- Hygon Z100 / gfx906 deliverables (hard rules 14 & 19) -------------------
+# The generic "*.sh" rule above hides tools/dcu/*.sh (s8b_gate.sh, s7_env.sh,
+# ...) and "test_*.py" hides tests/kernels/test_gfx906_packed_silu_fp16.py and
+# tests/platforms/test_hygon_dtk.py, so the Z100 gate scripts and regression
+# tests never showed up in `git status`. Whitelist them explicitly.
+!tools/dcu/**
+# ...but keep bytecode caches inside the whitelisted directory ignored.
+tools/dcu/__pycache__/
+!tests/kernels/test_gfx906_packed_silu_fp16.py
+!tests/platforms/test_hygon_dtk.py

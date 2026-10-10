@@ -17,18 +17,31 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx1x, on_gfx1100
+    from vllm.platforms.rocm import on_gfx1x, on_gfx1100, on_gfx906
 else:
-    on_gfx1100 = on_gfx1x = lambda: False  # noqa: E731
+    on_gfx1100 = on_gfx1x = on_gfx906 = lambda: False  # noqa: E731
 
 # Group sizes the HIP skinny path of RDNAHybridW4A16LinearKernel instantiates.
 _HYBRID_GROUP_SIZES = (32, 64, 128)
 
+# Gfx906GPTQWNA16LinearKernel.SUPPORTED_QUANT_TYPES.
+_GFX906_QUANT_TYPES = (
+    scalar_types.uint4,
+    scalar_types.uint4b8,
+    scalar_types.uint8,
+    scalar_types.uint8b128,
+)
+
 
 def _expected_rocm_kernel(weight_type, group_size: int) -> str:
     """Mirror the ROCm priority order in ``_POSSIBLE_KERNELS[ROCM]``:
-    RDNA3 (gfx1100, symmetric uint4b8) -> Hybrid (gfx11/gfx12) -> Triton.
+    gfx906 GPTQ/WNA16 -> RDNA3 (gfx1100, symmetric uint4b8) -> Hybrid
+    (gfx11/gfx12) -> Triton.
     """
+    # Gfx906GPTQWNA16LinearKernel is first in the ROCm list and accepts
+    # uint4/uint4b8/uint8/uint8b128 with group_size in {32, 64, 128, 256}.
+    if on_gfx906() and weight_type in _GFX906_QUANT_TYPES:
+        return "Gfx906GPTQWNA16LinearKernel"
     if on_gfx1100() and weight_type == scalar_types.uint4b8:
         return "RDNA3W4A16LinearKernel"
     if on_gfx1x() and group_size in _HYBRID_GROUP_SIZES:
@@ -68,3 +81,25 @@ def test_choose_mp_linear_kernel_uint4_asymmetric():
 
     kernel_type = choose_mp_linear_kernel(config)
     assert kernel_type.__name__ == _expected_rocm_kernel(scalar_types.uint4, 64)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx906()),
+    reason="gfx906 has no WNA16 kernel that supports activation reordering",
+)
+def test_choose_mp_linear_kernel_gidx_is_rejected_on_gfx906():
+    """``desc_act`` / ``actorder=group`` checkpoints must fail selection with a
+    reason instead of silently picking a kernel that ignores ``g_idx``."""
+    K, N = 1024, 256
+    config = MPLinearLayerConfig(
+        full_weight_shape=(K, N),
+        partition_weight_shape=(K, N),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.float16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=True,
+    )
+
+    with pytest.raises(ValueError, match="Activation reordering is not supported"):
+        choose_mp_linear_kernel(config)

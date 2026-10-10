@@ -94,6 +94,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // W8A8 INT8 GEMM/GEMV on gfx906's `V_DOT4_I32_I8` (DL-Ops).
+  // Weights stay [N, K] int8 (never transposed, never dequantized); the
+  // caller supplies per-token x_s and per-channel w_s.  The Python-side
+  // Gfx906Sdot4Int8ScaledMMLinearKernel is the only intended caller.
+  rocm_ops.def(
+      "w8a8_sdot4_gemv(Tensor xq, Tensor w, Tensor x_s, Tensor w_s, "
+      "Tensor? bias, ScalarType out_dtype, int nthreads) -> Tensor");
+  rocm_ops.impl("w8a8_sdot4_gemv", torch::kCUDA, &w8a8_sdot4_gemv);
+
+  rocm_ops.def(
+      "w8a8_sdot4_gemm(Tensor xq, Tensor w, Tensor x_s, Tensor w_s, "
+      "Tensor? bias, ScalarType out_dtype, int cfg) -> Tensor");
+  rocm_ops.impl("w8a8_sdot4_gemm", torch::kCUDA, &w8a8_sdot4_gemm);
+}
+
+// Meta implementations: `torch.compile` / fake tensor propagation needs the
+// output shape without running the kernel.  Registered from the same TU so
+// the ops can be traced instead of forcing a graph break.
+TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
+  rocm_meta_ops.impl("w8a8_sdot4_gemv", &w8a8_sdot4_gemv_meta);
+  rocm_meta_ops.impl("w8a8_sdot4_gemm", &w8a8_sdot4_gemm_meta);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

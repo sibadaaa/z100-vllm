@@ -82,6 +82,15 @@ def test_gdn_mixed_batch_builds_prefill_only_metadata():
     # Mirror __init__: build() consults this flag to keep capture batches
     # decode-only; this fixture bypasses __init__ via object.__new__.
     builder._building_for_capture = False
+    # build() funnels the common block table through
+    # mamba_get_block_table_tensor(). With mamba_cache_mode="none" that helper
+    # returns the table unchanged, which is what the one-column fixture below
+    # assumes (the "align" gather path is covered by
+    # test_qwen3_5_gdn_prefill_state_uses_cache_layout and by serving).
+    builder.kv_cache_spec = None
+    builder.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none")
+    )
 
     query_start_loc = torch.tensor([0, 1, 2, 5], dtype=torch.int32)
     common = SimpleNamespace(
@@ -89,10 +98,15 @@ def test_gdn_mixed_batch_builds_prefill_only_metadata():
         query_start_loc_cpu=query_start_loc.cpu(),
         num_computed_tokens_cpu=torch.tensor([8, 9, 0], dtype=torch.int32),
         block_table_tensor=torch.tensor([[3], [4], [5]], dtype=torch.int32),
+        seq_lens=torch.tensor([9, 10, 3], dtype=torch.int32),
         max_query_len=3,
         num_reqs=3,
         num_actual_tokens=5,
     )
+    # CommonAttentionMetadata replaced the per-request CPU computed-count
+    # field with this accessor; keep the fixture's numbers and expose them
+    # through the call the builder now makes.
+    common.compute_num_computed_tokens = lambda: common.num_computed_tokens_cpu
 
     metadata = builder.build(0, common)
 
@@ -210,8 +224,8 @@ def test_qwen3_5_load_uses_native_checkpoint_mapper(monkeypatch):
     captured: dict[str, object] = {}
 
     class _FakeLoader:
-        def __init__(self, model, skip_prefixes):
-            del model, skip_prefixes
+        def __init__(self, model, skip_prefixes=None, ignore_unexpected_prefixes=None):
+            del model, skip_prefixes, ignore_unexpected_prefixes
 
         def load_weights(self, weights, mapper=None):
             del weights

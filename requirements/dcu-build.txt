@@ -1,0 +1,26 @@
+# Build requirements for Hygon DCU (Z100 / gfx906) boards running DTK.
+#
+# Counterpart of requirements/rocm-build.txt for the DTK 26.04 stack: the
+# community ROCm 7.2 index, torch==2.11.0+rocm7.2, triton-rocm==3.6.0 and
+# amdsmi==7.0.2 are replaced by the DTK DAS 1.8.5 vendor wheels (cp310-only,
+# hence Python 3.10). DTK and community ROCm wheels must never be mixed.
+#
+# Example:
+#     source /opt/dtk/env.sh && source tools/dcu/env.sh
+#     pip install -r requirements/dcu-build.txt
+
+-r common.txt
+
+torch @ https://download.sourcefind.cn:65024/directlink/4/pytorch/DAS1.8.5/torch-2.11.0+das.opt1.dtk2604.2608241728.gfb4aa7-cp310-cp310-manylinux_2_28_x86_64.whl
+triton @ https://download.sourcefind.cn:65024/directlink/4/triton/DAS1.8.5/triton-3.6.0+das185.dtk2604.torch2100.2608131719.gb796b1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+
+cmake>=3.26.1,<4
+packaging>=24.2
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=8
+wheel
+jinja2>=3.1.6
+timm>=1.0.17
+
+# Provided by the DTK image instead of pip (hy-smi / librocm_smi64).
+# amdsmi

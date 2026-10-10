@@ -109,6 +109,15 @@ def rocm_platform_plugin() -> str | None:
     is_rocm = False
     logger.debug("Checking if ROCm platform is available.")
 
+    # Hygon DCU (DTK) images ship neither the amdsmi python module nor
+    # /opt/rocm, so the probes below cannot confirm the platform. DTK still
+    # presents a ROCm-compatible stack, so select it directly.
+    from vllm.platforms.hygon_dtk import is_hygon_dtk
+
+    if is_hygon_dtk():
+        logger.debug("Selecting ROCm platform because a Hygon DTK stack was found.")
+        return "vllm.platforms.rocm.RocmPlatform"
+
     visible_devices_set = any(
         os.environ.get(var)
         for var in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
@@ -137,18 +146,23 @@ def rocm_platform_plugin() -> str | None:
         try:
             import subprocess
 
-            result = subprocess.run(
-                ["/opt/rocm/bin/rocminfo"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0 and "gfx" in result.stdout:
-                is_rocm = True
-                logger.debug(
-                    "Confirmed ROCm platform is available via rocminfo fallback."
+            from vllm.platforms.hygon_dtk import rocminfo_candidates
+
+            for rocminfo in rocminfo_candidates():
+                result = subprocess.run(
+                    [rocminfo],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
                 )
+                if result.returncode == 0 and "gfx" in result.stdout:
+                    is_rocm = True
+                    logger.debug(
+                        "Confirmed ROCm platform is available via rocminfo at %s.",
+                        rocminfo,
+                    )
+                    break
         except Exception as fallback_error:
             logger.debug(
                 "ROCm rocminfo fallback probe failed because: %s",

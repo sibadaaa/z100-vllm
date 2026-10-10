@@ -157,6 +157,16 @@ if TYPE_CHECKING:
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
     VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ: bool = False
     VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE: bool = False
+    # Hygon DCU (DTK) overrides. VLLM_DCU_GCN_ARCH is an explicit escape
+    # hatch for the GCN arch probe (DTK's amdsmi can return a bogus arch).
+    VLLM_DCU_GCN_ARCH: str = ""
+    # "auto" probes the device, "1"/"0" force bf16 on/off on gfx906.
+    VLLM_DCU_BF16: str = "auto"
+    # gfx906 W8A8 INT8 GEMM built on the native `v_dot4_i32_i8` instruction.
+    # Off by default until the torch.compile integration is fixed: enabling it
+    # currently fails during engine compilation. Set to "1" to opt in; "0" or
+    # unset restores the Triton scaled_mm kernel (A/B and rollback switch).
+    VLLM_DCU_USE_INT8_SDOT4: bool = False
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1389,6 +1399,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE": lambda: (
         os.getenv("VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE", "False").lower()
         in ("true", "1")
+    ),
+    # Explicit GCN arch override for Hygon DCU (DTK) hosts, where amdsmi may
+    # report a bogus arch such as gfx18446744073709551615. Setting this also
+    # avoids initializing a HIP context while importing vLLM.
+    "VLLM_DCU_GCN_ARCH": lambda: os.getenv("VLLM_DCU_GCN_ARCH", "").strip(),
+    # bf16 availability on gfx906 (DTK): "auto" probes the device, "1" forces
+    # bf16 on, "0" forces it off. gfx906 has no native bf16 instructions, so
+    # bf16 is emulated and its usability is verified rather than assumed.
+    "VLLM_DCU_BF16": lambda: os.getenv("VLLM_DCU_BF16", "auto").strip().lower(),
+    # gfx906 W8A8 INT8 `v_dot4_i32_i8` GEMM (csrc/rocm/w8a8_sdot4.cu).
+    # Default OFF until the torch.compile integration is fixed (S11k); "1"
+    # enables it, "0"/unset restores the Triton scaled_mm kernel.
+    "VLLM_DCU_USE_INT8_SDOT4": lambda: (
+        os.getenv("VLLM_DCU_USE_INT8_SDOT4", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

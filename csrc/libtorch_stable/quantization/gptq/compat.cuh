@@ -5,6 +5,60 @@ Copied from https://github.com/turboderp/exllamav2
 #ifndef _compat_cuh
 #define _compat_cuh
 
+#ifdef USE_ROCM
+#include <type_traits>
+#include <utility>
+
+// Probe for an unqualified `atomicAdd(half2*, half2)` reaching this namespace;
+// the static_assert at the bottom of this file uses it to confirm the
+// `__DTK_ARCH__` decision below against the overload set the compiler sees.
+// A preprocessor test cannot do the probing itself (`::value` is not valid in
+// `#if`), and the HIP_VERSION gate below cannot be trusted either: DTK 26.04
+// reports HIP 6.3 while its <hip/amd_detail/amd_hip_fp16.h> declares
+// `__half2 atomicAdd(__half2*, __half2)` unconditionally.
+template <typename T, typename = void>
+struct vllm_gptq_has_native_half2_atomic_add : std::false_type {};
+template <typename T>
+struct vllm_gptq_has_native_half2_atomic_add<
+    T,
+    std::void_t<decltype(atomicAdd(std::declval<T*>(), std::declval<T>()))>>
+    : std::true_type {};
+#endif  // USE_ROCM
+
+// `__DTK_ARCH__` is defined by DTK's <ATen/dtk_macros.h>, which DTK's hipify
+// injects into every generated file, i.e. it is present in every DTK HIP
+// translation unit. DTK's amd_hip_fp16.h declares both `__half atomicAdd(
+// __half*, __half)` and `__half2 atomicAdd(__half2*, __half2)` at global scope
+// unconditionally, so on DTK neither emulation below may exist: each one is an
+// equally good candidate for the unqualified `atomicAdd(out, val)` calls in
+// this namespace and overload resolution would be ambiguous.
+#if defined(__CUDA_ARCH__) || defined(USE_ROCM)
+  #if !defined(__DTK_ARCH__)
+    #ifdef USE_ROCM
+      // Upstream's own gate: the `half2` overload landed in ROCm 7.13 as far as
+      // this file is concerned. A wrong guess fails the static_assert below
+      // rather than miscompiling.
+      #if defined(HIP_VERSION) && \
+          (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) >= 713
+        #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 0
+      #else
+        #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 1
+      #endif
+    #else
+      // CUDA: the native overloads arrived with sm_60 (half2) / sm_70 (half).
+      #if __CUDA_ARCH__ < 600
+        #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 1
+      #else
+        #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 0
+      #endif
+    #endif
+  #else
+    #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 0
+  #endif
+#else
+  #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 0
+#endif
+
 namespace vllm {
 namespace gptq {
 // atomicAdd for half types, to support CC < 7.x
@@ -41,19 +95,28 @@ __device__ __forceinline__ void atomicAdd_half2(half2* address, half2 val) {
   } while (assumed != old);
 }
 
-//
 #if defined(__CUDA_ARCH__) || \
     (defined(USE_ROCM) && (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) < 713)
   #if __CUDA_ARCH__ < 700 || defined(USE_ROCM)
+
+    #if VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED
 
 __device__ __forceinline__ void atomicAdd(half* address, half val) {
   atomicAdd_half(address, val);
 }
 
-    #if __CUDA_ARCH__ < 600 || defined(USE_ROCM)
 __device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
   atomicAdd_half2(address, val);
 }
+
+    #else
+
+      #if !defined(__DTK_ARCH__)
+__device__ __forceinline__ void atomicAdd(half* address, half val) {
+  atomicAdd_half(address, val);
+}
+      #endif
+
     #endif
 
   #endif
@@ -61,4 +124,19 @@ __device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
 
 }  // namespace gptq
 }  // namespace vllm
+
+#ifdef USE_ROCM
+namespace vllm {
+namespace gptq {
+// Confirms the `__DTK_ARCH__` decision above against the overload set the
+// compiler actually sees. With `VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED == 1` the
+// emulation is visible here too; with 0 the toolchain's own overload must be.
+static_assert(
+    vllm_gptq_has_native_half2_atomic_add<half2>::value,
+    "no atomicAdd(half2*, half2) is visible although the emulation was "
+    "compiled out by VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED");
+}  // namespace gptq
+}  // namespace vllm
+#endif  // USE_ROCM
+
 #endif
