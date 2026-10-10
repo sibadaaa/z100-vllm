@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import functools
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import regex as re
 
-from vllm.parser.engine.events import EventType
+from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.parser_engine_config import (
     ParserEngineConfig,
@@ -47,6 +48,74 @@ FUNC_PREFIX = "<function="
 FUNC_END = "</function>"
 PARAM_START = "<parameter="
 PARAM_END = "</parameter>"
+
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-]*")
+
+# Quantized Qwen3 checkpoints occasionally drop the ``function=`` marker and
+# open a tool call with the bare name, e.g. ``<tool_call>\n<bash>\n``. The
+# grammar has no terminal for that spelling, so the call used to be swallowed
+# and the response ended as an empty ``stop``. The requested tool names make
+# the intent unambiguous, so the opener is rewritten to the canonical form.
+_LOOSE_OPENER_RE = re.compile(r"^(?P<indent>\s*)<(?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)>")
+
+
+def _tool_names(tools: list[Tool] | None) -> frozenset[str]:
+    """Names of the tools requested for this request."""
+    names: set[str] = set()
+    for tool in tools or ():
+        function = getattr(tool, "function", None)
+        name = getattr(function, "name", None) if function is not None else None
+        if name is None:
+            name = getattr(tool, "name", None)
+        if isinstance(name, str) and name:
+            names.add(name)
+    return frozenset(names)
+
+
+def repair_loose_opener(text: str, tool_names: frozenset[str]) -> str:
+    """Rewrite a bare ``<name>`` tool-call opener to ``<function=name>``.
+
+    ``text`` is the region following a ``<tool_call>`` marker.
+    """
+    if not tool_names:
+        return text
+    match = _LOOSE_OPENER_RE.match(text)
+    if match is None or match.group("name") not in tool_names:
+        return text
+    name = match.group("name")
+    return f"{match.group('indent')}<function={name}>" + text[match.end() :]
+
+
+def _opener_settled(region: str, tool_names: frozenset[str]) -> bool:
+    """Whether text following ``<tool_call>`` can be parsed without lookahead.
+
+    The region stays open while it may still grow into an opener: a prefix of
+    the canonical ``<function=`` marker, or ``<`` plus a prefix of a requested
+    tool name.
+    """
+    stripped = region.lstrip()
+    if not stripped:
+        return False
+    if not stripped.startswith("<"):
+        return True
+    if FUNC_PREFIX.startswith(stripped):
+        return stripped == FUNC_PREFIX
+    match = _IDENT_RE.match(stripped[1:])
+    if match is None:
+        return True
+    if ">" in stripped[1 + match.end() :]:
+        return True
+    name = match.group(0)
+    return not any(tool_name.startswith(name) for tool_name in tool_names)
+
+
+def _partial_marker_len(text: str) -> int:
+    """Length of a trailing partial ``<tool_call>`` that must be held back."""
+    for keep in range(len(TOOL_CALL_START) - 1, 0, -1):
+        if text.endswith(TOOL_CALL_START[:keep]):
+            return keep
+    return 0
+
 
 _PARAM_RE = re.compile(
     r"<\s*parameter\s*=\s*([^>]*)>"
@@ -246,6 +315,121 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
+        self._tool_names = _tool_names(tools)
+        self._names_source = tools
+        self._pending: list[tuple[str, tuple[int, ...]]] = []
+        self._pending_text = ""
+        self._open_region = False
+
+    def _reset(self, initial_state: ParserState | None = None) -> None:
+        super()._reset(initial_state=initial_state)
+        self._pending = []
+        self._pending_text = ""
+        self._open_region = False
+
+    def _feed(
+        self,
+        delta_text: str,
+        delta_token_ids: Sequence[int],
+    ) -> list[SemanticEvent]:
+        if self._tools is not self._names_source:
+            self._names_source = self._tools
+            self._tool_names = _tool_names(self._tools)
+        if not self._tool_names:
+            return self._engine.feed(delta_text, delta_token_ids)
+        if delta_text:
+            self._pending.append((delta_text, tuple(delta_token_ids)))
+            self._pending_text += delta_text
+        events: list[SemanticEvent] = []
+        for part_text, part_ids in self._release_parts():
+            events.extend(self._engine.feed(part_text, part_ids))
+        return events
+
+    def _release_parts(self) -> list[tuple[str, tuple[int, ...]]]:
+        """Split what has arrived into engine-feedable parts.
+
+        A tool-call marker is fed as soon as it is complete — with its own
+        token ids, so the engine keeps treating it as a marker rather than as
+        prose. Only the region right after it is held, and only while it could
+        still grow into an opener, so a bare ``<bash>`` can be rewritten to
+        ``<function=bash>``.
+        """
+        parts: list[tuple[str, tuple[int, ...]]] = []
+        while self._pending_text:
+            if self._open_region:
+                if not _opener_settled(self._pending_text, self._tool_names):
+                    break
+                start = self._pending_text.find(TOOL_CALL_START)
+                if start == 0:
+                    self._open_region = False
+                    continue
+                cut = len(self._pending_text) if start < 0 else start
+                text, token_ids = self._take(cut)
+                parts.append((repair_loose_opener(text, self._tool_names), token_ids))
+                self._open_region = False
+                continue
+            start = self._pending_text.find(TOOL_CALL_START)
+            if start >= 0:
+                parts.append(self._take(start + len(TOOL_CALL_START)))
+                self._open_region = True
+                continue
+            captured = len(self._pending_text) - _partial_marker_len(self._pending_text)
+            if captured <= 0:
+                break
+            text, token_ids = self._take(captured)
+            if not text:
+                break
+            parts.append((text, token_ids))
+        return parts
+
+    def _take(self, cut: int) -> tuple[str, tuple[int, ...]]:
+        """Remove and return the first *cut* characters of the buffer."""
+        head: list[str] = []
+        head_token_ids: list[int] = []
+        kept: list[tuple[str, tuple[int, ...]]] = []
+        remaining = cut
+        for segment, segment_ids in self._pending:
+            if remaining <= 0:
+                kept.append((segment, segment_ids))
+                continue
+            if remaining >= len(segment):
+                head.append(segment)
+                head_token_ids.extend(segment_ids)
+                remaining -= len(segment)
+                continue
+            chars, count = self._aligned_prefix(segment, segment_ids, remaining)
+            if chars > 0:
+                head.append(segment[:chars])
+                head_token_ids.extend(segment_ids[:count])
+                rest = (segment[chars:], segment_ids[count:])
+            else:
+                rest = (segment, segment_ids)
+            kept.append(rest)
+            remaining = 0
+        self._pending = kept
+        self._pending_text = "".join(segment for segment, _ in kept)
+        return "".join(head), tuple(head_token_ids)
+
+    def _aligned_prefix(
+        self,
+        segment: str,
+        segment_ids: tuple[int, ...],
+        limit: int,
+    ) -> tuple[int, int]:
+        """Largest ``(chars, token_ids)`` prefix of a segment within *limit*."""
+        if not segment_ids:
+            return min(limit, len(segment)), 0
+        chars = 0
+        count = 0
+        for token_id in segment_ids:
+            piece = self.model_tokenizer.decode([token_id])
+            if not isinstance(piece, str):
+                piece = ""
+            if chars + len(piece) > limit:
+                break
+            chars += len(piece)
+            count += 1
+        return chars, count
 
     def extract_reasoning(
         self,
