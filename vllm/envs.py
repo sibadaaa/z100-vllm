@@ -162,11 +162,38 @@ if TYPE_CHECKING:
     VLLM_DCU_GCN_ARCH: str = ""
     # "auto" probes the device, "1"/"0" force bf16 on/off on gfx906.
     VLLM_DCU_BF16: str = "auto"
+    # Master switch for the three gfx906 (Z100) emulation kernels: the W8A8
+    # INT8 `v_dot4_i32_i8` kernel, the FP8 emulation kernel and the dense
+    # fp16/bf16 decode GEMV (see
+    # vllm/model_executor/kernels/linear/scaled_mm/gfx906_common.py). An
+    # *explicit* per-kernel setting below always wins over this one, so
+    # `VLLM_DCU_USE_GFX906_EMU=1 VLLM_DCU_USE_INT8_SDOT4=0` enables everything
+    # but INT8.
+    VLLM_DCU_USE_GFX906_EMU: bool = False
     # gfx906 W8A8 INT8 GEMM built on the native `v_dot4_i32_i8` instruction.
-    # Off by default until the torch.compile integration is fixed: enabling it
-    # currently fails during engine compilation. Set to "1" to opt in; "0" or
-    # unset restores the Triton scaled_mm kernel (A/B and rollback switch).
+    # Kept OFF by default even though the kernel is validated: S11l/S11m showed
+    # that enabling it changes greedy tokens (numerically, not by scheduling),
+    # and the repo's default must stay bit-stable; production opts in with
+    # "1" (3.9x decode). Explicit "0" or unset keeps the Triton scaled_mm
+    # kernel (A/B and rollback switch).
     VLLM_DCU_USE_INT8_SDOT4: bool = False
+    # gfx906 W8A8 FP8 GEMM/GEMV emulated on the fp16 datapath
+    # (csrc/rocm/fp8_emu_gemm.cu: fp8 --LDS LUT--> fp16 + `v_dot2_f32_f16`).
+    # gfx906 has no fp8 hardware at all, so without this kernel every FP8
+    # scaled-MM candidate refuses the target. Off by default (A/B + rollback
+    # switch); "1" opts in, "0"/unset keeps the previous selection.
+    VLLM_DCU_USE_FP8_EMU: bool = False
+    # Conversion route for the fp8 -> fp16 widening: "lut" (256-entry LDS
+    # table, exact for e4m3/e5m2) or "bits" (packed ALU; e5m2 exact, e4m3 only
+    # when no subnormal codes are present). Reserved for the A/B switch; the
+    # current kernel always uses the LUT.
+    VLLM_DCU_FP8_CVT: str = "lut"
+    # Dense fp16/bf16 decode GEMV (csrc/rocm/bf16_emu_gemv.cu), the gfx906
+    # replacement for the rocBLAS fallback on decode-shaped linear layers.
+    VLLM_DCU_USE_BF16_GEMV: bool = False
+    # "auto" (fp16 -> dot2, bf16 -> fp32), "f32" (exact, bf16 only) or
+    # "f16" (bf16 rebased to fp16 + dot2; requires the weight range check).
+    VLLM_DCU_BF16_ROUTE: str = "auto"
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1408,12 +1435,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bf16 on, "0" forces it off. gfx906 has no native bf16 instructions, so
     # bf16 is emulated and its usability is verified rather than assumed.
     "VLLM_DCU_BF16": lambda: os.getenv("VLLM_DCU_BF16", "auto").strip().lower(),
+    # Master switch for the gfx906 emulation kernels (see the annotation
+    # above). Per-kernel switches below override it when set explicitly.
+    "VLLM_DCU_USE_GFX906_EMU": lambda: (
+        os.getenv("VLLM_DCU_USE_GFX906_EMU", "False").lower() in ("true", "1")
+    ),
     # gfx906 W8A8 INT8 `v_dot4_i32_i8` GEMM (csrc/rocm/w8a8_sdot4.cu).
-    # Default OFF until the torch.compile integration is fixed (S11k); "1"
-    # enables it, "0"/unset restores the Triton scaled_mm kernel.
+    # Default OFF (enabling changes greedy tokens numerically); "1" enables it,
+    # "0"/unset restores the Triton scaled_mm kernel. Reads go through
+    # `gfx906_common.gfx906_emu_enabled()` so that the master switch and this
+    # per-kernel override compose.
     "VLLM_DCU_USE_INT8_SDOT4": lambda: (
         os.getenv("VLLM_DCU_USE_INT8_SDOT4", "False").lower() in ("true", "1")
     ),
+    # gfx906 W8A8 FP8 GEMM/GEMV emulated on the fp16 datapath
+    # (csrc/rocm/fp8_emu_gemm.cu). "1" enables the gfx906 FP8 kernel in the
+    # FP8 scaled-MM selection table; "0"/unset keeps the previous behaviour
+    # (per-tensor/per-channel FP8 refused, block-scaled on the slow Triton
+    # path). A/B and rollback switch.
+    "VLLM_DCU_USE_FP8_EMU": lambda: (
+        os.getenv("VLLM_DCU_USE_FP8_EMU", "False").lower() in ("true", "1")
+    ),
+    # fp8 -> fp16 conversion route selector for the emulation kernel
+    # ("lut" = 256-entry LDS table, exact; "bits" = packed ALU ops).
+    "VLLM_DCU_FP8_CVT": lambda: os.getenv("VLLM_DCU_FP8_CVT", "lut").strip().lower(),
+    # Dense fp16/bf16 decode GEMV on gfx906 (csrc/rocm/bf16_emu_gemv.cu).
+    # "1" replaces the rocBLAS fallback for M <= 8 unquantized linear layers.
+    "VLLM_DCU_USE_BF16_GEMV": lambda: (
+        os.getenv("VLLM_DCU_USE_BF16_GEMV", "False").lower() in ("true", "1")
+    ),
+    # Accumulation route for the bf16 GEMV: "auto" | "f32" | "f16".
+    "VLLM_DCU_BF16_ROUTE": lambda: os.getenv(
+        "VLLM_DCU_BF16_ROUTE", "auto"
+    ).strip().lower(),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
     # Recommended for large models to get allreduce

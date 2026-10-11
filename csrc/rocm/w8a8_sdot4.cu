@@ -61,11 +61,13 @@ constexpr int kNtMax = 512;    // max GEMV threads per block (power of two)
 template <int MS, typename T>
 __global__ void w8a8_sdot4_gemv_kernel(const int8_t* __restrict__ xq,  // [M, K]
                                        const int8_t* __restrict__ w,   // [N, K]
-                                       const float* __restrict__ x_s,  // [M]
-                                       const float* __restrict__ w_s,  // [N]
-                                       const T* __restrict__ bias,     // [N] | null
-                                       T* __restrict__ out,            // [M, N]
-                                       const int M, const int N, const int K4) {
+                                       const float* __restrict__ x_s,
+                                       const float* __restrict__ w_s,
+                                       const T* __restrict__ bias,  // [N] | null
+                                       T* __restrict__ out,         // [M, N]
+                                       const int M, const int N, const int K4,
+                                       const int x_s_stride,
+                                       const int w_s_stride) {
   extern __shared__ int red[];  // [MS][nt]
   const int n = blockIdx.x;
   const int t = threadIdx.x;
@@ -104,7 +106,11 @@ __global__ void w8a8_sdot4_gemv_kernel(const int8_t* __restrict__ xq,  // [M, K]
   }
 
   if (t < M) {
-    const float v = static_cast<float>(red[t * nt]) * x_s[t] * w_s[n];
+    // x_s_stride / w_s_stride are 0 for per-tensor (1-element) scales and 1
+    // for per-token / per-channel scales -- same contract as the FP8
+    // emulation kernel (csrc/rocm/fp8_emu_gemm.cu).
+    const float v = static_cast<float>(red[t * nt]) * x_s[t * x_s_stride] *
+                    w_s[n * w_s_stride];
     // Same order as triton_scaled_mm (and as the GEMM epilogue below):
     // (acc * x_s) * w_s, cast to the output dtype, then add bias in that
     // dtype.  The out-of-tree original folded the bias in fp32 before the
@@ -117,8 +123,9 @@ __global__ void w8a8_sdot4_gemv_kernel(const int8_t* __restrict__ xq,  // [M, K]
 }
 
 template <typename T>
-void launch_gemv(int M, int N, int K4, int nt, const int8_t* xq, const int8_t* w,
-                 const float* x_s, const float* w_s, const T* bias, T* out,
+void launch_gemv(int M, int N, int K4, int nt, int x_s_stride, int w_s_stride,
+                 const int8_t* xq, const int8_t* w, const float* x_s,
+                 const float* w_s, const T* bias, T* out,
                  hipStream_t stream) {
   const size_t smem = [&]() {
     if (M <= 1) return (size_t)1 * nt * sizeof(int);
@@ -127,14 +134,14 @@ void launch_gemv(int M, int N, int K4, int nt, const int8_t* xq, const int8_t* w
   }();
   dim3 grid(N), block(nt);
   if (M <= 1)
-    w8a8_sdot4_gemv_kernel<1, T>
-        <<<grid, block, smem, stream>>>(xq, w, x_s, w_s, bias, out, M, N, K4);
+    w8a8_sdot4_gemv_kernel<1, T><<<grid, block, smem, stream>>>(
+        xq, w, x_s, w_s, bias, out, M, N, K4, x_s_stride, w_s_stride);
   else if (M <= 4)
-    w8a8_sdot4_gemv_kernel<4, T>
-        <<<grid, block, smem, stream>>>(xq, w, x_s, w_s, bias, out, M, N, K4);
+    w8a8_sdot4_gemv_kernel<4, T><<<grid, block, smem, stream>>>(
+        xq, w, x_s, w_s, bias, out, M, N, K4, x_s_stride, w_s_stride);
   else
-    w8a8_sdot4_gemv_kernel<kMsMax, T>
-        <<<grid, block, smem, stream>>>(xq, w, x_s, w_s, bias, out, M, N, K4);
+    w8a8_sdot4_gemv_kernel<kMsMax, T><<<grid, block, smem, stream>>>(
+        xq, w, x_s, w_s, bias, out, M, N, K4, x_s_stride, w_s_stride);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +264,8 @@ template <int BM, int BN, int TM, int TN, typename T>
 __global__ void __launch_bounds__((BM / TM) * (BN / TN)) w8a8_sdot4_gemm_kernel(
     const int8_t* __restrict__ A, const int8_t* __restrict__ W,
     const float* __restrict__ x_s, const float* __restrict__ w_s,
-    const T* __restrict__ bias, T* __restrict__ C, int M, int N, int K) {
+    const T* __restrict__ bias, T* __restrict__ C, int M, int N, int K,
+    int x_s_stride, int w_s_stride) {
   using C_ = GConf<BM, BN, TM, TN>;
   constexpr int NT = C_::NT;
   constexpr int FRAGS = C_::FRAGS;
@@ -313,12 +321,12 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN)) w8a8_sdot4_gemm_kernel(
   for (int i = 0; i < TM; ++i) {
     const int row = m0 + ty + C_::MG * i;
     if (row >= M) continue;
-    const float sa = x_s[row];
+    const float sa = x_s[row * x_s_stride];
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
       const int col = n0 + tx + C_::NG * j;
       if (col >= N) continue;
-      const float v = static_cast<float>(acc[i][j]) * sa * w_s[col];
+      const float v = static_cast<float>(acc[i][j]) * sa * w_s[col * w_s_stride];
       T o = static_cast<T>(v);
       if (bias != nullptr) o += static_cast<T>(bias[col]);
       C[(int64_t)row * N + col] = o;
@@ -327,19 +335,23 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN)) w8a8_sdot4_gemm_kernel(
 }
 
 template <int BM, int BN, int TM, int TN, typename T>
-void launch_gemm(int M, int N, int K, const int8_t* A, const int8_t* W,
-                 const float* x_s, const float* w_s, const T* bias, T* C,
-                 hipStream_t stream) {
+void launch_gemm(int M, int N, int K, int x_s_stride, int w_s_stride,
+                 const int8_t* A, const int8_t* W, const float* x_s,
+                 const float* w_s, const T* bias, T* C, hipStream_t stream) {
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
   dim3 block((BM / TM) * (BN / TN));
-  w8a8_sdot4_gemm_kernel<BM, BN, TM, TN, T>
-      <<<grid, block, 0, stream>>>(A, W, x_s, w_s, bias, C, M, N, K);
+  w8a8_sdot4_gemm_kernel<BM, BN, TM, TN, T><<<grid, block, 0, stream>>>(
+      A, W, x_s, w_s, bias, C, M, N, K, x_s_stride, w_s_stride);
 }
 
+// Scale contract (shared with csrc/rocm/fp8_emu_gemm.cu):
+//   * x_s may hold M elements (dynamic per-token) or 1 (static per-tensor);
+//   * w_s may hold N elements (per-channel) or 1 (per-tensor).
+// A 1-element scale is addressed with stride 0.
 void check_common(const torch::Tensor& xq, const torch::Tensor& w,
                   const torch::Tensor& x_s, const torch::Tensor& w_s,
                   const std::optional<torch::Tensor>& bias,
-                  at::ScalarType out_dtype) {
+                  at::ScalarType out_dtype, int& x_s_stride, int& w_s_stride) {
   TORCH_CHECK(xq.is_cuda() && w.is_cuda() && x_s.is_cuda() && w_s.is_cuda(),
               "w8a8_sdot4: all tensors must be on the GPU");
   TORCH_CHECK(xq.scalar_type() == at::kChar && w.scalar_type() == at::kChar,
@@ -351,8 +363,10 @@ void check_common(const torch::Tensor& xq, const torch::Tensor& w,
               "w8a8_sdot4: tensors must be contiguous");
   TORCH_CHECK(w.size(1) == xq.size(1), "w8a8_sdot4: K mismatch: xq K=",
               xq.size(1), " w K=", w.size(1));
-  TORCH_CHECK(x_s.numel() == xq.size(0), "w8a8_sdot4: x_s must have M elements");
-  TORCH_CHECK(w_s.numel() == w.size(0), "w8a8_sdot4: w_s must have N elements");
+  TORCH_CHECK(x_s.numel() == xq.size(0) || x_s.numel() == 1,
+              "w8a8_sdot4: x_s must have M or 1 elements, got ", x_s.numel());
+  TORCH_CHECK(w_s.numel() == w.size(0) || w_s.numel() == 1,
+              "w8a8_sdot4: w_s must have N or 1 elements, got ", w_s.numel());
   TORCH_CHECK(out_dtype == at::kHalf || out_dtype == at::kBFloat16 ||
                   out_dtype == at::kFloat,
               "w8a8_sdot4: unsupported out dtype ", out_dtype);
@@ -363,6 +377,8 @@ void check_common(const torch::Tensor& xq, const torch::Tensor& w,
     TORCH_CHECK(bias->scalar_type() == out_dtype,
                 "w8a8_sdot4: bias dtype must match out dtype");
   }
+  x_s_stride = x_s.numel() == 1 ? 0 : 1;
+  w_s_stride = w_s.numel() == 1 ? 0 : 1;
 }
 
 }  // namespace
@@ -371,7 +387,8 @@ torch::Tensor w8a8_sdot4_gemv(torch::Tensor xq, torch::Tensor w,
                               torch::Tensor x_s, torch::Tensor w_s,
                               std::optional<torch::Tensor> bias,
                               at::ScalarType out_dtype, int64_t nthreads) {
-  check_common(xq, w, x_s, w_s, bias, out_dtype);
+  int x_s_stride = 1, w_s_stride = 1;
+  check_common(xq, w, x_s, w_s, bias, out_dtype, x_s_stride, w_s_stride);
   const int64_t M = xq.size(0), K = xq.size(1), N = w.size(0);
   TORCH_CHECK(K % 4 == 0, "w8a8_sdot4: K must be a multiple of 4, got ", K);
   TORCH_CHECK(M >= 1 && M <= kMsMax, "w8a8_sdot4: M must be in [1,", kMsMax,
@@ -399,18 +416,19 @@ torch::Tensor w8a8_sdot4_gemv(torch::Tensor xq, torch::Tensor w,
   switch (out.scalar_type()) {
     case at::kBFloat16:
       launch_gemv<at::BFloat16>(
-          M, N, K4, nt, xq_p, w_p, xs_p, ws_p,
+          M, N, K4, nt, x_s_stride, w_s_stride, xq_p, w_p, xs_p, ws_p,
           reinterpret_cast<const at::BFloat16*>(bias_ptr),
           reinterpret_cast<at::BFloat16*>(out.data_ptr()), stream);
       break;
     case at::kHalf:
-      launch_gemv<at::Half>(M, N, K4, nt, xq_p, w_p, xs_p, ws_p,
+      launch_gemv<at::Half>(M, N, K4, nt, x_s_stride, w_s_stride, xq_p, w_p,
+                            xs_p, ws_p,
                             reinterpret_cast<const at::Half*>(bias_ptr),
                             reinterpret_cast<at::Half*>(out.data_ptr()), stream);
       break;
     default:
-      launch_gemv<float>(M, N, K4, nt, xq_p, w_p, xs_p, ws_p,
-                         reinterpret_cast<const float*>(bias_ptr),
+      launch_gemv<float>(M, N, K4, nt, x_s_stride, w_s_stride, xq_p, w_p, xs_p,
+                         ws_p, reinterpret_cast<const float*>(bias_ptr),
                          reinterpret_cast<float*>(out.data_ptr()), stream);
       break;
   }
@@ -421,7 +439,8 @@ torch::Tensor w8a8_sdot4_gemm(torch::Tensor xq, torch::Tensor w,
                               torch::Tensor x_s, torch::Tensor w_s,
                               std::optional<torch::Tensor> bias,
                               at::ScalarType out_dtype, int64_t cfg) {
-  check_common(xq, w, x_s, w_s, bias, out_dtype);
+  int x_s_stride = 1, w_s_stride = 1;
+  check_common(xq, w, x_s, w_s, bias, out_dtype, x_s_stride, w_s_stride);
   const int64_t M = xq.size(0), K = xq.size(1), N = w.size(0);
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "w8a8_sdot4: K must be a positive multiple of 4, got ", K);
@@ -447,7 +466,8 @@ torch::Tensor w8a8_sdot4_gemm(torch::Tensor xq, torch::Tensor w,
 #define VLLM_SDOT4_GEMM_CASE(CFG, BM, BN, TM, TN, T)                       \
   case CFG:                                                               \
     launch_gemm<BM, BN, TM, TN, T>(                                       \
-        Mi, Ni, Ki, A, W, xs, ws, reinterpret_cast<const T*>(bias_ptr),   \
+        Mi, Ni, Ki, x_s_stride, w_s_stride, A, W, xs, ws,                  \
+        reinterpret_cast<const T*>(bias_ptr),                             \
         reinterpret_cast<T*>(out.data_ptr()), stream);                    \
     break
 
@@ -459,7 +479,7 @@ torch::Tensor w8a8_sdot4_gemm(torch::Tensor xq, torch::Tensor w,
         VLLM_SDOT4_GEMM_CASE(3, 64, 128, 4, 8, at::BFloat16);
         default:
           launch_gemm<128, 128, 8, 8, at::BFloat16>(
-              Mi, Ni, Ki, A, W, xs, ws,
+              Mi, Ni, Ki, x_s_stride, w_s_stride, A, W, xs, ws,
               reinterpret_cast<const at::BFloat16*>(bias_ptr),
               reinterpret_cast<at::BFloat16*>(out.data_ptr()), stream);
           break;
@@ -472,7 +492,7 @@ torch::Tensor w8a8_sdot4_gemm(torch::Tensor xq, torch::Tensor w,
         VLLM_SDOT4_GEMM_CASE(3, 64, 128, 4, 8, at::Half);
         default:
           launch_gemm<128, 128, 8, 8, at::Half>(
-              Mi, Ni, Ki, A, W, xs, ws,
+              Mi, Ni, Ki, x_s_stride, w_s_stride, A, W, xs, ws,
               reinterpret_cast<const at::Half*>(bias_ptr),
               reinterpret_cast<at::Half*>(out.data_ptr()), stream);
           break;
@@ -485,7 +505,7 @@ torch::Tensor w8a8_sdot4_gemm(torch::Tensor xq, torch::Tensor w,
         VLLM_SDOT4_GEMM_CASE(3, 64, 128, 4, 8, float);
         default:
           launch_gemm<128, 128, 8, 8, float>(
-              Mi, Ni, Ki, A, W, xs, ws,
+              Mi, Ni, Ki, x_s_stride, w_s_stride, A, W, xs, ws,
               reinterpret_cast<const float*>(bias_ptr),
               reinterpret_cast<float*>(out.data_ptr()), stream);
           break;

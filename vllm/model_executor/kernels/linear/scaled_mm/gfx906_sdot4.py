@@ -17,10 +17,20 @@ Design notes:
 * M <= ``_GEMV_MAX_M`` (decode) takes the GEMV path; larger M takes the tiled
   GEMM path.  Both accumulate in int32 and apply ``x_s``/``w_s`` only in the
   epilogue, in the same order as ``triton_scaled_mm``.
-* Rollback / A-B switch: ``VLLM_DCU_USE_INT8_SDOT4=1`` opts in (default is off
-  until the compile integration is proven end to end).  When disabled, or when
-  the shape/quantization form is not covered, the ROCm kernel table falls
-  through to ``TritonInt8ScaledMMLinearKernel``.
+* Scale forms: weight scales per-channel ``[N]`` or per-tensor ``[1]``; input
+  scales dynamic per-token ``[M]`` or static per-tensor ``[1]``.  A 1-element
+  scale is applied with stride 0 inside the kernel -- the same contract as the
+  FP8 emulation kernel (``gfx906_fp8.py``).  Asymmetric activation
+  quantization (zero point / azp adjustment) is not implemented here, so
+  ``can_implement`` requires symmetric inputs.
+* Rollback / A-B switch: ``VLLM_DCU_USE_INT8_SDOT4=1`` opts in.  The repo
+  default stays off because enabling it changes greedy tokens numerically
+  (S11l/S11m); the production recipe sets ``=1`` explicitly.  The shared master
+  switch ``VLLM_DCU_USE_GFX906_EMU=1`` enables it together with the FP8 and
+  dense-GEMV kernels, and an explicit per-kernel value wins over the master
+  (see ``gfx906_common.py``).  When disabled, or when the shape/quantization
+  form is not covered, the ROCm kernel table falls through to
+  ``TritonInt8ScaledMMLinearKernel``.
 * ``VLLM_DCU_SDOT4_INNER=triton`` is a *diagnostic* override (S11l): it keeps
   the opaque ``custom_op`` in the graph but runs ``triton_scaled_mm`` inside
   its body.  It exists only to separate "the opaque op changed the compiled
@@ -44,7 +54,6 @@ import os
 import torch
 
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
@@ -56,6 +65,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx906
 
+from .gfx906_common import gfx906_emu_enabled
 from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
@@ -150,8 +160,11 @@ class Gfx906Sdot4Int8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
             return False, "requires ROCm."
         if not on_gfx906():
             return False, "requires gfx906 (V_DOT4_I32_I8)."
-        if not envs.VLLM_DCU_USE_INT8_SDOT4:
-            return False, "disabled by VLLM_DCU_USE_INT8_SDOT4=0."
+        if not gfx906_emu_enabled("VLLM_DCU_USE_INT8_SDOT4"):
+            return False, (
+                "disabled by VLLM_DCU_USE_INT8_SDOT4=0 (or unset while "
+                "VLLM_DCU_USE_GFX906_EMU=0)."
+            )
         if not ops_available():
             return False, "torch.ops._rocm_C.w8a8_sdot4_* is not registered."
         if not hasattr(torch.ops.vllm, "w8a8_sdot4_mm"):
@@ -162,12 +175,13 @@ class Gfx906Sdot4Int8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     def can_implement(
         cls, c: Int8ScaledMMLinearLayerConfig
     ) -> tuple[bool, str | None]:
+        # Scale contract of the kernel (csrc/rocm/w8a8_sdot4.cu):
+        #   * x_s: M elements (dynamic per-token) or 1 (static per-tensor);
+        #   * w_s: N elements (per-channel) or 1 (per-tensor).
+        # Asymmetric activation quantization needs an azp correction term that
+        # this kernel does not implement, so symmetric input is required.
         if not c.input_symmetric:
             return False, "supports symmetric input quantization only."
-        if c.is_static_input_scheme:
-            return False, "supports dynamic per-token input quantization only."
-        if not c.is_channelwise:
-            return False, "requires per-channel weight scales."
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -181,7 +195,9 @@ class Gfx906Sdot4Int8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
                 layer, w_q_name, torch.nn.Parameter(w, requires_grad=False)
             )
 
-        # Per-channel weight scale, flattened to [N] float32.
+        # Weight scale: per-channel [N] (fused modules with a per-tensor scale
+        # are widened to per-channel, exactly like the Triton kernel) or a
+        # single per-tensor value, which the kernel applies with stride 0.
         w_s = getattr(layer, w_s_name)
         logical_widths = getattr(layer, "logical_widths", None)
         if (
@@ -191,17 +207,32 @@ class Gfx906Sdot4Int8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         ):
             w_s = convert_to_channelwise(w_s, logical_widths)
         w_s = w_s.reshape(-1).to(torch.float32).contiguous()
-        if w_s.numel() != w.shape[0]:
-            # can_implement() already rules this out for the supported configs.
+        if w_s.numel() not in (1, w.shape[0]):
             raise RuntimeError(
                 f"Gfx906Sdot4Int8ScaledMMLinearKernel: weight_scale has "
-                f"{w_s.numel()} elements but N={w.shape[0]}"
+                f"{w_s.numel()} elements but N={w.shape[0]} (the kernel "
+                f"accepts per-channel [N] or per-tensor [1])"
             )
         replace_parameter(layer, w_s_name, torch.nn.Parameter(w_s, requires_grad=False))
 
-        # Dynamic symmetric quantization: no input scale / zero point / azp
-        # term is needed (x_s is computed per token in apply_weights).
-        setattr(layer, i_s_name, None)
+        # Input scale: static per-tensor scales are kept (the kernel applies a
+        # 1-element scale with stride 0); dynamic quantization computes x_s per
+        # token in apply_weights.  Asymmetric quantization (input zero point /
+        # azp adjustment) is not implemented by this kernel, so those are
+        # dropped -- can_implement() already requires symmetric inputs.
+        i_s = getattr(layer, i_s_name, None)
+        if self.config.is_static_input_scheme and i_s is not None:
+            i_s = i_s.reshape(-1).to(torch.float32).contiguous()
+            if i_s.numel() != 1:
+                raise RuntimeError(
+                    f"Gfx906Sdot4Int8ScaledMMLinearKernel: static input_scale "
+                    f"must be a scalar, got {i_s.numel()} elements"
+                )
+            replace_parameter(
+                layer, i_s_name, torch.nn.Parameter(i_s, requires_grad=False)
+            )
+        else:
+            setattr(layer, i_s_name, None)
         setattr(layer, i_zp_name, None)
         setattr(layer, azp_adj_name, None)
 
@@ -225,14 +256,26 @@ class Gfx906Sdot4Int8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        w, w_s, _i_s, _i_zp, _azp = self._get_layer_params(layer)
+        w, w_s, i_s, _i_zp, _azp = self._get_layer_params(layer)
         x_2d = x.reshape(-1, x.shape[-1])
         out_shape = (*x.shape[:-1], w.shape[0])
+
+        # Static per-tensor input scale (kept by process_weights_after_loading)
+        # or dynamic per-token quantization.  `ops.scaled_int8_quant` handles
+        # both: with a scale it is static, without it computes the per-token
+        # scale.
+        static_input = (
+            self.config.is_static_input_scheme
+            and i_s is not None
+            and i_s.numel() == 1
+        )
+        a_scale = i_s if static_input else None
 
         k = w.shape[1]
         supported = (
             w.dtype == torch.int8
             and w_s.dtype == torch.float32
+            and w_s.numel() in (1, w.shape[0])
             and k == x_2d.shape[1]
             and k % 4 == 0
             and x_2d.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -240,14 +283,14 @@ class Gfx906Sdot4Int8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         )
         if not supported:
             x_q, x_s, _ = ops.scaled_int8_quant(
-                x_2d.contiguous(), None, None, symmetric=True
+                x_2d.contiguous(), a_scale, None, symmetric=True
             )
             return self._triton_fallback(
                 x_q, x_s.reshape(-1), w, w_s, bias, x.dtype
             ).view(out_shape)
 
         x_q, x_s, _ = ops.scaled_int8_quant(
-            x_2d.contiguous(), None, None, symmetric=True
+            x_2d.contiguous(), a_scale, None, symmetric=True
         )
         x_s = x_s.reshape(-1)
 

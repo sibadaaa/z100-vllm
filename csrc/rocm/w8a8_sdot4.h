@@ -6,6 +6,11 @@
 
 // W8A8 INT8 GEMM/GEMV built on the gfx906 `V_DOT4_I32_I8` instruction.
 // See csrc/rocm/w8a8_sdot4.cu for the layout contract and provenance.
+//
+// Scale contract (shared with csrc/rocm/fp8_emu_gemm.cu):
+//   * `x_s` may hold M elements (dynamic per-token) or 1 (static per-tensor);
+//   * `w_s` may hold N elements (per-channel) or 1 (per-tensor).
+// A 1-element scale is applied as a scalar (stride 0 inside the kernel).
 
 // Decode path (M <= 8): one block per output column, LDS tree reduction.
 // `nthreads` is the GEMV block size (power of two, <= 512; 64 is the tuned
