@@ -20,10 +20,18 @@ from vllm.triton_utils import tl, triton
 
 _GFX906_MTP_CONV_DEBUG_REPORTED = False
 
-# gfx906 escape hatch: set VLLM_GFX906_TRITON_CAUSAL_CONV1D=0 to keep
-# routing prefill causal-conv1d through the per-sequence PyTorch fallback.
+# gfx906 escape hatch: set VLLM_GFX906_TRITON_CAUSAL_CONV1D=1 to route prefill
+# causal-conv1d through the Triton kernel.  Default OFF (fallback below) because
+# on Qwen3.8-27B W8A8 INT8 serving the Triton path deterministically selects a
+# degenerate generation attractor: thinking loops that never emit content, empty
+# responses and repetition (4/4 engine starts), while the fallback does not
+# (0/4).  The Triton kernel itself is *numerically identical* to the fallback
+# here (12/12 in-engine call replays bit-equal, state included), so the trigger
+# is an indirect side effect (layout/kernel-schedule dependent), not the conv
+# math; see docs/result/z100-15-conv-prefill-quality-result.md.  Cost of the
+# fallback is small: prefill 394 vs 424 t/s @2048 tokens (TP=4, eager).
 ENABLE_GFX906_TRITON_CAUSAL_CONV1D = os.getenv(
-    "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "1"
+    "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "0"
 ).lower() in {"1", "true", "yes", "on"}
 
 # gfx906 launch-safety sync: synchronize the stream right after the Triton
