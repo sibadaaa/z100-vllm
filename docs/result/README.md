@@ -88,5 +88,6 @@ Todolist 见 [`docs/z100-todolist.md`](../z100-todolist.md)，分步做法见 [`
 | S11m | [z100-11m-aot-restart-reproducibility-result.md](z100-11m-aot-restart-reproducibility-result.md) | ✅ AOT 重载真因（缺尾换行口径不一致）+ 修复（54.15→19.5 s）；`=1` 热启动 3/3 逐位一致；**修正：token 变体由 vintage 决定而非开关（同会话 `=0`/`=1` 仅差 2/512）**；146 passed | 2026-10-09 |
 | S12 | [z100-12-p2p-acs-impact-result.md](z100-12-p2p-acs-impact-result.md) | ✅ **NCCL 两态完全一致**（RCCL 全走 SHM、0 条 P2P）；27B TP=2 差异 ≤0.7%；TP=4 不可行（4B 曲线 TP2→4 仅 1.07×）；公平基线：我们 TP=2 快生产栈 1.43–1.56×；顺带修掉 `revert` 的真 bug | 2026-10-09 |
 | S13 | 待补（去掉 `--disable-custom-all-reduce` 的收益测评 + 8K prefill / vendor 重复） | — | — |
-| S11f | 待补（P6：FP16 模拟 FP8） | — | — |
+| S11f | [z100-11f-fp8-bf16-emu-kernels-result.md](z100-11f-fp8-bf16-emu-kernels-result.md) | 🔶 内核级完成：FP8 W8A8（LDS LUT + dot2）与 bf16/fp16 decode GEMV；`v_fmac_f32`=0、FP8 sweep 384/384、28 passed；FP8 decode 1.6–5.5×、dense decode 1.3–5.7×（≤0.39 ulp）；**端到端 / block-scaled 未做** | 2026-10-11 |
+| S11e2 | [z100-11e2-int8-family-integration-result.md](z100-11e2-int8-family-integration-result.md) | ✅ INT8 `sdot4` 并入内核族：per-tensor/per-channel × 动态/静态 scale 契约、族总开关 `VLLM_DCU_USE_GFX906_EMU`、新单测 28 项；56 passed、`--mode int` 全 bit_equal、`--mode check` 2.988e-04 与 S11e 一致 | 2026-10-11 |
 | S11g | [z100-11g-1cat-vllm-reference-analysis-result.md](z100-11g-1cat-vllm-reference-analysis-result.md) | ✅ 7/7 条 `file:line` 证据；三条结论已折进方案 §4C.1（Lead 修正其一：271→95 s 出处是 `README.md:1303-1308`） | 2026-10-08 |
