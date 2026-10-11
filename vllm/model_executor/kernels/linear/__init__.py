@@ -213,6 +213,10 @@ from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
 from vllm.model_executor.kernels.linear.scaled_mm.gfx906_sdot4 import (
     Gfx906Sdot4Int8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.gfx906_fp8 import (
+    Gfx906Fp8BlockScaledMMLinearKernel,
+    Gfx906Fp8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     BlockWiseTorchFP8ScaledMMLinearKernel,
     ChannelWiseTorchFP8ScaledMMLinearKernel,
@@ -438,6 +442,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         HummingFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        Gfx906Fp8ScaledMMLinearKernel,
         AiterHipbMMPerTokenFp8ScaledMMLinearKernel,
         AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
         AiterPerTokenFp8ScaledMMLinearKernel,
@@ -476,6 +481,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         BlockWiseTorchFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        Gfx906Fp8BlockScaledMMLinearKernel,
         AiterFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,
     ],

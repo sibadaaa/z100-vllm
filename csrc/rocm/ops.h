@@ -2,6 +2,8 @@
 
 #include <torch/all.h>
 
+#include "rocm/bf16_emu_gemv.h"
+#include "rocm/fp8_emu_gemm.h"
 #include "rocm/w8a8_sdot4.h"
 
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,

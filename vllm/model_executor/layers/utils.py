@@ -15,7 +15,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.rocm import on_gfx9
+from vllm.platforms.rocm import on_gfx9, on_gfx906
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
     is_flashinfer_cutedsl_bf16_gemm_supported,
@@ -426,6 +426,86 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+_GFX906_GEMV_THREADS = 64
+_GFX906_GEMV_AVAILABLE = hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "bf16_emu_gemv"
+)
+
+
+def _gfx906_gemv_shape_ok(n_tokens: int, n_out: int, dtype: torch.dtype) -> bool:
+    """Shapes where the emulated GEMV beats rocBLAS (measured, see
+    ``tools/dcu/s11f_bf16_gemv_probe.py``).
+
+    Measured speedups over `F.linear` (Z100, K=5120): a single-token decode
+    wins everywhere (1.3-5.7x, 590-625 GB/s vs rocBLAS's 215-235 GB/s), bf16
+    small-N wins too (N=512: 5.7x at M=1, 2.1x at M=4), while M >= 8 becomes
+    LDS/compute bound and *loses* to rocBLAS (0.2-0.9x).  The rule below only
+    enables the cells that were measured to win, so a non-qualifying call keeps
+    the previous rocBLAS behaviour unchanged.
+    """
+    if n_tokens == 1:
+        return True
+    if n_tokens == 4 and dtype == torch.bfloat16 and 128 <= n_out <= 1024:
+        return True
+    return False
+
+
+def _gfx906_dense_gemv_enabled() -> bool:
+    """Whether the gfx906 dense decode GEMV is enabled.
+
+    Uses the shared family switch so that ``VLLM_DCU_USE_GFX906_EMU=1`` turns
+    this kernel on together with the INT8/FP8 scaled-MM kernels, while an
+    explicit ``VLLM_DCU_USE_BF16_GEMV=0`` still wins.
+    """
+    from vllm.model_executor.kernels.linear.scaled_mm.gfx906_common import (
+        gfx906_emu_enabled,
+    )
+
+    return gfx906_emu_enabled("VLLM_DCU_USE_BF16_GEMV")
+
+
+def _gfx906_bf16_route() -> int:
+    """Map VLLM_DCU_BF16_ROUTE to the kernel's route selector."""
+    route = envs.VLLM_DCU_BF16_ROUTE
+    if route == "f32":
+        return 1
+    if route == "f16":
+        return 2
+    return 0  # auto: fp16 -> dot2, bf16 -> fp32 (exact)
+
+
+def _register_gfx906_dense_gemv() -> None:
+    """Expose the gfx906 dense GEMV as a `torch.library.custom_op` (once).
+
+    Same reason as `gfx906_sdot4.py`: a raw ``TORCH_LIBRARY`` op leaks an
+    ``Eq(dim, hint)`` guard on the symbolic token dimension at its call site
+    and aborts vLLM's compile with ``ConstraintViolationError``; a
+    ``custom_op`` with a ``register_fake`` keeps it an opaque in-graph call.
+    """
+    if hasattr(torch.ops.vllm, "bf16_emu_mm"):
+        return
+
+    @torch.library.custom_op("vllm::bf16_emu_mm", mutates_args=())
+    def bf16_emu_mm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return torch.ops._rocm_C.bf16_emu_gemv(
+            x, weight, bias, _GFX906_GEMV_THREADS, _gfx906_bf16_route(), False
+        )
+
+    @bf16_emu_mm.register_fake
+    def _(
+        x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+if current_platform.is_rocm():
+    _register_gfx906_dense_gemv()
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -450,6 +530,33 @@ def rocm_unquantized_gemm_impl(
         and k % 8 == 0
     ):
         out = ops.LLMM1(weight, x_view, 4)
+        return out.view(*x.shape[:-1], weight.shape[0])
+
+    # gfx906 (Z100): LLMM1 is excluded from the gfx906 build (MFMA ISA) and
+    # `on_gfx9()` is False here -- upstream defines it as the CDNA2/CDNA3 parts
+    # (gfx90a/gfx942/gfx950), *not* as "any gfx9" -- so the `n <= 16` Triton
+    # matmul below is taken rather than skipped.  Decode-shaped layers would
+    # therefore land on Triton or rocBLAS, which move ~235 GB/s of weights for
+    # a [1 x 5120] @ [17408 x 5120] bf16 GEMV (24% of HBM) and ~24 GB/s for
+    # small-N shapes.  The emulated GEMV (csrc/rocm/bf16_emu_gemv.cu) streams
+    # the same weights with coalesced loads and an LDS reduction, so it must be
+    # tested *before* the Triton branch: measured 2.3-8.3x over Triton at the
+    # shapes below (`tools/dcu/s11f_bf16_gemv_probe.py`).  Opt in with
+    # VLLM_DCU_USE_BF16_GEMV=1; on failure/unavailability the previous path is
+    # used unchanged.
+    if (
+        on_gfx906()
+        and _gfx906_dense_gemv_enabled()
+        and _GFX906_GEMV_AVAILABLE
+        and x.dtype == weight.dtype
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and k >= 2
+        and k % 2 == 0
+        and _gfx906_gemv_shape_ok(n_tokens=n, n_out=m, dtype=x.dtype)
+        and x_view.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        out = torch.ops.vllm.bf16_emu_mm(x_view, weight, bias)
         return out.view(*x.shape[:-1], weight.shape[0])
 
     if n <= 16 and not on_gfx9():

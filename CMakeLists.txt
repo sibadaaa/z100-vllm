@@ -1546,6 +1546,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/w8a8_sdot4.cu"
+    "csrc/rocm/fp8_emu_gemm.cu"
+    "csrc/rocm/bf16_emu_gemv.cu"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/attention.cu")

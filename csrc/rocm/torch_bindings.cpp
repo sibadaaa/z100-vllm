@@ -108,6 +108,46 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "w8a8_sdot4_gemm(Tensor xq, Tensor w, Tensor x_s, Tensor w_s, "
       "Tensor? bias, ScalarType out_dtype, int cfg) -> Tensor");
   rocm_ops.impl("w8a8_sdot4_gemm", torch::kCUDA, &w8a8_sdot4_gemm);
+
+  // W8A8 FP8 GEMM/GEMV on gfx906, emulated as fp8 --(256-entry LDS LUT)-->
+  // fp16 with `v_dot2_f32_f16` + fp32 accumulation.  Weights stay fp8 in
+  // their [N, K] checkpoint layout; nothing is dequantized or copied.
+  // The Python-side Gfx906Fp8ScaledMMLinearKernel is the only intended
+  // caller (see vllm/model_executor/kernels/linear/scaled_mm/gfx906_fp8.py).
+  rocm_ops.def(
+      "fp8_emu_gemv(Tensor a, Tensor w, Tensor a_s, Tensor w_s, Tensor lut, "
+      "Tensor? bias, ScalarType out_dtype, int nthreads) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemv", torch::kCUDA, &fp8_emu_gemv);
+
+  rocm_ops.def(
+      "fp8_emu_gemm(Tensor a, Tensor w, Tensor a_s, Tensor w_s, Tensor lut, "
+      "Tensor? bias, ScalarType out_dtype, int cfg) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemm", torch::kCUDA, &fp8_emu_gemm);
+
+  // Same kernels for FP8 block-scaled checkpoints: `a_s` is
+  // [M, cdiv(K, block_k)] and `w_s` is [cdiv(N, block_n), cdiv(K, block_k)].
+  // The Python-side Gfx906Fp8BlockScaledMMLinearKernel is the only intended
+  // caller (see vllm/model_executor/kernels/linear/scaled_mm/gfx906_fp8.py).
+  rocm_ops.def(
+      "fp8_emu_gemv_block(Tensor a, Tensor w, Tensor a_s, Tensor w_s, "
+      "Tensor lut, Tensor? bias, ScalarType out_dtype, int nthreads, "
+      "int block_n, int block_k) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemv_block", torch::kCUDA, &fp8_emu_gemv_block);
+
+  rocm_ops.def(
+      "fp8_emu_gemm_block(Tensor a, Tensor w, Tensor a_s, Tensor w_s, "
+      "Tensor lut, Tensor? bias, ScalarType out_dtype, int cfg, "
+      "int block_n, int block_k) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemm_block", torch::kCUDA, &fp8_emu_gemm_block);
+
+  // Dense fp16/bf16 decode GEMV (M <= 8) for gfx906: the replacement for the
+  // rocBLAS fallback on unquantized linear layers, used by
+  // vllm/model_executor/layers/utils.py (rocm_unquantized_gemm_impl) behind
+  // VLLM_DCU_USE_BF16_GEMV=1.
+  rocm_ops.def(
+      "bf16_emu_gemv(Tensor x, Tensor w, Tensor? bias, int nthreads, "
+      "int route, bool range_safe) -> Tensor");
+  rocm_ops.impl("bf16_emu_gemv", torch::kCUDA, &bf16_emu_gemv);
 }
 
 // Meta implementations: `torch.compile` / fake tensor propagation needs the
@@ -116,6 +156,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
   rocm_meta_ops.impl("w8a8_sdot4_gemv", &w8a8_sdot4_gemv_meta);
   rocm_meta_ops.impl("w8a8_sdot4_gemm", &w8a8_sdot4_gemm_meta);
+  rocm_meta_ops.impl("fp8_emu_gemv", &fp8_emu_gemv_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm", &fp8_emu_gemm_meta);
+  rocm_meta_ops.impl("fp8_emu_gemv_block", &fp8_emu_gemv_block_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm_block", &fp8_emu_gemm_block_meta);
+  rocm_meta_ops.impl("bf16_emu_gemv", &bf16_emu_gemv_meta);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

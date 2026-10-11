@@ -159,6 +159,27 @@ BF16-dot2|v_dot2_f32_bf16 v0, v1, v2, v3
 MFMA-f16|v_mfma_f32_16x16x16f16 v0, v1, v2, v3
 MQSAD-pk|v_mqsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7]
 QSAD-pk|v_qsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7]
+FP8EMU-pk-sub-u16|v_pk_sub_u16 v0, v1, v2
+FP8EMU-pk-min-f16|v_pk_min_f16 v0, v1, v2
+FP8EMU-pk-max-f16|v_pk_max_f16 v0, v1, v2
+FP8EMU-pack-b32-f16|v_pack_b32_f16 v0, v1, v2
+FP8EMU-perm-b32|v_perm_b32 v0, v1, v2, v3
+FP8EMU-lshl-or-b32|v_lshl_or_b32 v0, v1, v2, v3
+FP8EMU-or3-b32|v_or3_b32 v0, v1, v2, v3
+FP8EMU-alignbit-b32|v_alignbit_b32 v0, v1, v2, v3
+FP8EMU-bfe-u32|v_bfe_u32 v0, v1, v2, v3
+FP8EMU-bfe-i32|v_bfe_i32 v0, v1, v2, v3
+FP8EMU-rndne-f32|v_rndne_f32 v0, v1
+FP8EMU-cvt-pk-u8-f32|v_cvt_pk_u8_f32 v0, v1, v2, v3
+FP8EMU-sat-pk-u8-i16|v_sat_pk_u8_i16 v0, v1
+FP8EMU-ds-read-u16|ds_read_u16 v0, v1
+FP8EMU-ds-read-b16|ds_read_b16 v0, v1
+FP8EMU-ds-bpermute|ds_bpermute_b32 v0, v1, v2
+FP8EMU-ds-permute|ds_permute_b32 v0, v1, v2
+FP8EMU-dpp-quad|v_mov_b32_dpp v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+FP8EMU-sdwa-byte0|v_cvt_f32_i32_sdwa v0, v1 src0_sel:BYTE_0
+FP8EMU-cvt-pk-f32-fp8|v_cvt_pk_f32_fp8 v0, v1
+FP8EMU-cvt-pk-bf16-f32|v_cvt_pk_bf16_f32 v0, v1, v2
 EOF
 )
 
@@ -224,6 +245,7 @@ __builtin_amdgcn_mfma_i32_16x16x16i8
 __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
 __builtin_amdgcn_cvt_pk_fp8_f32
 __builtin_amdgcn_cvt_pk_f32_fp8
+__builtin_amdgcn_perm
 __builtin_amdgcn_s_sleep
 __builtin_amdgcn_s_barrier"
 
@@ -284,6 +306,16 @@ EOF
 
 # fields: name | expected instruction regex | mode (c = plain C source, asm =
 # inline asm; "asm" entries cover opcodes that DTK clang has no builtin for) | source
+#
+# Two rows below are pinned to the *canonicalised* form, because DTK clang 18
+# rewrites `u16x2 - {0xc000,0xc000}` into `v_pk_add_u16 x, x, 2.0` (0x4000 is
+# the two's-complement delta of 0xc000), so `v_pk_sub_u16` is never emitted for
+# it: the `pk_u16_sub` row therefore expects `v_pk_add_u16`, and
+# `bf16_to_f16_bits` is pinned to the `v_pk_lshlrev_b16` that carries the
+# op_sel_hi lane-selection trap this row exists to document.  Neither path is
+# used by the kernels in csrc/rocm/gfx906_emu_common.cuh (they use the 32-bit
+# scalar per-lane form).  Note the regex field cannot contain `|` -- that is the
+# table's column separator.
 CG_TABLE=$(cat <<'EOF'
 sdot4|v_dot4_i32_i8|c|KERNEL void k_sdot4(i32 *o, const i32 *a, const i32 *b) { o[0] = __builtin_amdgcn_sdot4(a[0], b[0], o[0], 0); }
 udot4|v_dot4_u32_u8|c|KERNEL void k_udot4(u32 *o, const u32 *a, const u32 *b) { o[0] = __builtin_amdgcn_udot4(a[0], b[0], o[0], 0); }
@@ -305,6 +337,15 @@ fmac_f32_builtin|v_fmac_f32|c|KERNEL void k_fmac_b(float *o, const float *a, con
 fma_f32_asm|v_fma_f32|asm|KERNEL void k_fma32(float *o, const float *a, const float *b) { float r; __asm__("v_fma_f32 %0, %1, %2, %3" : "=v"(r) : "v"(a[0]), "v"(b[0]), "v"(o[0])); o[0] = r; }
 mad_i32_i24_asm|v_mad_i32_i24|asm|KERNEL void k_mad24(i32 *o, const i32 *a, const i32 *b) { i32 r; __asm__("v_mad_i32_i24 %0, %1, %2, %3" : "=v"(r) : "v"(a[0]), "v"(b[0]), "v"(o[0])); o[0] = r; }
 fma_mix_f32_asm|v_fma_mix_f32|asm|KERNEL void k_mixasm(float *o, const i32 *a, const i32 *b) { float r; __asm__("v_fma_mix_f32 %0, %1, %2, %3 op_sel:[0,1,0] op_sel_hi:[1,0,0]" : "=v"(r) : "v"(a[0]), "v"(b[0]), "v"(o[0])); o[0] = r; }
+pk_u16_add|v_pk_add_u16|c|KERNEL void k_pkaddu16(u16x2 *o, const u16x2 *a) { o[0] = a[0] + (u16x2){0x2000, 0x2000}; }
+pk_u16_sub|v_pk_add_u16|c|KERNEL void k_pksubu16(u16x2 *o, const u16x2 *a) { o[0] = a[0] - (u16x2){0xc000, 0xc000}; }
+pk_u16_shl|v_pk_lshlrev_b16|c|KERNEL void k_pkshlu16(u16x2 *o, const u16x2 *a) { o[0] = a[0] << 7; }
+e5m2_to_f16_bits|v_pk_lshlrev_b16|c|KERNEL void k_e5m2(u16x2 *o, const u16x2 *a) { o[0] = a[0] << 8; }
+e4m3_to_f16_bits|v_pk_add_u16|c|KERNEL void k_e4m3(u16x2 *o, const u16x2 *a) { u16x2 s = a[0] & (u16x2){0x8080, 0x8080}; u16x2 m = a[0] & (u16x2){0x7f7f, 0x7f7f}; o[0] = ((m << 7) + (u16x2){0x2000, 0x2000}) | s; }
+bf16_to_f16_bits|v_pk_lshlrev_b16|c|KERNEL void k_bf16s(u16x2 *o, const u16x2 *a) { o[0] = (a[0] - (u16x2){0x3800u, 0x3800u}) << 3; }
+bf16_to_f32_shift|v_lshlrev_b32|c|KERNEL void k_bf2f32(float *o, const u32 *a) { o[0] = __builtin_bit_cast(float, a[0] << 16); }
+f32_to_bf16_round|v_add_u32|c|KERNEL void k_f2bf16(u32 *o, const float *a) { o[0] = __builtin_bit_cast(u32, a[0]) + 0x8000; }
+dot2_after_convert|v_dot2_f32_f16|c|KERNEL void k_dot2(float *o, const u16x2 *a) { f16x2 f = *(const f16x2 *)a; o[0] = __builtin_amdgcn_fdot2(f, f, o[0], 0); }
 EOF
 )
 
@@ -422,6 +463,38 @@ cgo sdot4 EMITTED
 cgo fdot2 EMITTED
 cgo pk_fma_f16 EMITTED
 cgo fma_mix_f32 EMITTED
+asm FP8EMU-pk-sub-u16 OK
+asm FP8EMU-pk-min-f16 OK
+asm FP8EMU-pk-max-f16 OK
+asm FP8EMU-pack-b32-f16 OK
+asm FP8EMU-perm-b32 OK
+asm FP8EMU-lshl-or-b32 OK
+asm FP8EMU-or3-b32 OK
+asm FP8EMU-alignbit-b32 OK
+asm FP8EMU-bfe-u32 OK
+asm FP8EMU-bfe-i32 OK
+asm FP8EMU-rndne-f32 OK
+asm FP8EMU-cvt-pk-u8-f32 OK
+asm FP8EMU-sat-pk-u8-i16 OK
+asm FP8EMU-ds-read-u16 OK
+asm FP8EMU-ds-read-b16 FAIL
+asm FP8EMU-ds-bpermute OK
+asm FP8EMU-ds-permute OK
+asm FP8EMU-dpp-quad OK
+asm FP8EMU-sdwa-byte0 OK
+asm FP8EMU-cvt-pk-f32-fp8 FAIL
+asm FP8EMU-cvt-pk-bf16-f32 FAIL
+blt __builtin_amdgcn_perm 1
+blt __builtin_amdgcn_cvt_pk_u8_f32 1
+cgo pk_u16_add EMITTED
+cgo pk_u16_sub EMITTED
+cgo pk_u16_shl EMITTED
+cgo e5m2_to_f16_bits EMITTED
+cgo e4m3_to_f16_bits EMITTED
+cgo bf16_to_f16_bits EMITTED
+cgo bf16_to_f32_shift EMITTED
+cgo f32_to_bf16_round EMITTED
+cgo dot2_after_convert EMITTED
 EOF
 )
 bad=0
@@ -438,7 +511,7 @@ while read -r kind name want; do
   fi
 done <<< "$BASELINE"
 if [ "$bad" -eq 0 ]; then
-  echo "baseline  : MATCH (all ${ISA_PROBE_BASELINE_N:-21} expectations hold)"
+  echo "baseline  : MATCH (all ${ISA_PROBE_BASELINE_N:-53} expectations hold)"
 else
   echo "baseline  : $bad MISMATCH(es)"
 fi
