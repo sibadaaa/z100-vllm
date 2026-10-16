@@ -429,6 +429,13 @@ class SpeculativeConfig:
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When `None`, the draft inherits the
     target model's `--kv-cache-dtype`."""
+    dtype: str | None = None
+    """Data type for the draft model's weights and activations. When `None`,
+    the draft inherits the target model's `--dtype` (upstream behaviour).
+    Useful when the drafter ships in a wider dtype than the target, e.g. a bf16
+    block-diffusion drafter (DFlash) behind an fp16-served target: running that
+    drafter in fp16 overflows its MLP activations. Pair with `kv_cache_dtype`
+    so the drafter's own KV cache matches."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -1290,7 +1297,7 @@ class SpeculativeConfig:
                     trust_remote_code=self.target_model_config.trust_remote_code,
                     allowed_local_media_path=self.target_model_config.allowed_local_media_path,
                     allowed_media_domains=self.target_model_config.allowed_media_domains,
-                    dtype=self.target_model_config.dtype,
+                    dtype=self.dtype or self.target_model_config.dtype,
                     seed=self.target_model_config.seed,
                     revision=self.revision,
                     code_revision=self.code_revision,

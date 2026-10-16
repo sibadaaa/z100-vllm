@@ -302,8 +302,10 @@ def test_block_gemv_matches_fp32_reference(fp8_ops, out_dtype, m):
 
 
 @pytest.mark.parametrize("m", [16, 64, 129])
-def test_block_gemm_matches_fp32_reference(fp8_ops, m):
-    """M > 8 prefill path, K folded per 128-element block."""
+@pytest.mark.parametrize("cfg", [0, 1, 2, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+def test_block_gemm_matches_fp32_reference(fp8_ops, m, cfg):
+    """M > 8 prefill path, K folded per 128-element block; cfgs 11..15 are the
+    BM=8/16 decode tiles, which must also be exact when M exceeds their tile."""
     torch.manual_seed(0)
     fp8_dtype = torch.float8_e4m3fn
     n, k = 256, 512
@@ -314,12 +316,39 @@ def test_block_gemm_matches_fp32_reference(fp8_ops, m):
     ref = _reference_block(a_q, a_s, w_q, w_s)
 
     lut = fp8_ops(fp8_dtype)
-    for cfg in (0, 1, 2):
-        out = torch.ops._rocm_C.fp8_emu_gemm_block(
-            a_q, w_q, a_s, w_s, lut, None, torch.float32, cfg, BLOCK_N, BLOCK_K
-        )
-        err = (out - ref).abs().max().item() / ref.abs().max().item()
-        assert err < 1e-5, f"cfg={cfg} max|err|/max|ref| = {err}"
+    out = torch.ops._rocm_C.fp8_emu_gemm_block(
+        a_q, w_q, a_s, w_s, lut, None, torch.float32, cfg, BLOCK_N, BLOCK_K
+    )
+    err = (out - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 1e-5, f"cfg={cfg} max|err|/max|ref| = {err}"
+
+
+@pytest.mark.parametrize("m", [5, 6, 7, 8])
+@pytest.mark.parametrize("cfg", ["legacy", "auto", 11, 12, 13, 14, 15, 16, 17, 18, 19])
+def test_block_gemv_decode_m8_uses_exact_tiles(fp8_ops, monkeypatch, cfg, m):
+    """M=5..8/K=5120 cannot stream (M*K*2 > LDS gate) and used to fall back to
+    the BM=32 prefill tile, computing 4x the MACs needed.  VLLM_DCU_FP8_DECODE_CFG
+    selects the BM=8/16 tiles without a rebuild; every setting must agree with
+    the fp32 reference and with each other."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 512, 5120  # production K, block 128x128
+    a = torch.randn(m, k, device="cuda") * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    a_q, a_s = _quantize_block(a, fp8_dtype, rows_per_group=1)
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block(a_q, a_s, w_q, w_s)
+    lut = fp8_ops(fp8_dtype)
+
+    if cfg == "legacy":
+        monkeypatch.delenv("VLLM_DCU_FP8_DECODE_CFG", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_DCU_FP8_DECODE_CFG", str(cfg))
+    out = torch.ops._rocm_C.fp8_emu_gemv_block(
+        a_q, w_q, a_s, w_s, lut, None, torch.float32, 64, BLOCK_N, BLOCK_K
+    )
+    err = (out - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 1e-5, f"cfg={cfg} max|err|/max|ref| = {err}"
 
 
 def test_block_gemm_handles_odd_shapes(fp8_ops):
@@ -417,3 +446,117 @@ def test_block_kernel_gating_and_can_implement(monkeypatch):
     # block_k must be a multiple of 32 (the GEMM folds scales on chunk bounds).
     ok, reason = K.can_implement(_fp8_config(GroupShape(128, 100), GroupShape(1, 100)))
     assert not ok and "multiple of 32" in (reason or "")
+
+
+# ---------------------------------------------------------------------------
+# decode range M = 1..8: the streaming GEMV
+# (csrc/rocm/fp8_emu_gemm.cu, fp8_emu_gemv_stream_block_kernel)
+# ---------------------------------------------------------------------------
+# The streaming path is selected inside the GEMV entry point when the geometry
+# fits (K and the W row stride multiples of 16, M*K*2 LDS budget), and falls
+# back to `fp8_emu_gemv_block_kernel` otherwise.  Both must agree with the fp32
+# reference; only the fp32 accumulation order may differ.
+
+
+def _block_gemv(a_q, w_q, a_s, w_s, lut, bias, out_dtype, block_n=BLOCK_N,
+                block_k=BLOCK_K):
+    return torch.ops._rocm_C.fp8_emu_gemv_block(
+        a_q, w_q, a_s, w_s, lut, bias, out_dtype, 64, block_n, block_k
+    )
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6, 8])
+def test_block_gemv_decode_m_range(fp8_ops, out_dtype, m):
+    """M = 1..8 (draft M=1, MTP verify M=1+spec) must stay in tolerance."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 384, 1024
+    a = torch.randn(m, k, device="cuda") * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    a_q, a_s = _quantize_block(a, fp8_dtype, rows_per_group=1)
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block(a_q, a_s, w_q, w_s)
+
+    out = _block_gemv(a_q, w_q, a_s, w_s, fp8_ops(fp8_dtype), None, out_dtype)
+    tol = 1e-5 if out_dtype == torch.float32 else 1e-3
+    err = (out.to(torch.float32) - ref).abs().max().item() / ref.abs().max().item()
+    assert err < tol, f"m={m} max|err|/max|ref| = {err}"
+
+
+def test_block_gemv_verify_shape_m3(fp8_ops):
+    """M=3 on a production-shaped shard (K=5120, block 128x128)."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m, n, k = 3, 1024, 5120
+    a = torch.randn(m, k, device="cuda") * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    a_q, a_s = _quantize_block(a, fp8_dtype, rows_per_group=1)
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block(a_q, a_s, w_q, w_s)
+
+    out = _block_gemv(a_q, w_q, a_s, w_s, fp8_ops(fp8_dtype), None, torch.float16)
+    err = (out.to(torch.float32) - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 1e-3, f"max|err|/max|ref| = {err}"
+
+
+def test_block_gemv_m8_large_k_falls_back(fp8_ops):
+    """M=8/K=5120 exceeds the streaming LDS budget: the GEMM fallback must work.
+
+    The decode entry point routes M=5..8 with an unfittable M*K to the tiled
+    GEMM (measured 3-10x faster than the old GEMV there); this pins that the
+    fallback is numerically equivalent.
+    """
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m, n, k = 8, 256, 5120
+    a = torch.randn(m, k, device="cuda") * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    a_q, a_s = _quantize_block(a, fp8_dtype, rows_per_group=1)
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block(a_q, a_s, w_q, w_s)
+
+    out = _block_gemv(a_q, w_q, a_s, w_s, fp8_ops(fp8_dtype), None, torch.float16)
+    err = (out.to(torch.float32) - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 1e-3, f"max|err|/max|ref| = {err}"
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    [(100, 128), (128, 1152), (37, 384), (512, 256)],
+    ids=["n<block_n,k=128", "ragged_k", "n<block_n_odd", "k_small"],
+)
+def test_block_gemv_odd_decode_shapes(fp8_ops, n, k):
+    """N < block_n, N not a multiple of the row group, short/ragged K."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m = 3
+    a = torch.randn(m, k, device="cuda") * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    a_q, a_s = _quantize_block(a, fp8_dtype, rows_per_group=1)
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block(a_q, a_s, w_q, w_s)
+
+    out = _block_gemv(a_q, w_q, a_s, w_s, fp8_ops(fp8_dtype), None, torch.float32)
+    err = (out - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 1e-5, f"n={n} k={k} max|err|/max|ref| = {err}"
+
+
+def test_block_gemv_decode_stream_matches_gemm(fp8_ops):
+    """Decode M<=8 and the prefill GEMM must agree on the same operands."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m, n, k = 4, 512, 1024
+    a = torch.randn(m, k, device="cuda") * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    a_q, a_s = _quantize_block(a, fp8_dtype, rows_per_group=1)
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    lut = fp8_ops(fp8_dtype)
+
+    gemv = _block_gemv(a_q, w_q, a_s, w_s, lut, None, torch.float32)
+    gemm = torch.ops._rocm_C.fp8_emu_gemm_block(
+        a_q, w_q, a_s, w_s, lut, None, torch.float32, 0, BLOCK_N, BLOCK_K
+    )
+    assert torch.allclose(gemv, gemm, rtol=1e-3, atol=1e-3), (
+        (gemv - gemm).abs().max().item()
+    )

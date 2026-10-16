@@ -194,6 +194,15 @@ if TYPE_CHECKING:
     # "auto" (fp16 -> dot2, bf16 -> fp32), "f32" (exact, bf16 only) or
     # "f16" (bf16 rebased to fp16 + dot2; requires the weight range check).
     VLLM_DCU_BF16_ROUTE: str = "auto"
+    # Largest M that still takes the GEMV path in the gfx906 scaled-MM
+    # emulation kernels (FP8 block-scaled / W8A8 INT8); larger M uses the
+    # tiled GEMM.  S18 measurement (tools/dcu/s18_fp8_block_mprobe.py, real
+    # decode shapes): the GEMV cost grows ~linearly with M (M=8 -> 7.4x) while
+    # the tiled GEMM is M-flat, so speculative-decoding verify
+    # (M = 1 + num_speculative_tokens) wants 1.  M=1 stays GEMV because it is
+    # faster there on small-N shapes.  Default 8 keeps the pre-S18 policy.
+    VLLM_DCU_FP8_GEMV_MAX_M: int = 8
+    VLLM_DCU_INT8_GEMV_MAX_M: int = 8
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1468,6 +1477,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCU_BF16_ROUTE": lambda: os.getenv(
         "VLLM_DCU_BF16_ROUTE", "auto"
     ).strip().lower(),
+    # gfx906 scaled-MM dispatch threshold (see the annotation on the field).
+    "VLLM_DCU_FP8_GEMV_MAX_M": lambda: int(
+        os.getenv("VLLM_DCU_FP8_GEMV_MAX_M", "8")
+    ),
+    "VLLM_DCU_INT8_GEMV_MAX_M": lambda: int(
+        os.getenv("VLLM_DCU_INT8_GEMV_MAX_M", "8")
+    ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
     # Recommended for large models to get allreduce

@@ -21,6 +21,91 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+def _gdn_mtp_triton_enabled() -> bool:
+    """Perf1 A/B switch for the layout-aware gfx906 MTP kernel (opt-in)."""
+    return os.getenv("VLLM_QWEN35_MTP_GDN_TRITON", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _gdn_mtp_triton(**kwargs):
+    # Imported lazily so the default (env unset) path never pays for the
+    # module import and cannot be affected by it.
+    from vllm.model_executor.layers.fla.ops.gfx906_gdn_mtp_triton import (
+        gdn_mtp_gfx906_triton,
+    )
+
+    return gdn_mtp_gfx906_triton(**kwargs)
+
+
+def _mtp_debug_enabled() -> bool:
+    return os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _report_mtp_custom_hit(q, initial_state, num_accepted_tokens, engine) -> None:
+    """One-shot attribution line for the VLLM_QWEN35_MTP_GDN_DEBUG channel."""
+    global _GFX906_MTP_GDN_DEBUG_REPORTED
+    if _GFX906_MTP_GDN_DEBUG_REPORTED or not _mtp_debug_enabled():
+        return
+    _GFX906_MTP_GDN_DEBUG_REPORTED = True
+    print(
+        f"QWEN35_MTP_GDN_CUSTOM_HIT engine={engine} "
+        f"q={tuple(q.shape)}/{q.dtype} "
+        f"state={tuple(initial_state.shape)}/{initial_state.dtype} "
+        f"accepted={num_accepted_tokens.dtype}",
+        file=sys.stderr,
+    )
+
+
+def _report_mtp_ineligible(
+    num_accepted_tokens,
+    cu_seqlens,
+    q,
+    initial_state,
+    inplace_final_state,
+    ssm_state_indices,
+) -> None:
+    """One-shot attribution line when the MTP kernel is not eligible.
+
+    Kept out of the dispatcher with the other debug helpers so that
+    `fused_sigmoid_gating_delta_rule_update` contains no store to a module
+    global (a missing `global` there raises UnboundLocalError on every call,
+    not just when the debug channel is enabled).
+    """
+    global _GFX906_MTP_GDN_DEBUG_REPORTED
+    if _GFX906_MTP_GDN_DEBUG_REPORTED or not _mtp_debug_enabled():
+        return
+    _GFX906_MTP_GDN_DEBUG_REPORTED = True
+    state_desc = (
+        None
+        if initial_state is None
+        else (tuple(initial_state.shape), initial_state.dtype)
+    )
+    indices_desc = (
+        None
+        if ssm_state_indices is None
+        else tuple(ssm_state_indices.shape)
+    )
+    print(
+        "QWEN35_MTP_GDN_INELIGIBLE "
+        f"cu={cu_seqlens is not None} q={tuple(q.shape)}/{q.dtype} "
+        f"state={state_desc} "
+        f"inplace={inplace_final_state} "
+        f"indices={indices_desc} "
+        f"accepted={tuple(num_accepted_tokens.shape)}/"
+        f"{num_accepted_tokens.dtype}",
+        file=sys.stderr,
+    )
+
+
 @lru_cache(maxsize=1)
 def _is_gfx906_rocm() -> bool:
     capability = current_platform.get_device_capability()
@@ -598,6 +683,7 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
 ):
+    global _GFX906_MTP_GDN_DEBUG_REPORTED
     if _is_gfx906_rocm() and not is_kda:
         if scale is None:
             scale = k.shape[-1] ** -0.5
@@ -610,8 +696,53 @@ def fused_sigmoid_gating_delta_rule_update(
             and inplace_final_state
             and ssm_state_indices is not None
             and num_accepted_tokens is not None
+            # S18 bisect switch: VLLM_QWEN35_MTP_GDN_CUSTOM=0 skips the gfx906
+            # MTP kernel (opt-in A/B only; the default keeps current
+            # behaviour) so MTP-vs-non-spec token parity can be attributed.
+            and os.getenv("VLLM_QWEN35_MTP_GDN_CUSTOM", "1") != "0"
         )
         if mtp_gfx906_path:
+            if _gdn_mtp_triton_enabled():
+                # Perf1 A/B: same math as the C++ MTP kernel, but lanes map
+                # onto the key axis of one value row so the persistent state
+                # ([slot][head][v][k], k contiguous) is read/written
+                # coalesced, and the grid is (VD/BV, kv_heads, requests)
+                # instead of a single 6-block serial kernel.  Opt-in only;
+                # VLLM_QWEN35_MTP_GDN_CUSTOM=0 still wins (eager bisect path).
+                try:
+                    o = _gdn_mtp_triton(
+                        A_log=A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        state=initial_state,
+                        state_indices=ssm_state_indices,
+                        cu_seqlens=cu_seqlens,
+                        num_accepted_tokens=num_accepted_tokens,
+                        beta=beta,
+                        threshold=threshold,
+                        scale=scale,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    )
+                    _report_mtp_custom_hit(
+                        q, initial_state, num_accepted_tokens, "triton"
+                    )
+                    return o.unsqueeze(0), initial_state
+                except (
+                    AttributeError,
+                    RuntimeError,
+                    AssertionError,
+                    ImportError,
+                ) as exc:
+                    if _mtp_debug_enabled():
+                        print(
+                            f"QWEN35_MTP_GDN_TRITON_FALLBACK "
+                            f"{type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
             try:
                 o = ops.fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
                     A_log=A_log,
@@ -630,29 +761,10 @@ def fused_sigmoid_gating_delta_rule_update(
                     scale=scale,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
-                global _GFX906_MTP_GDN_DEBUG_REPORTED
-                if (
-                    not _GFX906_MTP_GDN_DEBUG_REPORTED
-                    and os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower()
-                    in {"1", "true", "yes", "on"}
-                ):
-                    _GFX906_MTP_GDN_DEBUG_REPORTED = True
-                    print(
-                        "QWEN35_MTP_GDN_CUSTOM_HIT "
-                        f"q={tuple(q.shape)}/{q.dtype} "
-                        f"state={tuple(initial_state.shape)}/"
-                        f"{initial_state.dtype} "
-                        f"accepted={num_accepted_tokens.dtype}",
-                        file=sys.stderr,
-                    )
+                _report_mtp_custom_hit(q, initial_state, num_accepted_tokens, "cpp")
                 return o.unsqueeze(0), initial_state
             except (AttributeError, RuntimeError) as exc:
-                if os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }:
+                if _mtp_debug_enabled():
                     print(
                         "QWEN35_MTP_GDN_FALLBACK "
                         f"{type(exc).__name__}: {exc}; "
@@ -667,22 +779,14 @@ def fused_sigmoid_gating_delta_rule_update(
                         f"{num_accepted_tokens.dtype}",
                         file=sys.stderr,
                     )
-        elif (
-            not _GFX906_MTP_GDN_DEBUG_REPORTED
-            and num_accepted_tokens is not None
-            and os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower()
-            in {"1", "true", "yes", "on"}
-        ):
-            _GFX906_MTP_GDN_DEBUG_REPORTED = True
-            print(
-                "QWEN35_MTP_GDN_INELIGIBLE "
-                f"cu={cu_seqlens is not None} q={tuple(q.shape)}/{q.dtype} "
-                f"state={None if initial_state is None else (tuple(initial_state.shape), initial_state.dtype)} "
-                f"inplace={inplace_final_state} "
-                f"indices={None if ssm_state_indices is None else tuple(ssm_state_indices.shape)} "
-                f"accepted={tuple(num_accepted_tokens.shape)}/"
-                f"{num_accepted_tokens.dtype}",
-                file=sys.stderr,
+        elif num_accepted_tokens is not None:
+            _report_mtp_ineligible(
+                num_accepted_tokens,
+                cu_seqlens,
+                q,
+                initial_state,
+                inplace_final_state,
+                ssm_state_indices,
             )
         decode_gfx906_path = (
             cu_seqlens is not None

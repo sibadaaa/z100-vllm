@@ -45,8 +45,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         super().__init__(vllm_config, device)
 
+        # The drafter can run in its own dtype (SpeculativeConfig.dtype, e.g. a
+        # bf16 DFlash checkpoint behind an fp16 target), so the buffer that
+        # carries the fused target hidden states must use that dtype too.
         self.hidden_states = torch.zeros(
-            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+            self.max_num_tokens,
+            self.hidden_size,
+            dtype=self.draft_model_config.dtype,
+            device=device,
         )
 
         # Multimodal inputs not currently supported.

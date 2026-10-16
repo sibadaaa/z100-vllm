@@ -1,0 +1,24 @@
+..............................................                           [100%]
+=============================== warnings summary ===============================
+vllm/__init__.py:7
+  /src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+  No module named 'vllm._version'
+    from .version import __version__, __version_tuple__  # isort:skip
+
+<frozen importlib._bootstrap>:241
+  <frozen importlib._bootstrap>:241: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+<frozen importlib._bootstrap>:241
+  <frozen importlib._bootstrap>:241: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+../usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+../usr/local/lib/python3.10/dist-packages/_pytest/cacheprovider.py:475
+  /usr/local/lib/python3.10/dist-packages/_pytest/cacheprovider.py:475: PytestCacheWarning: could not create cache path /src/.pytest_cache/v/cache/nodeids: [Errno 30] Read-only file system: '/src/pytest-cache-files-1cnuzjfv'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+46 passed, 18 warnings in 30.39s
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute

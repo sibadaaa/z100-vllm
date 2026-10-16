@@ -56,6 +56,44 @@ logger = init_logger(__name__)
 _SLIDING_ATTENTION = "sliding_attention"
 
 
+def _c_rms_norm_supported(
+    x: torch.Tensor, weight: torch.Tensor | None = None
+) -> bool:
+    """Whether the platform's C RMSNorm kernel accepts these dtypes.
+
+    gfx906's C RMSNorm kernels are Half-typed, so a bf16 DFlash drafter (behind
+    an fp16 target) must use the native formula for its fused context-KV
+    precompute instead of ``ops.rms_norm``.
+    """
+    if not current_platform.is_rocm():
+        return True
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        return True
+    if x.dtype != torch.float16:
+        return False
+    return weight is None or weight.dtype == torch.float16
+
+
+def _native_weighted_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Weighted RMSNorm in the model dtype, without the C kernel.
+
+    ``weight`` is broadcast over the last dim; a 2D weight carries one row per
+    leading dim of ``x`` (the grouped per-layer K norm).
+    """
+    y = x.to(torch.float32)
+    y = y * torch.rsqrt(y.pow(2).mean(dim=-1, keepdim=True) + eps)
+    w = weight.to(torch.float32)
+    if w.dim() > 1:
+        # Leading weight dims map onto the leading dims of ``x``; the last
+        # weight dim is the normalized (last) dim of ``x``.
+        w = w.reshape(w.shape[:-1] + (1,) * (y.dim() - w.dim()) + (w.shape[-1],))
+    return (y * w).to(x.dtype)
+
+
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """Resolve explicit causality before falling back to legacy layer defaults."""
     is_causal = getattr(config, "is_causal", None)
@@ -465,7 +503,9 @@ class DFlashQwen3Model(nn.Module):
             # Replace masked slots with the dedicated mask embedding.
             is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
             embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
-        return embeds
+        # The embedding is shared with the target, which may run in a different
+        # dtype than the drafter (e.g. fp16 target, bf16 DFlash drafter).
+        return embeds.to(self.mask_embedding.dtype)
 
     def _build_context_kv_buffers(
         self,
@@ -541,13 +581,18 @@ class DFlashQwen3Model(nn.Module):
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # --- Fused KV projection (one GEMM for all layers) ---
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states,
-            context_states,
-            self._hidden_norm_weight,
-            self._rms_norm_eps,
-        )
+        if _c_rms_norm_supported(context_states, self._hidden_norm_weight):
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states,
+                context_states,
+                self._hidden_norm_weight,
+                self._rms_norm_eps,
+            )
+        else:
+            normed_context_states = _native_weighted_rms_norm(
+                context_states, self._hidden_norm_weight, self._rms_norm_eps
+            )
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
@@ -566,6 +611,10 @@ class DFlashQwen3Model(nn.Module):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
+        if not _c_rms_norm_supported(all_k, self._k_norm_weights):
+            return _native_weighted_rms_norm(
+                all_k, self._k_norm_weights, self._rms_norm_eps
+            )
         all_k_normed = torch.empty_like(all_k)
         if current_platform.is_xpu():
             for layer_idx in range(all_k.shape[0]):
@@ -766,6 +815,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        # lm_head is shared with the target and may live in the target's dtype.
+        hidden_states = hidden_states.to(self.lm_head.weight.dtype)
         logits = self.logits_processor(self.lm_head, hidden_states)
         if self.draft_id_to_target_id is None:
             return logits
@@ -807,6 +858,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
+        if hidden_states.dtype != self.model.fc.weight.dtype:
+            # The aux states arrive in the target's dtype; the fusion GEMM runs
+            # in the drafter's own dtype (fp16 target + bf16 DFlash drafter).
+            hidden_states = hidden_states.to(self.model.fc.weight.dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)

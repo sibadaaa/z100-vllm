@@ -183,12 +183,17 @@ def test_dense_gemm_dispatch_reaches_the_emu_kernel(monkeypatch):
     tested the ``n <= 16`` Triton branch *first*, and because upstream
     ``on_gfx9()`` means the CDNA2/CDNA3 parts (gfx90a/gfx942/gfx950) rather
     than "any gfx9" it is False on gfx906 -- so every shape this kernel
-    supports (``_gfx906_gemv_shape_ok`` returns True only for n in {1, 4}) was
-    swallowed by the Triton branch and ``torch.ops.vllm.bf16_emu_mm`` never
-    ran, even with VLLM_DCU_USE_BF16_GEMV=1.
+    supports was swallowed by the Triton branch and
+    ``torch.ops.vllm.bf16_emu_mm`` never ran, even with
+    VLLM_DCU_USE_BF16_GEMV=1.  The comparison has to use the same thread count
+    the dispatch picks (``_gfx906_gemv_threads``, shape dependent), otherwise
+    the two reductions differ in order and the bitwise guard is meaningless.
     """
     import vllm  # noqa: F401
-    from vllm.model_executor.layers.utils import rocm_unquantized_gemm_impl
+    from vllm.model_executor.layers.utils import (
+        _gfx906_gemv_threads,
+        rocm_unquantized_gemm_impl,
+    )
 
     monkeypatch.setenv("VLLM_DCU_USE_BF16_GEMV", "1")
     torch.manual_seed(0)
@@ -196,7 +201,9 @@ def test_dense_gemm_dispatch_reaches_the_emu_kernel(monkeypatch):
     w = (torch.randn(384, 512, device="cuda") * 0.02).to(torch.bfloat16)
 
     routed = rocm_unquantized_gemm_impl(x, w)
-    direct = torch.ops._rocm_C.bf16_emu_gemv(x, w, None, 64, 0, False)
+    direct = torch.ops._rocm_C.bf16_emu_gemv(
+        x, w, None, _gfx906_gemv_threads(w.shape[0]), 0, False
+    )
     assert torch.equal(routed, direct), "dispatch did not reach bf16_emu_gemv"
 
 

@@ -1,0 +1,18 @@
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 10-13 12:44:04 [_aiter_ops.py:174] Could not locate PyTorch's HIP runtime; AITER JIT extensions may fail to resolve HIP symbols.
+         shape  mode  var  M       ms   GB/s  note
+   1280x5120    gemm    0 16   0.2839     23  
+   1280x5120    gemm    0 32   0.2859     23  
+   1280x5120    gemm    0 64   0.2786     24  
+   1280x5120    gemm    0 129   0.3569     18  
+   4352x5120    gemm    0 16   0.3727     60  
+   4352x5120    gemm    0 32   0.3619     62  
+   4352x5120    gemm    0 64   0.4616     48  
+   4352x5120    gemm    0 129   0.8137     27  
+   8704x5120    gemm    0 16   0.4544     98  
+   8704x5120    gemm    0 32   0.4627     96  
+   8704x5120    gemm    0 64   0.7480     60  
+   8704x5120    gemm    0 129   1.5405     29  
+[probe] wrote /mnt/game/perf1/perf1_kernel_mprobe_streamunset_prefunset.json

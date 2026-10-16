@@ -50,7 +50,27 @@ ENABLE_GFX906_ATTN_PREFILL_3D = os.getenv(
 
 # Upper bound for split-KV segments the decode policy may request. The
 # backend sizes its softmax segment buffers with this value on gfx906.
+# Interleaved sweeps at 8k/32k (tools/dcu/perf1_attn_verify.md) put 128 and
+# 256 within ~11% of each other and 512+ clearly worse, so the cap is not a
+# lever on its own; the win comes from actually reaching this path (below).
 GFX906_MAX_DECODE_SEGMENTS = 128
+
+# Query-length ceiling up to which a forward pass is treated as decode-shaped.
+# Speculative decoding verifies k+1 tokens per request in one step, so the
+# k=2 MTP configuration used in production arrives here with max_seqlen_q == 3.
+# Such a step scans the whole KV cache for a handful of query tokens, exactly
+# like decode; classifying it as prefill (the old `max_seqlen_q > 1` test) sent
+# it to the unsplit 2D kernel, whose grid collapses to one CTA per
+# (sequence, kv head) and serializes the entire context scan: 16 full-attention
+# layers * (18.9 ms - 0.9 ms) of pure loss at 32k, on every decode step.
+# True prefill batches (chunked prefill) stay well above this ceiling.
+GFX906_VERIFY_MAX_QUERY_LEN = 8
+
+# Kill switch for the decode-shaped routing above; 0 restores the historical
+# `max_seqlen_q > 1 == prefill` classification.
+ENABLE_GFX906_ATTN_VERIFY_3D = os.getenv(
+    "VLLM_GFX906_ATTN_VERIFY_3D", "1"
+).lower() in {"1", "true", "yes", "on"}
 
 # Split-KV segments for the gfx906 prefill 3D path. Prefill already fills the
 # GPU with q-block x kv-head CTAs; a small fixed split balances the causal
@@ -58,7 +78,37 @@ GFX906_MAX_DECODE_SEGMENTS = 128
 # segments {2,4,8,16} at 4k-16k serving shapes put 2 and 4 within ~1% of
 # each other (8+ regress); 2 halves the fp32 segment workspace, which keeps
 # gpu_memory_utilization=0.95 runs within budget at the default chunk size.
-GFX906_PREFILL_SEGMENTS = 2
+
+
+def _gfx906_env_int(name: str, default: int) -> int:
+    """Read an integer tuning knob, falling back to `default` (S22)."""
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw else default
+
+
+# S22 prefill tuning knobs. The defaults reproduce the swept configuration
+# (BLOCK_M 32 / TILE 32 / 4 warps / 1 stage / 2 segments) exactly, so the
+# engine is unchanged unless one of these is set; they exist so the constants
+# can be A/B'd without editing this file between arms.
+# See tools/dcu/s22_attn_prefill_probe.py for the measurements.
+GFX906_PREFILL_BLOCK_M_OVERRIDE = _gfx906_env_int(
+    "VLLM_GFX906_ATTN_PREFILL_BLOCK_M", 0
+)
+GFX906_PREFILL_TILE_OVERRIDE = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_TILE", 0)
+GFX906_PREFILL_WARPS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_WARPS", 4)
+GFX906_PREFILL_STAGES = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_STAGES", 1)
+GFX906_PREFILL_SEGMENTS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_SEGMENTS", 2)
+GFX906_PREFILL_3D_WARPS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_3D_WARPS", 4)
+GFX906_PREFILL_3D_STAGES = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_3D_STAGES", 1)
+# Minimum KV context length for the prefill split-KV path. The S22 controlled
+# arms show the 3D path at the shipped two segments is a large win on long
+# prefills (p32k TTFT 178.6 -> 169.1 s, -5.3%) but a large loss on short ones
+# (c1 1429-token prefill 2612 -> 3376 ms per iteration), so production keeps
+# the win only above this context length. 0 keeps the historical behaviour
+# (3D whenever the switch is on).
+GFX906_PREFILL_3D_MIN_CTX = _gfx906_env_int(
+    "VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX", 0
+)
 
 # Lazily grown workspace for the prefill split-KV path. Unlike the decode
 # segment buffers (sized for the decode batch threshold and provided by the
@@ -155,7 +205,7 @@ def _prefill_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
     # tokens per 16-row block. Sweeps over BLOCK_M/TILE/num_warps/num_stages
     # at 4k-16k prefill shapes favor 32/32/4/1 uniformly on gfx906.
     if head_size == 256 and num_queries_per_kv == 6:
-        return 32
+        return GFX906_PREFILL_BLOCK_M_OVERRIDE or 32
     return None
 
 
@@ -166,6 +216,29 @@ def _num_query_blocks(num_query_tokens: int, num_seqs: int, block_q: int) -> int
     if num_seqs == 1:
         return (num_query_tokens + block_q - 1) // block_q
     return num_query_tokens // block_q + num_seqs
+
+
+def gfx906_small_q_decode(
+    max_seqlen_q: int,
+    segm_buffers_ready: bool,
+    tuned_decode_shape: int | None,
+    sched_tuning: bool,
+) -> bool:
+    """Whether a >1 query-length forward is still decode-shaped on gfx906.
+
+    A speculative-decoding verify pass carries k+1 query tokens but scans the
+    whole KV cache once, so it belongs on the split-KV decode path. Only the
+    tuned decode shape is rerouted, which keeps every other model on the
+    historical `max_seqlen_q > 1 implies prefill` classification.
+    """
+    return (
+        sched_tuning
+        and max_seqlen_q > 1
+        and ENABLE_GFX906_ATTN_VERIFY_3D
+        and segm_buffers_ready
+        and tuned_decode_shape is not None
+        and max_seqlen_q <= GFX906_VERIFY_MAX_QUERY_LEN
+    )
 
 
 def _decode_num_segments(
@@ -263,6 +336,7 @@ def kernel_unified_attention_2d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    CAUSAL: tl.constexpr,  # bool
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
@@ -359,21 +433,25 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-
-    if USE_MM_PREFIX:
-        # image bidirectional attention ranges require a full range
-        # including q_block padding to make sure doc mask is correct
-        max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        if USE_MM_PREFIX:
+            # image bidirectional attention ranges require a full range
+            # including q_block padding to make sure doc mask is correct
+            max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
+        else:
+            # adjust for potential padding in the last q_block by considering
+            # the actual sequence length
+            max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
     else:
-        # adjust for potential padding in the last q_block by considering the
-        # actual sequence length
-        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+        # Bidirectional attention: every query can reach every key, including
+        # the query block's own (later) positions.
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -393,12 +471,18 @@ def kernel_unified_attention_2d(
             cur_batch_query_len - 1,
         )
         # For sliding window, each query position q can only attend to
-        # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
-        # where q_abs = context_len + q
+        # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs] (causal) or
+        # [q_abs - SLIDING_WINDOW + 1, q_abs + SLIDING_WINDOW - 1]
+        # (bidirectional), where q_abs = context_len + q
         # The union of allowed key positions for this Q-block is:
         # [context_len + qpos_lo - SLIDING_WINDOW + 1, context_len + qpos_hi]
+        # extended by SLIDING_WINDOW - 1 when attention is bidirectional.
         first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
-        last_allowed_key = context_len + qpos_hi
+        last_allowed_key = (
+            context_len + qpos_hi
+            if CAUSAL
+            else context_len + qpos_hi + SLIDING_WINDOW - 1
+        )
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
@@ -439,7 +523,10 @@ def kernel_unified_attention_2d(
             else:
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
-            K = K_load
+            # A drafter can run its own dtype (e.g. bf16 DFlash behind an fp16
+            # target) while its KV cache keeps the run's cache dtype; cast to
+            # the query dtype so tl.dot sees matching operands.
+            K = K_load if K_load.dtype == Q.dtype else K_load.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -454,16 +541,30 @@ def kernel_unified_attention_2d(
             else:
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
-            V = V_load
+            V = V_load if V_load.dtype == Q.dtype else V_load.to(Q.dtype)
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            # Bidirectional (DFlash drafter blocks): every valid key is
+            # visible, then the sliding window below narrows it. Keys past the
+            # end of the sequence must stay masked -- their K/V tiles load as
+            # zeros, so they would otherwise collect probability mass.
+            seq_mask = seq_offset[None, :] < seq_len
 
         # Apply sliding window to base mask BEFORE mm_prefix OR.
         # Order must match FlexAttention: (causal AND sliding_window) OR mm_prefix
         if SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+            if CAUSAL:
+                seq_mask = seq_mask & (
+                    (query_abs_pos - seq_offset) < SLIDING_WINDOW
+                )
+            else:
+                seq_mask = seq_mask & (
+                    tl.abs(query_abs_pos - seq_offset) < SLIDING_WINDOW
+                )
 
         # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
         # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
@@ -611,6 +712,7 @@ def kernel_unified_attention_3d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    CAUSAL: tl.constexpr,  # bool
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
@@ -714,18 +816,20 @@ def kernel_unified_attention_3d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # Bidirectional attention: every query can reach every key, including
+        # the query block's own (later) positions.
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -745,12 +849,18 @@ def kernel_unified_attention_3d(
             cur_batch_query_len - 1,
         )
         # For sliding window, each query position q can only attend to
-        # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
-        # where q_abs = context_len + q
+        # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs] (causal) or
+        # [q_abs - SLIDING_WINDOW + 1, q_abs + SLIDING_WINDOW - 1]
+        # (bidirectional), where q_abs = context_len + q
         # The union of allowed key positions for this Q-block is:
         # [context_len + qpos_lo - SLIDING_WINDOW + 1, context_len + qpos_hi]
+        # extended by SLIDING_WINDOW - 1 when attention is bidirectional.
         first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
-        last_allowed_key = context_len + qpos_hi
+        last_allowed_key = (
+            context_len + qpos_hi
+            if CAUSAL
+            else context_len + qpos_hi + SLIDING_WINDOW - 1
+        )
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
@@ -794,7 +904,10 @@ def kernel_unified_attention_3d(
             else:
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
-            K = K_load
+            # A drafter can run its own dtype (e.g. bf16 DFlash behind an fp16
+            # target) while its KV cache keeps the run's cache dtype; cast to
+            # the query dtype so tl.dot sees matching operands.
+            K = K_load if K_load.dtype == Q.dtype else K_load.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -809,16 +922,30 @@ def kernel_unified_attention_3d(
             else:
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
-            V = V_load
+            V = V_load if V_load.dtype == Q.dtype else V_load.to(Q.dtype)
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            # Bidirectional (DFlash drafter blocks): every valid key is
+            # visible, then the sliding window below narrows it. Keys past the
+            # end of the sequence must stay masked -- their K/V tiles load as
+            # zeros, so they would otherwise collect probability mass.
+            seq_mask = seq_offset[None, :] < seq_len
 
         # Apply sliding window to base mask BEFORE mm_prefix OR.
         # Order must match FlexAttention: (causal AND sliding_window) OR mm_prefix
         if SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+            if CAUSAL:
+                seq_mask = seq_mask & (
+                    (query_abs_pos - seq_offset) < SLIDING_WINDOW
+                )
+            else:
+                seq_mask = seq_mask & (
+                    tl.abs(query_abs_pos - seq_offset) < SLIDING_WINDOW
+                )
 
         # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
         # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
@@ -1102,7 +1229,20 @@ def unified_attention(
     # Gemma4 mm_prefix + sliding-window clamping is not implemented here.
     mm_prefix_clamp_sliding_window: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
+    if not causal:
+        logger.info_once(
+            "gfx906 unified attention: running the bidirectional (non-causal) "
+            "path for a drafter."
+        )
+    if not causal and os.environ.get("VLLM_GFX906_ATTN_FORCE_CAUSAL") == "1":
+        # A/B arm: force the DFlash drafter's bidirectional block attention onto
+        # the causal path, to quantify how much of the acceptance length comes
+        # from real non-causal masking.
+        logger.warning_once(
+            "gfx906 unified attention: forcing non-causal requests onto the "
+            "causal path (VLLM_GFX906_ATTN_FORCE_CAUSAL=1)."
+        )
+        causal = True
     assert q_descale is None, "Q scales not supported"
 
     if (
@@ -1149,14 +1289,29 @@ def unified_attention(
 
     gfx906_sched = _gfx906_sched_tuning_enabled()
 
+    tuned_decode_shape = _decode_block_m(head_size, num_queries_per_kv)
+    segm_buffers_ready = (
+        seq_threshold_3D is not None
+        and num_par_softmax_segments is not None
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+    )
+    # Decode and a speculative-decoding verify pass both scan the whole KV
+    # cache for a handful of query tokens, so both must stay decode-shaped.
+    # Restricted to the tuned decode shape so every other model keeps the
+    # pre-existing routing.
+    small_q_decode = gfx906_small_q_decode(
+        max_seqlen_q, segm_buffers_ready, tuned_decode_shape, gfx906_sched
+    )
     decode_block_m = (
-        _decode_block_m(head_size, num_queries_per_kv)
-        if gfx906_sched and max_seqlen_q == 1
+        tuned_decode_shape
+        if gfx906_sched and (max_seqlen_q == 1 or small_q_decode)
         else None
     )
     prefill_block_m = (
         _prefill_block_m(head_size, num_queries_per_kv)
-        if gfx906_sched and max_seqlen_q > 1
+        if gfx906_sched and max_seqlen_q > 1 and not small_q_decode
         else None
     )
     BLOCK_M = decode_block_m or prefill_block_m or (
@@ -1187,6 +1342,8 @@ def unified_attention(
         q.element_size(),
         is_prefill=True,
     )
+    if GFX906_PREFILL_TILE_OVERRIDE:
+        TILE_SIZE_PREFILL = GFX906_PREFILL_TILE_OVERRIDE
     TILE_SIZE_DECODE = _get_tile_size(
         head_size,
         sliding_window_val,
@@ -1201,6 +1358,7 @@ def unified_attention(
         num_segments,
         tile_size,
         num_warps,
+        num_stages=1,
     ):
         kernel_unified_attention_3d[
             (total_num_q_blocks, num_kv_heads, num_segments)
@@ -1239,6 +1397,7 @@ def unified_attention(
             MAX_MM_RANGES=max_mm_ranges,
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
+            CAUSAL=causal,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
@@ -1253,7 +1412,11 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_segments,
             # num_warps=None keeps the Triton defaults on non-gfx906 platforms
-            **({"num_warps": num_warps, "num_stages": 1} if num_warps else {}),
+            **(
+                {"num_warps": num_warps, "num_stages": num_stages}
+                if num_warps
+                else {}
+            ),
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
@@ -1283,6 +1446,7 @@ def unified_attention(
     # workspace cannot be allocated inside a capture.
     use_prefill_3d = (
         ENABLE_GFX906_ATTN_PREFILL_3D
+        and max_seqlen_k >= GFX906_PREFILL_3D_MIN_CTX
         and gfx906_sched
         and prefill_block_m is not None
         and sliding_window_val == 0
@@ -1311,7 +1475,8 @@ def unified_attention(
             segm_expsum,
             num_segments,
             TILE_SIZE_PREFILL,
-            4,
+            GFX906_PREFILL_3D_WARPS,
+            GFX906_PREFILL_3D_STAGES,
         )
         return
 
@@ -1320,13 +1485,15 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    # A small-query-length verify pass is decode-shaped (see small_q_decode), so
+    # it is deliberately not treated as "a prefill request" here.
     if (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not small_q_decode)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     ):
@@ -1371,6 +1538,7 @@ def unified_attention(
             MAX_MM_RANGES=max_mm_ranges,
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
+            CAUSAL=causal,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
@@ -1387,7 +1555,14 @@ def unified_attention(
             **(
                 # tuned prefill shapes run 4 warps; everything else (incl. the
                 # decode fallback through the 2D kernel) keeps 2 warps
-                {"num_warps": 4 if prefill_block_m else 2, "num_stages": 1}
+                (
+                    {
+                        "num_warps": GFX906_PREFILL_WARPS,
+                        "num_stages": GFX906_PREFILL_STAGES,
+                    }
+                    if prefill_block_m
+                    else {"num_warps": 2, "num_stages": 1}
+                )
                 if gfx906_sched
                 else {}
             ),

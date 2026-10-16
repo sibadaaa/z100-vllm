@@ -301,10 +301,17 @@ verify_*.py
 test_*.py
 !tests/v1/core/test_mamba_align_chunk_split.py
 !tests/v1/attention/test_gdn_metadata_builder.py
+!tests/parser/test_metrics.py
+!tests/v1/spec_decode/test_metrics.py
 *_test.py
 *_verify.py
 *_validation.py
 .trash/
+
+# Local benchmark / profiling scratch
+.bench/
+.s20/
+.s21/
 
 !.buildkite/scripts/lib/
 

@@ -1,0 +1,44 @@
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 10-13 12:43:34 [_aiter_ops.py:174] Could not locate PyTorch's HIP runtime; AITER JIT extensions may fail to resolve HIP symbols.
+
+rocblaslt warning: No paths matched /opt/dtk/lib/hipblaslt/library/*gfx906*co. Make sure that HIPBLASLT_TENSILE_LIBPATH is set correctly.
+         shape  mode  var  M       ms   GB/s  note
+   1280x5120    gemv   64  1   0.0255    257  rel=0.00e+00
+   1280x5120    gemv   64  2   0.0297    221  rel=0.00e+00
+   1280x5120    gemv   64  3   0.0369    178  rel=0.00e+00
+   1280x5120    gemv   64  4   0.0519    126  rel=0.00e+00
+   1280x5120    gemv   64  5   0.2601     25  rel=0.00e+00
+   1280x5120    gemv   64  8   0.2453     27  rel=0.00e+00
+   3584x5120    gemv   64  1   0.0459    400  rel=0.00e+00
+   3584x5120    gemv   64  2   0.0559    328  rel=0.00e+00
+   3584x5120    gemv   64  3   0.0638    288  rel=0.00e+00
+   3584x5120    gemv   64  4   0.1011    182  rel=0.00e+00
+   3584x5120    gemv   64  5   0.2472     74  rel=0.00e+00
+   3584x5120    gemv   64  8   0.2470     74  rel=0.00e+00
+   4096x5120    gemv   64  1   0.0585    359  rel=0.00e+00
+   4096x5120    gemv   64  2   0.0715    293  rel=0.00e+00
+   4096x5120    gemv   64  3   0.0804    261  rel=0.00e+00
+   4096x5120    gemv   64  4   0.1219    172  rel=0.00e+00
+   4096x5120    gemv   64  5   0.3205     65  rel=0.00e+00
+   4096x5120    gemv   64  8   0.3211     65  rel=0.00e+00
+   5120x5120    gemv   64  1   0.0615    427  rel=0.00e+00
+   5120x5120    gemv   64  2   0.0745    352  rel=0.00e+00
+   5120x5120    gemv   64  3   0.0841    312  rel=5.96e-05
+   5120x5120    gemv   64  4   0.1265    207  rel=5.96e-05
+   5120x5120    gemv   64  5   0.3219     81  rel=5.96e-05
+   5120x5120    gemv   64  8   0.3215     82  rel=5.96e-05
+   8704x5120    gemv   64  1   0.1060    421  rel=0.00e+00
+   8704x5120    gemv   64  2   0.1209    369  rel=5.96e-05
+   8704x5120    gemv   64  3   0.1499    297  rel=5.96e-05
+   8704x5120    gemv   64  4   0.2201    202  rel=5.96e-05
+   8704x5120    gemv   64  5   0.4172    107  rel=5.96e-05
+   8704x5120    gemv   64  8   0.4171    107  rel=5.96e-05
+   4352x5120    gemv   64  1   0.0600    371  rel=0.00e+00
+   4352x5120    gemv   64  2   0.0739    302  rel=0.00e+00
+   4352x5120    gemv   64  3   0.0813    274  rel=0.00e+00
+   4352x5120    gemv   64  4   0.1217    183  rel=0.00e+00
+   4352x5120    gemv   64  5   0.3209     69  rel=0.00e+00
+   4352x5120    gemv   64  8   0.3213     69  rel=0.00e+00
+[probe] wrote /mnt/game/perf1/perf1_kernel_mprobe_streamunset_prefunset.json

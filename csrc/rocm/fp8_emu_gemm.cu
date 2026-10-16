@@ -55,6 +55,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "rocm/fp8_emu_gemm.h"
 #include "rocm/gfx906_emu_common.cuh"
@@ -222,8 +223,12 @@ struct FConf {
   static constexpr int MG = BM / TM;  // threads along M
   static constexpr int NG = BN / TN;  // threads along N
   static constexpr int NT = MG * NG;
-  static constexpr int A4 = BM * kFKw4 / NT;  // fp8 dwords loaded per thread
-  static constexpr int B4 = BN * kFKw4 / NT;
+  // fp8 dwords staged per thread.  Ceil, because a decode tile can have
+  // BM * kFKw4 < NT (BM = 8 at 128 threads): the surplus threads stage a
+  // zeroed dword behind the `idx < BM * kFKw4` guard instead of moving the
+  // tile geometry.
+  static constexpr int A4 = (BM * kFKw4 + NT - 1) / NT;
+  static constexpr int B4 = (BN * kFKw4 + NT - 1) / NT;
 };
 
 // Stage one K slice of A/W from global into registers (zero-filled for
@@ -246,7 +251,8 @@ __device__ __forceinline__ void fp8_gemm_load(const uint8_t* __restrict__ A,
     const int r = idx >> kFLogKw4;
     const int jd = idx & (kFKw4 - 1);
     uint32_t v = 0;
-    if (m0 + r < M && (kfull || (k0 + (jd + 1) * 4) <= K))
+    if (idx < BM * kFKw4 && m0 + r < M &&
+        (kfull || (k0 + (jd + 1) * 4) <= K))
       v = ap[(int64_t)r * K4 + jd];
     dst[u] = v;
   }
@@ -256,7 +262,8 @@ __device__ __forceinline__ void fp8_gemm_load(const uint8_t* __restrict__ A,
     const int r = idx >> kFLogKw4;
     const int jd = idx & (kFKw4 - 1);
     uint32_t v = 0;
-    if (n0 + r < N && (kfull || (k0 + (jd + 1) * 4) <= K))
+    if (idx < BN * kFKw4 && n0 + r < N &&
+        (kfull || (k0 + (jd + 1) * 4) <= K))
       v = wp[(int64_t)r * K4 + jd];
     dst[C::A4 + u] = v;
   }
@@ -273,6 +280,7 @@ __device__ __forceinline__ void fp8_gemm_store(int tid,
 #pragma unroll
   for (int u = 0; u < C::A4; ++u) {
     const int idx = tid + u * C::NT;
+    if (idx >= BM * kFKw4) continue;
     const int r = idx >> kFLogKw4;
     const int jd = idx & (kFKw4 - 1);
     uint32_t lo, hi;
@@ -283,6 +291,7 @@ __device__ __forceinline__ void fp8_gemm_store(int tid,
 #pragma unroll
   for (int u = 0; u < C::B4; ++u) {
     const int idx = tid + u * C::NT;
+    if (idx >= BN * kFKw4) continue;
     const int r = idx >> kFLogKw4;
     const int jd = idx & (kFKw4 - 1);
     uint32_t lo, hi;
@@ -329,8 +338,7 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   using C_ = FConf<BM, BN, TM, TN>;
   constexpr int NT = C_::NT;
   constexpr int FRAGS = C_::A4 + C_::B4;
-  static_assert((BM * kFKw4) % NT == 0 && (BN * kFKw4) % NT == 0,
-                "tile/thread mismatch");
+  static_assert(C_::MG * TM == BM && C_::NG * TN == BN, "tile/thread mismatch");
 
   __shared__ uint32_t As[2][BM * kFKp];
   __shared__ uint32_t Bs[2][BN * kFKp];
@@ -559,6 +567,479 @@ void launch_gemv_block(int M, int N, int K4, int nt, int64_t w_stride, int nkb,
 #undef VLLM_FP8_EMU_GEMV_BLOCK_CASE
 }
 
+// ---------------------------------------------------------------------------
+// streaming decode kernel, block-scaled: M <= 8
+// ---------------------------------------------------------------------------
+// The tiled GEMM above costs 375 us for N=4352/K=5120 regardless of M, i.e.
+// 63 GB/s = 9% of the 670 GB/s this card reaches on a flat stream.  The
+// standalone roofline probe (pmc/gemv_probe.cpp) shows why: the double-buffered
+// 32-element K loop is an on-chip pipeline with a serial dependency per chunk
+// and only 68 blocks x 128 threads live, and deleting *all* of its global
+// loads makes it slower (341.6 vs 320.4 us), so the exposed latency is LDS /
+// barrier, not DRAM.
+//
+// This kernel is shaped like the probe's `k_stream_rows`, which did reach
+// 621.7 GB/s at exactly this geometry (grid = N/64, 512 threads/block):
+//
+//   * one block per `rows` rows of W, one warp per row at a time;
+//   * 64 lanes stride K in uint4 (16 fp8 byte) steps, so every W load is a
+//     single fully-coalesced 1 KiB request per warp;
+//   * no K-carried dependency: each row restarts the accumulator chain, and a
+//     depth-1 prefetch keeps the next row-chunk's load in flight while the
+//     current one is widened and dotted;
+//   * `rows` divides `block_n`, so every row of the block reads the same
+//     `w_s[nb, :]` row and the per-block_k scales can be folded once per block
+//     into LDS as `a_s[m, kb] * w_s[nb, kb]` (identical arithmetic to
+//     `fp8_emu_gemv_block_kernel`: `acc[m] += loc[m] * s[m]`);
+//   * A is widened once per block into LDS, so the M*K LUT lookups are paid
+//     once per block instead of once per row of W.
+constexpr int kStreamChunk = 16;  // fp8 elements owned by one lane per step
+// Upper bound for the streaming path's dynamic LDS: A (M*K fp16) + folded
+// scales.  The real gate is min(this, device LDS per block - 1 KiB), queried
+// once from the device, so a smaller-LDS part degrades to the old GEMV instead
+// of failing the launch.
+constexpr size_t kStreamSmemCap = (size_t)44 * 1024;
+
+size_t stream_smem_limit() {
+  static const size_t lim = []() -> size_t {
+    int dev = 0;
+    hipDeviceProp_t prop{};
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipGetDeviceProperties(&prop, dev) != hipSuccess ||
+        prop.sharedMemPerBlock <= 2 * 1024) {
+      return kStreamSmemCap;
+    }
+    const size_t d = (size_t)prop.sharedMemPerBlock - 1024;  // LUT + slack
+    return d < kStreamSmemCap ? d : kStreamSmemCap;
+  }();
+  return lim;
+}
+
+template <int MS, int PREF, typename T>
+__global__ void fp8_emu_gemv_stream_block_kernel(
+    const uint8_t* __restrict__ a,      // [M, K]
+    const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
+    const float* __restrict__ a_s,      // [M, nkb]
+    const float* __restrict__ w_s,      // [cdiv(N, block_n), nkb]
+    const __half* __restrict__ lut,     // [256]
+    const T* __restrict__ bias,         // [N] | null
+    T* __restrict__ out,                // [M, N]
+    const int M, const int N, const int K, const int64_t w_stride,
+    const int rows, const int nkb, const int block_n, const int cpb) {
+  extern __shared__ uint32_t dyn[];
+  __half* sA = reinterpret_cast<__half*>(dyn);                     // [M][K]
+  float* sscale = reinterpret_cast<float*>(sA + (int64_t)M * K);   // [M][nkb]
+  __shared__ __half sl[256];
+
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const int lane = t & 63;
+  const int warp = t >> 6;
+  const int nwarp = nt >> 6;
+  const int K4 = K >> 2;
+
+  fp8_lut_stage(sl, lut, nt);
+  __syncthreads();
+
+  {  // A -> LDS, widened once per block.
+    const uint32_t* __restrict__ a32 = reinterpret_cast<const uint32_t*>(a);
+    uint32_t* sA32 = reinterpret_cast<uint32_t*>(sA);
+    const int64_t tot = (int64_t)M * K4;
+    for (int64_t i = t; i < tot; i += nt) {
+      uint32_t lo, hi;
+      fp8x4_to_f16x2x2(sl, a32[i], lo, hi);
+      sA32[2 * i] = lo;
+      sA32[2 * i + 1] = hi;
+    }
+  }
+  {  // Folded per-block_k scales: rows divides block_n, so one w_s row.
+    const int nb = (int)(((int64_t)blockIdx.x * rows) / block_n);
+    const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
+    const int tot = M * nkb;
+    for (int i = t; i < tot; i += nt) {
+      const int m = i / nkb;
+      const int kb = i - m * nkb;
+      sscale[i] = a_s[(int64_t)m * nkb + kb] * wsr[kb];
+    }
+  }
+  __syncthreads();
+
+  const int n0 = blockIdx.x * rows;
+  const int k4v = K4 >> 2;  // 16-byte vectors per row of W
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
+
+  for (int r = warp; r < rows; r += nwarp) {
+    const int row = n0 + r;
+    if (row >= N) break;
+    const uint4* __restrict__ wp = wv + (((int64_t)row * w_stride) >> 4);
+
+    float acc[MS];
+#pragma unroll
+    for (int m = 0; m < MS; ++m) acc[m] = 0.0f;
+
+    // Uniform trip count for the whole wavefront (the cross-lane reduction
+    // below must not sit behind a divergent branch); out-of-range lanes carry a
+    // zeroed chunk and a clamped index, so they contribute exactly 0.
+    //
+    // PREF chunks of W are kept in flight: the DRAM latency (~600 cycles) is
+    // several times the issue cost of one chunk (~50 instructions), so one
+    // in-flight load per warp exposes most of it.  PREF is a template knob so
+    // the depth can be A/B'd without a rebuild (VLLM_DCU_FP8_GEMV_PREF).
+    const int niter = (k4v + 63) >> 6;
+    int i = lane;
+    uint4 buf[PREF];
+#pragma unroll
+    for (int q = 0; q < PREF; ++q) {
+      const int ii = i + q * 64;
+      buf[q] = make_uint4(0u, 0u, 0u, 0u);
+      if (ii < k4v) buf[q] = wp[ii];
+    }
+    for (int j = 0; j < niter; ++j) {
+      const uint4 vv = buf[0];
+      const int inext = i + PREF * 64;
+      uint4 vn = make_uint4(0u, 0u, 0u, 0u);
+      if (j + PREF < niter && inext < k4v) vn = wp[inext];
+#pragma unroll
+      for (int q = 0; q + 1 < PREF; ++q) buf[q] = buf[q + 1];
+      buf[PREF - 1] = vn;
+
+      uint32_t p[8];
+      fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);
+      fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);
+      fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);
+      fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);
+
+      const int ic = min(i, k4v - 1);  // clamped for padded lanes
+      const int kb = ic / cpb;
+#pragma unroll
+      for (int m = 0; m < MS; ++m) {
+        if (m < M) {
+          const uint4* __restrict__ ap = reinterpret_cast<const uint4*>(
+              sA + (int64_t)m * K + ic * kStreamChunk);
+          const uint4 xa = ap[0];
+          const uint4 xb = ap[1];
+          float loc = 0.0f;
+          loc = dot2(p[0], xa.x, loc);
+          loc = dot2(p[1], xa.y, loc);
+          loc = dot2(p[2], xa.z, loc);
+          loc = dot2(p[3], xa.w, loc);
+          loc = dot2(p[4], xb.x, loc);
+          loc = dot2(p[5], xb.y, loc);
+          loc = dot2(p[6], xb.z, loc);
+          loc = dot2(p[7], xb.w, loc);
+          acc[m] += loc * sscale[m * nkb + kb];
+        }
+      }
+      i += 64;
+    }
+
+    // Cross-lane reduction; lane 0 owns the row.  Executed by the whole
+    // wavefront (the K loop above reconverges at its exit).
+#pragma unroll
+    for (int m = 0; m < MS; ++m) {
+      if (m < M) {
+        float v = acc[m];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
+        if (lane == 0) {
+          T o = static_cast<T>(v);
+          if (bias != nullptr) o += static_cast<T>(bias[row]);
+          out[(int64_t)m * N + row] = o;
+        }
+      }
+    }
+  }
+}
+
+template <int MS, int PREF, typename T>
+void launch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows, int nt,
+                        int nkb, int block_n, int cpb, const uint8_t* A,
+                        const uint8_t* W, const float* a_s, const float* w_s,
+                        const __half* lut, const T* bias, T* C,
+                        hipStream_t stream) {
+  const size_t smem = (size_t)M * K * sizeof(__half) +
+                      (size_t)M * nkb * sizeof(float);
+  dim3 grid((N + rows - 1) / rows);
+  dim3 block(nt);
+  fp8_emu_gemv_stream_block_kernel<MS, PREF, T><<<grid, block, smem, stream>>>(
+      A, W, a_s, w_s, lut, bias, C, M, N, K, w_stride, rows, nkb, block_n,
+      cpb);
+}
+
+// Streaming path available *and* its geometry chosen.  Returns 0 = none,
+// 1 = variant 1, 2 = variant 2.
+//
+// Variant 1: `rows` divides `block_n` (so a block never straddles a w_s row)
+// and is small enough that the grid still fills the 60 CUs; 512 threads is the
+// block size the probe measured 621 GB/s with.
+// Variant 2 additionally needs exactly 8 warps x RW=8 rows and a block_n that
+// rows=64 divides (its per-warp row ownership is fixed at launch).
+int stream_block_select(int M, int N, int K, int64_t w_stride, int nkb,
+                        int block_n, int block_k, int want, int& rows,
+                        int& nt) {
+  if (want == 0 || M < 1 || M > kMsMax) return 0;
+  if (K < 64 || (K % kStreamChunk) != 0) return 0;
+  if ((w_stride % kStreamChunk) != 0) return 0;
+  if (block_k < kStreamChunk || (block_k % kStreamChunk) != 0) return 0;
+  if (block_n < 8 || (block_n % 8) != 0) return 0;
+  const size_t smem = (size_t)M * K * sizeof(__half) +
+                      (size_t)M * nkb * sizeof(float);
+  if (smem > stream_smem_limit()) return 0;
+  if (want == 2 && M <= 4 && (block_n % 64) == 0) {
+    rows = 64;
+    nt = 512;
+    return 2;
+  }
+  // Load balance beats A-restaging: the perf1 s1 table shows 420-445 GB/s once
+  // the grid has ~112+ blocks (N=3584/8704) but only 250-400 GB/s at 64-80
+  // blocks (N=1280/4096/5120), because ceil(blocks/60) waves leave CUs idle at
+  // the tail.  Target >= kStreamMinBlocks row-groups, floored at rows=8 so the
+  // per-block A staging stays amortised (it is L2-resident: rows are re-read,
+  // not re-streamed from DRAM).
+  // Measured variant (NOT shipped): 100 puts every production N in the
+  // 112-160 row-group sweet spot (N=3584 back to 43.3/58.9/87.4 us at
+  // M=1/3/4) while keeping the -16..-20% on 4352/4096/5120, at the cost of
+  // a rebuild + full re-verification; left for the next build window.
+  constexpr int kStreamMinBlocks = 120;
+  rows = 64;
+  while (rows > 8 && ((block_n % rows) != 0 ||
+                      (N + rows - 1) / rows < kStreamMinBlocks))
+    rows >>= 1;
+  if ((block_n % rows) != 0) return 0;
+  nt = 512;
+  return 1;
+}
+
+// 0 = old GEMV, 1 = streaming variant 1 (default), 2 = variant 2.  Read once
+// per process so an A/B needs no rebuild.
+int stream_block_mode() {
+  static const int mode = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_STREAM");
+    if (e == nullptr) return 1;
+    const int v = std::atoi(e);
+    return v <= 0 ? 0 : (v == 2 ? 2 : 1);
+  }();
+  return mode;
+}
+
+// Depth of the W software pipeline; 3 keeps 3 KiB per warp in flight, which is
+// what covers the ~600-cycle DRAM latency at 512 threads/block.  A/B knob, no
+// rebuild needed.
+int stream_prefetch() {
+  static const int p = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_PREF");
+    if (e == nullptr) return 3;
+    return std::atoi(e) == 1 ? 1 : 3;
+  }();
+  return p;
+}
+
+template <typename T>
+void dispatch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows,
+                          int nt, int nkb, int block_n, int cpb, int pref,
+                          const uint8_t* A, const uint8_t* W,
+                          const float* a_s, const float* w_s,
+                          const __half* lut, const T* bias, T* C,
+                          hipStream_t stream) {
+#define VLLM_FP8_EMU_GEMV_STREAM_CASE(MS, PREF)                             \
+  do {                                                                      \
+    launch_gemv_stream<MS, PREF, T>(M, N, K, w_stride, rows, nt, nkb,       \
+                                    block_n, cpb, A, W, a_s, w_s, lut, bias, \
+                                    C, stream);                             \
+    return;                                                                 \
+  } while (0)
+#define VLLM_FP8_EMU_GEMV_STREAM_MS(MS)                                     \
+  do {                                                                      \
+    if (pref == 1) VLLM_FP8_EMU_GEMV_STREAM_CASE(MS, 1);                    \
+    VLLM_FP8_EMU_GEMV_STREAM_CASE(MS, 3);                                   \
+  } while (0)
+  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM_MS(1);
+  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM_MS(2);
+  if (M <= 4) VLLM_FP8_EMU_GEMV_STREAM_MS(4);
+  VLLM_FP8_EMU_GEMV_STREAM_MS(kMsMax);
+#undef VLLM_FP8_EMU_GEMV_STREAM_MS
+#undef VLLM_FP8_EMU_GEMV_STREAM_CASE
+}
+
+// ---------------------------------------------------------------------------
+// streaming decode kernel, variant 2: A hoisted out of the row loop
+// ---------------------------------------------------------------------------
+// Same geometry as variant 1 (one block per `rows` rows of W, one warp per row
+// at a time, lane-strided uint4 loads), but the loop order is K-outer /
+// rows-inner with RW rows per warp held in registers:
+//
+//   for each K chunk:  load this lane's A chunk once (MS x 2 x 128-bit LDS)
+//                      for r in 0..RW-1: load W[r][chunk], widen, dot2
+//
+// A lane's K position is identical for every row, so variant 1's per-row A
+// re-read (MS*2 128-bit LDS reads + 4*64 LUT reads per 1 KiB of W) is paid
+// once per chunk instead of once per row, the W loads of RW rows are in flight
+// together, and the cross-lane reduction happens once per (row, m) for the
+// whole K loop instead of per row.  Costs RW*MS fp32 accumulators, so it is
+// only instantiated for M <= 4.
+template <int MS, int RW, typename T>
+__global__ void fp8_emu_gemv_stream2_block_kernel(
+    const uint8_t* __restrict__ a, const uint8_t* __restrict__ w,
+    const float* __restrict__ a_s, const float* __restrict__ w_s,
+    const __half* __restrict__ lut, const T* __restrict__ bias,
+    T* __restrict__ out, const int M, const int N, const int K,
+    const int64_t w_stride, const int rows, const int nkb, const int block_n,
+    const int cpb) {
+  extern __shared__ uint32_t dyn[];
+  __half* sA = reinterpret_cast<__half*>(dyn);                     // [M][K]
+  float* sscale = reinterpret_cast<float*>(sA + (int64_t)M * K);   // [M][nkb]
+  __shared__ __half sl[256];
+
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const int lane = t & 63;
+  const int warp = t >> 6;
+  const int K4 = K >> 2;
+
+  fp8_lut_stage(sl, lut, nt);
+  __syncthreads();
+  {
+    const uint32_t* __restrict__ a32 = reinterpret_cast<const uint32_t*>(a);
+    uint32_t* sA32 = reinterpret_cast<uint32_t*>(sA);
+    const int64_t tot = (int64_t)M * K4;
+    for (int64_t i = t; i < tot; i += nt) {
+      uint32_t lo, hi;
+      fp8x4_to_f16x2x2(sl, a32[i], lo, hi);
+      sA32[2 * i] = lo;
+      sA32[2 * i + 1] = hi;
+    }
+  }
+  {
+    const int nb = (int)(((int64_t)blockIdx.x * rows) / block_n);
+    const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
+    const int tot = M * nkb;
+    for (int i = t; i < tot; i += nt) {
+      const int m = i / nkb;
+      const int kb = i - m * nkb;
+      sscale[i] = a_s[(int64_t)m * nkb + kb] * wsr[kb];
+    }
+  }
+  __syncthreads();
+
+  const int n0 = blockIdx.x * rows;
+  const int k4v = K4 >> 2;
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
+  const int rbase = n0 + warp * RW;
+
+  float acc[RW][MS];
+#pragma unroll
+  for (int r = 0; r < RW; ++r) {
+#pragma unroll
+    for (int m = 0; m < MS; ++m) acc[r][m] = 0.0f;
+  }
+
+  const int niter = (k4v + 63) >> 6;
+  for (int j = 0; j < niter; ++j) {
+    const int i = lane + (j << 6);
+    const int ic = min(i, k4v - 1);
+    const int kb = ic / cpb;
+
+    uint4 xa[MS], xb[MS];
+#pragma unroll
+    for (int m = 0; m < MS; ++m) {
+      if (m < M) {
+        const uint4* __restrict__ ap = reinterpret_cast<const uint4*>(
+            sA + (int64_t)m * K + ic * kStreamChunk);
+        xa[m] = ap[0];
+        xb[m] = ap[1];
+      }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+      const int row = rbase + r;
+      if (row < N) {
+        const uint4* __restrict__ wp =
+            wv + (((int64_t)row * w_stride) >> 4);
+        // Padded lanes (i >= k4v) must contribute exactly zero, not the
+        // clamped chunk again.
+        uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+        if (i < k4v) vv = wp[i];
+        uint32_t p[8];
+        fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);
+        fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);
+        fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);
+        fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);
+#pragma unroll
+        for (int m = 0; m < MS; ++m) {
+          if (m < M) {
+            float loc = 0.0f;
+            loc = dot2(p[0], xa[m].x, loc);
+            loc = dot2(p[1], xa[m].y, loc);
+            loc = dot2(p[2], xa[m].z, loc);
+            loc = dot2(p[3], xa[m].w, loc);
+            loc = dot2(p[4], xb[m].x, loc);
+            loc = dot2(p[5], xb[m].y, loc);
+            loc = dot2(p[6], xb[m].z, loc);
+            loc = dot2(p[7], xb[m].w, loc);
+            acc[r][m] += loc * sscale[m * nkb + kb];
+          }
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < RW; ++r) {
+    const int row = rbase + r;
+    if (row >= N) continue;
+#pragma unroll
+    for (int m = 0; m < MS; ++m) {
+      if (m < M) {
+        float v = acc[r][m];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
+        if (lane == 0) {
+          T o = static_cast<T>(v);
+          if (bias != nullptr) o += static_cast<T>(bias[row]);
+          out[(int64_t)m * N + row] = o;
+        }
+      }
+    }
+  }
+}
+
+template <int MS, int RW, typename T>
+void launch_gemv_stream2(int M, int N, int K, int64_t w_stride, int rows, int nt,
+                         int nkb, int block_n, int cpb, const uint8_t* A,
+                         const uint8_t* W, const float* a_s, const float* w_s,
+                         const __half* lut, const T* bias, T* C,
+                         hipStream_t stream) {
+  const size_t smem = (size_t)M * K * sizeof(__half) +
+                      (size_t)M * nkb * sizeof(float);
+  dim3 grid((N + rows - 1) / rows);
+  dim3 block(nt);
+  fp8_emu_gemv_stream2_block_kernel<MS, RW, T><<<grid, block, smem, stream>>>(
+      A, W, a_s, w_s, lut, bias, C, M, N, K, w_stride, rows, nkb, block_n,
+      cpb);
+}
+
+template <typename T>
+void dispatch_gemv_stream2(int M, int N, int K, int64_t w_stride, int rows,
+                           int nt, int nkb, int block_n, int cpb,
+                           const uint8_t* A, const uint8_t* W,
+                           const float* a_s, const float* w_s,
+                           const __half* lut, const T* bias, T* C,
+                           hipStream_t stream) {
+  constexpr int kRW = 8;  // rows per warp (= rows / nwarp at 512 threads)
+#define VLLM_FP8_EMU_GEMV_STREAM2_CASE(MS)                                  \
+  do {                                                                      \
+    launch_gemv_stream2<MS, kRW, T>(M, N, K, w_stride, rows, nt, nkb,       \
+                                    block_n, cpb, A, W, a_s, w_s, lut, bias, \
+                                    C, stream);                             \
+    return;                                                                 \
+  } while (0)
+  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM2_CASE(1);
+  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM2_CASE(2);
+  VLLM_FP8_EMU_GEMV_STREAM2_CASE(4);
+#undef VLLM_FP8_EMU_GEMV_STREAM2_CASE
+}
+
 // Stage a K slice from global into registers, honouring the (possibly padded)
 // row stride of W: `process_fp8_weight_block_strategy` pads the last dimension
 // by VLLM_ROCM_FP8_PADDING, so `w.stride(0)` is K + pad, not K.
@@ -618,8 +1099,8 @@ __device__ __forceinline__ void fp8_gemm_fold_block_scale(
   }
 }
 
-template <int BM, int BN, int TM, int TN, typename T>
-__global__ void __launch_bounds__((BM / TM) * (BN / TN))
+template <int BM, int BN, int TM, int TN, typename T, int MINB = 1>
+__global__ void __launch_bounds__((BM / TM) * (BN / TN), MINB)
     fp8_emu_gemm_block_kernel(const uint8_t* __restrict__ A,
                               const uint8_t* __restrict__ W,
                               const int64_t w_stride,
@@ -632,8 +1113,8 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   using C_ = FConf<BM, BN, TM, TN>;
   constexpr int NT = C_::NT;
   constexpr int FRAGS = C_::A4 + C_::B4;
-  static_assert((BM * kFKw4) % NT == 0 && (BN * kFKw4) % NT == 0,
-                "tile/thread mismatch");
+  static_assert(C_::MG * TM == BM && C_::NG * TN == BN, "tile/thread mismatch");
+  static_assert(BM * kFKw4 >= 1 && BN * kFKw4 >= 1, "empty tile");
 
   __shared__ uint32_t As[2][BM * kFKp];
   __shared__ uint32_t Bs[2][BN * kFKp];
@@ -713,15 +1194,16 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   }
 }
 
-template <int BM, int BN, int TM, int TN, typename T>
+template <int BM, int BN, int TM, int TN, typename T, int MINB = 1>
 void launch_gemm_block(int M, int N, int K, int64_t w_stride, int nkb, int cpb,
                        int block_n, const uint8_t* A, const uint8_t* W,
                        const float* a_s, const float* w_s, const __half* lut,
                        const T* bias, T* C, hipStream_t stream) {
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
   dim3 block((BM / TM) * (BN / TN));
-  fp8_emu_gemm_block_kernel<BM, BN, TM, TN, T><<<grid, block, 0, stream>>>(
-      A, W, w_stride, a_s, w_s, nkb, cpb, block_n, lut, bias, C, M, N, K);
+  fp8_emu_gemm_block_kernel<BM, BN, TM, TN, T, MINB>
+      <<<grid, block, 0, stream>>>(A, W, w_stride, a_s, w_s, nkb, cpb,
+                                   block_n, lut, bias, C, M, N, K);
 }
 
 void check_common(const torch::Tensor& a, const torch::Tensor& w,
@@ -940,10 +1422,58 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
                                          block_n, A, W, a_s, w_s, lut,     \
                                          bias, C, stream);                 \
     break
+// Same tile with an explicit minimum-blocks-per-CU hint, which caps the VGPR
+// budget (`__launch_bounds__(NT, MINB)` -> 65536/(NT*MINB) VGPR/thread).  The
+// default cfg 1 tile needs 216 VGPR, i.e. <= 2 blocks/CU on 60 CUs, which is
+// what the S18 profile blamed for the 9% memory-roofline efficiency.
+#define VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB(CFG, BM, BN, TM, TN, MINB)         \
+  case CFG:                                                                \
+    launch_gemm_block<BM, BN, TM, TN, T, MINB>(M, N, K, w_stride, nkb,     \
+                                               cpb, block_n, A, W, a_s,    \
+                                               w_s, lut, bias, C, stream); \
+    break
   switch (cfg) {
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(1, 32, 64, 4, 4);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(2, 64, 64, 4, 4);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(3, 64, 128, 4, 8);
+    // 5: 256 threads, TM=2 -> 8 accumulators instead of 16 (register relief).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(5, 32, 64, 2, 4);
+    // 6: 256 threads, 4x4 -> 2 A + 2 B dwords staged per thread.
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(6, 32, 128, 2, 8);
+    // 7: cfg 1 at 128 threads but forced to 4 / 6 blocks per CU (VGPR cap
+    //    128 / 85).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB(7, 32, 64, 4, 4, 4);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB(8, 32, 64, 4, 4, 6);
+    // 9: cfg 2 (256 threads) forced to 3 blocks/CU (VGPR cap 85).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB(9, 64, 64, 4, 4, 3);
+    // 10: cfg 5 with 4 blocks/CU (VGPR cap 64).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB(10, 32, 64, 2, 4, 4);
+    // 11..15: decode tiles for M = 5..8.  The fallback tiles above are sized
+    // for prefill (BM = 32/64/128); at M = 8 a BM = 32 tile computes 4x the
+    // MACs that are needed and the epilogue discards 3/4 of them.  These tiles
+    // are BM = 8 (exact M for the verify batch) and 128 threads, i.e. the same
+    // per-thread work as cfg 5 at 1/4 the instruction count.  Measured: only
+    // 1.0-1.2x over cfg 5/10 at M = 8, because these tiles have half the
+    // resident threads of the BM=32 tile and the kernel is occupancy-bound --
+    // cfgs 16..19 below restore the thread count (tools/dcu/s20_kernel_NOTES.md).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(11, 8, 64, 1, 4);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB(12, 8, 64, 1, 4, 4);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(13, 8, 128, 1, 8);
+    // 14: BM = 16 (2x M waste) but TM = 2 keeps the per-thread A/B ratio.
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(14, 16, 64, 2, 4);
+    // 15: 64 threads (one warp per row tile).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(15, 8, 64, 1, 8);
+    // 16..19: same exact-M idea but TN=2/TN=1, i.e. twice/4x the threads.  The
+    // M=8 decode kernel is occupancy-bound, not issue-bound: total resident
+    // threads are (N/BN)*NT = N*BM/(TM*TN), so TN=4 (cfg 11) leaves only 4.5
+    // warps/CU at N=8704 while the BM=32 fallback tile runs 9.07.  Measured
+    // (tools/dcu/s20_kernel_NOTES.md S20 6): cfg 11/12 0.36-0.39 ms vs cfg
+    // 13/15 0.44-0.52 ms, ordered exactly by warps/CU; cfg 16 (TN=2) then
+    // reaches 1.7-1.8x over the legacy dispatch at the production shapes.
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(16, 8, 64, 1, 2);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(17, 8, 32, 1, 2);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(18, 8, 64, 1, 1);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE(19, 8, 128, 1, 2);
     case 4:
     default:
       launch_gemm_block<128, 128, 8, 8, T>(M, N, K, w_stride, nkb, cpb,
@@ -952,6 +1482,23 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
       break;
   }
 #undef VLLM_FP8_EMU_GEMM_BLOCK_CASE
+#undef VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB
+}
+
+// Decode (M = 5..8) tiled-GEMM configuration.  `VLLM_DCU_FP8_DECODE_CFG` is an
+// A/B knob (no rebuild): unset or 0 keeps the pre-S20 policy (cfg 5, or cfg 10
+// for wide N); 11..15 force one of the exact-M tiles above; anything else picks
+// the auto rule.  The default is deliberately the legacy policy until the
+// end-to-end A/B accepts the new tiles.
+int decode_gemm_cfg(int N) {
+  const int wide = 16;  // auto rule: exact-M tile with TN=2 (occupancy)
+  const char* e = std::getenv("VLLM_DCU_FP8_DECODE_CFG");
+  if (e == nullptr) return (N >= 6144) ? 10 : 5;
+  if (e[0] == 'a' || e[0] == 'A') return wide;  // "auto"
+  const int v = std::atoi(e);
+  if (v >= 11 && v <= 19) return v;
+  if (v == 0) return (N >= 6144) ? 10 : 5;
+  return wide;
 }
 
 void run_block(const torch::Tensor& a, const torch::Tensor& w,
@@ -975,9 +1522,32 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
   const __half* lut_p = reinterpret_cast<const __half*>(lut.data_ptr());
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  // Decode (gemv) picks the streaming kernel when its geometry fits: it is the
+  // path the S18 probe measures several times faster than the tiled GEMM on
+  // the real N=4352/K=5120 shard.  `VLLM_DCU_FP8_GEMV_STREAM` selects it
+  // (0 = old GEMV, 1 = streaming variant 1 (default), 2 = variant 2).
+  int s_rows = 0, s_nt = 0;
+  const int s_mode =
+      gemv ? stream_block_select(M, N, K, w_stride, nkb, (int)block_n,
+                                 (int)block_k, stream_block_mode(), s_rows,
+                                 s_nt)
+           : 0;
+  const bool use_stream = (s_mode != 0);
+
+  // Shape-aware decode policy (perf1 s1 table, K=5120): M=1..4 -> streaming
+  // GEMV; M=5..8 -> streaming GEMV only when its LDS budget fits (M*K*2 <=
+  // device LDS), otherwise the tiled GEMM, which is 3-10x faster than the old
+  // GEMV there (M=8: GEMM 245-419 us vs old GEMV 704-3628 us).  cfg 5
+  // (32x64 TM2TN4, 256 threads) wins for N <= 5120 and cfg 10 (same tile at 4
+  // blocks/CU) for wide N; the crossover sits between the measured 5120 and
+  // 8704 points.  Prefill (M > 8) never enters this function.
+  const int decode_cfg = decode_gemm_cfg(N);
+  const bool gemv_use_gemm = gemv && !use_stream && M > 4 &&
+                             (block_k % kFBk) == 0;
+
   const uint32_t* a_h2 = nullptr;
   at::Tensor a_scratch;
-  if (gemv && M >= 2) {
+  if (gemv && !use_stream && !gemv_use_gemm && M >= 2) {
     a_scratch = at::empty({(int64_t)M * K}, a.options().dtype(at::kHalf));
     a_h2 = reinterpret_cast<const uint32_t*>(a_scratch.data_ptr());
     const int64_t n_dwords = (int64_t)M * K / 4;
@@ -997,14 +1567,37 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
 
 #define VLLM_FP8_EMU_BLOCK_DISPATCH(T, AT)                                   \
   do {                                                                       \
-    if (gemv) {                                                              \
-      dispatch_gemv_block<T>(M, N, K, nthreads, w_stride, nkb,               \
-                             (int)block_n, A, W, a_h2, a_s_p, w_s_p, lut_p,  \
-                             reinterpret_cast<const AT*>(bias_ptr),          \
-                             reinterpret_cast<AT*>(out.data_ptr()), stream); \
+    if (gemv && !gemv_use_gemm) {                                            \
+      if (use_stream) {                                                      \
+        if (s_mode == 2) {                                                   \
+          dispatch_gemv_stream2<T>(M, N, K, w_stride, s_rows, s_nt, nkb,     \
+                                   (int)block_n,                             \
+                                   (int)(block_k / kStreamChunk), A, W,      \
+                                   a_s_p, w_s_p, lut_p,                      \
+                                   reinterpret_cast<const AT*>(bias_ptr),    \
+                                   reinterpret_cast<AT*>(out.data_ptr()),    \
+                                   stream);                                  \
+        } else {                                                             \
+          dispatch_gemv_stream<T>(M, N, K, w_stride, s_rows, s_nt, nkb,      \
+                                  (int)block_n,                              \
+                                  (int)(block_k / kStreamChunk),             \
+                                  stream_prefetch(), A, W, a_s_p, w_s_p,     \
+                                  lut_p,                                     \
+                                  reinterpret_cast<const AT*>(bias_ptr),     \
+                                  reinterpret_cast<AT*>(out.data_ptr()),     \
+                                  stream);                                   \
+        }                                                                    \
+      } else {                                                               \
+        dispatch_gemv_block<T>(M, N, K, nthreads, w_stride, nkb,             \
+                               (int)block_n, A, W, a_h2, a_s_p, w_s_p,       \
+                               lut_p, reinterpret_cast<const AT*>(bias_ptr), \
+                               reinterpret_cast<AT*>(out.data_ptr()),        \
+                               stream);                                      \
+      }                                                                      \
     } else {                                                                 \
-      dispatch_gemm_block_cfg<T>(cfg, M, N, K, w_stride, nkb, cpb,           \
-                                 (int)block_n, A, W, a_s_p, w_s_p, lut_p,    \
+      dispatch_gemm_block_cfg<T>(gemv ? decode_cfg : cfg, M, N, K,      \
+                                 w_stride, nkb, cpb, (int)block_n, A, W,     \
+                                 a_s_p, w_s_p, lut_p,                        \
                                  reinterpret_cast<const AT*>(bias_ptr),      \
                                  reinterpret_cast<AT*>(out.data_ptr()),      \
                                  stream);                                    \
@@ -1115,13 +1708,40 @@ torch::Tensor fp8_emu_gemm_block(torch::Tensor a, torch::Tensor w,
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "fp8_emu_block: K must be a positive multiple of 4, got ", K);
   TORCH_CHECK(M >= 1, "fp8_emu_block: M must be >= 1");
-  TORCH_CHECK(cfg >= 0 && cfg <= 4, "fp8_emu_block: cfg must be 0..4, got ",
+  TORCH_CHECK(cfg >= 0 && cfg <= 19, "fp8_emu_block: cfg must be 0..19, got ",
               cfg);
 
   const c10::cuda::CUDAGuard guard(a.device());
   auto out = at::empty({M, N}, a_s.options().dtype(out_dtype));
   int c = (int)cfg;
-  if (c == 0) c = (M <= 32) ? 1 : 2;  // same tuned default as the per-tensor path
+  // cfg 0 auto rule, from the perf1 s1 sweep (K=5120, M=1..129):
+  //   * cfg 5, 32x64 TM2TN4 at 256 threads, is the best tile for every M
+  //     measured up to N=5120 (e.g. N=1280: 245 us vs 343 us for the old
+  //     cfg 1 at M=1, and 248 us vs 418 us at M=16);
+  //   * cfg 10, the same tile with a 4-blocks/CU VGPR cap, wins once the grid
+  //     is wide (N=8704: 414 vs 532 us at M=1, 1541 vs 1976 us at M=129) or
+  //     once deep M makes the narrow-tile grid tall (N=4352: M=64 462 vs
+  //     592 us, M=129 828 vs 1014 us).
+  // Crossovers are interpolated between the measured 5120 and 8704 points and
+  // the measured 3584 all-M point; an explicit cfg (1..10) still overrides.
+  if (c == 0) {
+    if (M <= kMsMax && (block_k % kFBk) == 0) {
+      // Decode/spec-verify batch.  Route it through the same policy the gemv
+      // entry uses so `VLLM_DCU_FP8_DECODE_CFG` (and its default = the rule
+      // below) is honoured on this entry too: previously the knob was only
+      // consulted by `fp8_emu_gemv_block`, so reaching the exact-M tiles from
+      // the production `M > VLLM_DCU_FP8_GEMV_MAX_M` dispatch required setting
+      // `VLLM_DCU_FP8_GEMV_MAX_M=8` as well, which also re-routed M <= 4
+      // (tools/dcu/s20_kernel_NOTES.md S20 6.4).
+      c = decode_gemm_cfg(N);
+    } else if (N >= 6144) {
+      c = 10;
+    } else if (M > 32 && N >= 4096) {
+      c = 10;
+    } else {
+      c = 5;
+    }
+  }
   run_block(a, w, a_s, w_s, lut, bias, out, /*gemv=*/false, 0, c, block_n,
             block_k);
   return out;

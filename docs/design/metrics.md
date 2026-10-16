@@ -391,6 +391,13 @@ for [unclear reasons](gh-pr:7279#discussion_r1710417152). We
 simply use a `Gauge` metric set to 1 and
 `multiprocess_mode="mostrecent"` instead.
 
+The label set is the configuration itself, minus the bookkeeping fields that
+only describe how it was constructed (`_block_size_resolved` and the
+`user_specified_*` flags). Since a configuration change yields a different
+label set rather than updating the existing series, the metric is informational;
+see [Reducing Scrape Volume](../usage/metrics.md#reducing-scrape-volume) for how
+to drop it when the configuration is tracked elsewhere.
+
 ### LoRA Metrics
 
 The `vllm:lora_requests_info` `Gauge` is somewhat similar, except the

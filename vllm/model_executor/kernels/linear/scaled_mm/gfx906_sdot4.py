@@ -54,6 +54,7 @@ import os
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
@@ -74,7 +75,11 @@ from .ScaledMMLinearKernel import (
 logger = init_logger(__name__)
 
 # M <= _GEMV_MAX_M goes to the GEMV kernel (must match kMsMax in the .cu).
-_GEMV_MAX_M = 8
+# S18: the GEMV cost grows ~linearly with M while the tiled GEMM is M-flat, so
+# speculative-decoding verify (M = 1 + num_spec_tokens) is better served by the
+# GEMM path.  Default keeps the old policy; set VLLM_DCU_INT8_GEMV_MAX_M=1 to
+# route every M >= 2 to the GEMM.
+_GEMV_MAX_M = envs.VLLM_DCU_INT8_GEMV_MAX_M
 # GEMV threads per block: tuned value from the source project (power of two).
 _GEMV_THREADS = 64
 

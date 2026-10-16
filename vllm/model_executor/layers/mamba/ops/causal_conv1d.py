@@ -51,6 +51,101 @@ ENABLE_GFX906_TRITON_CAUSAL_CONV1D_SYNC = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 
 
+def _gfx906_conv_window_read(state: torch.Tensor, window_len: int) -> torch.Tensor:
+    """Return the rolling window inside a conv-state slot.
+
+    The conv state is a FIFO of ``cache_len = width - 1 + num_spec`` tokens.
+    The MTP update kernel reads its window starting at ``num_accepted - 1`` and
+    re-normalises it to the front of the slot
+    (``csrc/mamba/gfx906_decode_kernels.cu:222-284``), so once speculative
+    decoding widens the slot the newest ``width - 1`` tokens live at the FRONT.
+    Without speculation the slot is exactly ``width - 1`` wide and both
+    alignments are identical.
+    """
+    if window_len <= 0:
+        return state[..., :0]
+    cache_len = state.shape[-1]
+    if cache_len > window_len:
+        return state[..., :window_len]
+    return state[..., cache_len - window_len :]
+
+
+def _gfx906_conv_window_write(window: torch.Tensor, cache_len: int) -> torch.Tensor:
+    """Pack the rolling window back into a conv-state slot (see above)."""
+    if window.shape[-1] == cache_len:
+        return window
+    out = torch.zeros(
+        (*window.shape[:-1], cache_len), dtype=window.dtype, device=window.device
+    )
+    out[..., : window.shape[-1]] = window
+    return out
+
+
+def _gfx906_conv_state_rows(
+    conv_states: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    num_seqs: int,
+    state_len: int,
+    pad_slot_id: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Resolve the conv-state row of every sequence with tensor ops only.
+
+    The per-sequence fallback below needs, for each sequence, its cache slot,
+    whether it has prior state, and its token range.  Reading the first two with
+    ``cache_indices[i].item()`` / ``has_initial_state[i].item()`` costs one DtoH
+    sync each, i.e. ~2 per sequence per layer (96+ per step on a 48-layer GDN
+    model) and dominated the gfx906 prefill step.  Gathering the rows up front
+    keeps that metadata on device; only the token boundaries still need host
+    scalars, and those come from the caller's CPU metadata copy.
+
+    Returns:
+        rows: ``[num_seqs, dim, cache_len]`` initial state per sequence, zeroed
+            where the sequence has no initial state.
+        safe_indices: clamped slot index per sequence, or None when
+            ``cache_indices`` is None (row i is then slot i).
+        valid: ``[num_seqs]`` bool, False for pad slots.
+    """
+    if cache_indices is None:
+        rows = conv_states[:num_seqs]
+        safe_indices = None
+        valid = None
+    else:
+        raw_indices = cache_indices[:num_seqs].to(dtype=torch.long)
+        valid = raw_indices != pad_slot_id
+        safe_indices = raw_indices.clamp(0, conv_states.shape[0] - 1)
+        rows = conv_states.index_select(0, safe_indices)
+    if has_initial_state is not None and state_len > 0:
+        keep = has_initial_state[:num_seqs].reshape(
+            (num_seqs,) + (1,) * (conv_states.dim() - 1)
+        )
+        rows = torch.where(keep, rows, rows.new_zeros(()))
+    return rows, safe_indices, valid
+
+
+def _gfx906_conv_state_write(
+    conv_states: torch.Tensor,
+    safe_indices: torch.Tensor | None,
+    valid: torch.Tensor | None,
+    seq_idx: int,
+    updated_state: torch.Tensor,
+) -> None:
+    """Write one sequence's updated conv-state slot back, on device.
+
+    Pad slots keep their current contents, matching the old
+    ``if cache_idx == pad_slot_id: continue`` without a host-side branch.
+    """
+    if safe_indices is None:
+        conv_states[seq_idx].copy_(updated_state)
+        return
+    slot = safe_indices[seq_idx : seq_idx + 1]
+    payload = updated_state.unsqueeze(0)
+    if valid is not None:
+        current = conv_states.index_select(0, slot)
+        payload = torch.where(valid[seq_idx], payload, current)
+    conv_states.index_copy_(0, slot, payload)
+
+
 def _causal_conv1d_gfx906_fallback(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -61,6 +156,7 @@ def _causal_conv1d_gfx906_fallback(
     has_initial_state: torch.Tensor | None,
     activation: str | None,
     pad_slot_id: int,
+    query_start_loc_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
@@ -71,7 +167,6 @@ def _causal_conv1d_gfx906_fallback(
     weight_conv = weight.to(x.dtype).unsqueeze(1).contiguous()
     if bias is not None:
         bias = bias.to(x.dtype)
-    zero_state = torch.zeros((dim, state_len), dtype=x.dtype, device=x.device)
 
     if query_start_loc is None:
         unsqueeze = False
@@ -80,20 +175,12 @@ def _causal_conv1d_gfx906_fallback(
             out = out.unsqueeze(-1)
             unsqueeze = True
         batch = x.shape[0]
+        rows, safe_indices, valid = _gfx906_conv_state_rows(
+            conv_states, cache_indices, has_initial_state, batch, state_len,
+            pad_slot_id,
+        )
         for seq_idx in range(batch):
-            cache_idx = (
-                seq_idx if cache_indices is None else int(cache_indices[seq_idx].item())
-            )
-            if cache_idx == pad_slot_id:
-                continue
-            use_initial_state = has_initial_state is None or bool(
-                has_initial_state[seq_idx].item()
-            )
-            prev_state = (
-                conv_states[cache_idx][:, -state_len:]
-                if state_len > 0 and use_initial_state
-                else zero_state
-            )
+            prev_state = _gfx906_conv_window_read(rows[seq_idx], state_len)
             seq_x = x[seq_idx]
             full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
             seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
@@ -102,63 +189,81 @@ def _causal_conv1d_gfx906_fallback(
             out[seq_idx].copy_(seq_out)
 
             if cache_state_len > 0:
-                updated_state = full_x.squeeze(0)[:, -cache_state_len:]
-                if updated_state.shape[1] < cache_state_len:
-                    padded_state = torch.zeros(
-                        (dim, cache_state_len),
-                        dtype=updated_state.dtype,
-                        device=updated_state.device,
-                    )
-                    padded_state[:, -updated_state.shape[1] :] = updated_state
-                    updated_state = padded_state
-                conv_states[cache_idx].copy_(updated_state)
+                state_row = full_x.squeeze(0)
+                window = (
+                    state_row[:, -state_len:]
+                    if state_len > 0
+                    else state_row[:, -cache_state_len:]
+                )
+                _gfx906_conv_state_write(
+                    conv_states,
+                    safe_indices,
+                    valid,
+                    seq_idx,
+                    _gfx906_conv_window_write(window, cache_state_len),
+                )
 
+        if valid is not None:
+            # Pad rows are not processed; return zeros rather than the
+            # uninitialised contents of `out`.
+            out.masked_fill_(~valid.reshape((-1,) + (1,) * (out.dim() - 1)), 0)
         if unsqueeze:
             out = out.squeeze(-1)
         return out.to(original_x_dtype)
 
-    for seq_idx in range(query_start_loc.size(0) - 1):
-        start = int(query_start_loc[seq_idx].item())
-        end = int(query_start_loc[seq_idx + 1].item())
+    # Token boundaries are the only host scalars left; the caller passes the CPU
+    # mirror of `query_start_loc` when it has one, which is sync-free.  Without
+    # it each boundary read is a DtoH sync, as before.  The mirror is only
+    # trusted when it has the same length, so a caller that hands over a
+    # different (e.g. unsliced) tensor cannot silently re-index the sequences.
+    query_starts_host = query_start_loc
+    if (
+        query_start_loc_cpu is not None
+        and query_start_loc_cpu.shape[0] == query_start_loc.shape[0]
+    ):
+        query_starts_host = query_start_loc_cpu
+    num_seqs = query_start_loc.size(0) - 1
+    rows, safe_indices, valid = _gfx906_conv_state_rows(
+        conv_states, cache_indices, has_initial_state, num_seqs, state_len,
+        pad_slot_id,
+    )
+
+    for seq_idx in range(num_seqs):
+        start = int(query_starts_host[seq_idx].item())
+        end = int(query_starts_host[seq_idx + 1].item())
         if end <= start:
             continue
 
-        cache_idx = (
-            seq_idx if cache_indices is None else int(cache_indices[seq_idx].item())
-        )
-        if cache_idx == pad_slot_id:
-            continue
-
-        use_initial_state = has_initial_state is None or bool(
-            has_initial_state[seq_idx].item()
-        )
-        prev_state = (
-            conv_states[cache_idx][:, -state_len:]
-            if state_len > 0 and use_initial_state
-            else zero_state
-        )
+        prev_state = _gfx906_conv_window_read(rows[seq_idx], state_len)
         channels_first = x.dim() == 2 and x.shape[0] == dim
         seq_x = x[:, start:end] if channels_first else x[start:end].transpose(0, 1)
         full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
         seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
         if activation in ["silu", "swish"]:
             seq_out = F.silu(seq_out)
+        if valid is not None:
+            # Pad rows are not processed; emit zeros instead of a value derived
+            # from a clamped (unrelated) slot.
+            seq_out = torch.where(valid[seq_idx], seq_out, torch.zeros_like(seq_out))
         if channels_first:
             out[:, start:end] = seq_out
         else:
             out[start:end] = seq_out.transpose(0, 1)
 
         if cache_state_len > 0:
-            updated_state = full_x.squeeze(0)[:, -cache_state_len:]
-            if updated_state.shape[1] < cache_state_len:
-                padded_state = torch.zeros(
-                    (dim, cache_state_len),
-                    dtype=updated_state.dtype,
-                    device=updated_state.device,
-                )
-                padded_state[:, -updated_state.shape[1] :] = updated_state
-                updated_state = padded_state
-            conv_states[cache_idx].copy_(updated_state)
+            state_row = full_x.squeeze(0)
+            window = (
+                state_row[:, -state_len:]
+                if state_len > 0
+                else state_row[:, -cache_state_len:]
+            )
+            _gfx906_conv_state_write(
+                conv_states,
+                safe_indices,
+                valid,
+                seq_idx,
+                _gfx906_conv_window_write(window, cache_state_len),
+            )
 
     return out.to(original_x_dtype)
 
@@ -218,7 +323,7 @@ def _causal_conv1d_gfx906_decode_update_fallback(
 
     prev_state = conv_states.index_select(0, safe_indices)
     if conv_state_len > 0:
-        prev_state = prev_state[:, :, -conv_state_len:]
+        prev_state = _gfx906_conv_window_read(prev_state, conv_state_len)
         full_x = torch.cat((prev_state, x), dim=-1)
     else:
         full_x = x
@@ -236,12 +341,10 @@ def _causal_conv1d_gfx906_decode_update_fallback(
     out = torch.where(valid_mask.view(batch, 1, 1), out, torch.zeros_like(out))
 
     if cache_state_len > 0:
-        updated_state = full_x[:, :, -cache_state_len:]
-        if updated_state.shape[-1] < cache_state_len:
-            updated_state = F.pad(
-                updated_state,
-                (cache_state_len - updated_state.shape[-1], 0),
-            )
+        updated_state = _gfx906_conv_window_write(
+            full_x[..., -conv_state_len:] if conv_state_len > 0 else full_x[..., :0],
+            cache_state_len,
+        )
         for seq_idx in range(batch):
             state_idx = safe_indices[seq_idx : seq_idx + 1]
             current_state = conv_states.index_select(0, state_idx)
@@ -727,6 +830,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    query_start_loc_cpu: torch.Tensor | None = None,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -777,6 +881,10 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
+    query_start_loc_cpu: (batch + 1,) int32, optional
+        CPU mirror of `query_start_loc`.  Used by the gfx906 per-sequence
+        fallback to avoid a DtoH sync per sequence boundary per layer; when
+        omitted, a CPU mirror carried by `metadata` is used if present.
     out: same shape as `x`
     """
     if isinstance(activation, bool) and activation:
@@ -799,6 +907,15 @@ def causal_conv1d_fn(
             and getattr(metadata, "nums_dict", None) is not None
         )
         if not ENABLE_GFX906_TRITON_CAUSAL_CONV1D or not metadata_ready:
+            # GDNAttentionMetadata publishes a CPU twin of the same
+            # `non_spec_query_start_loc` this entry point is handed; using it
+            # removes the per-sequence, per-layer boundary DtoH syncs.  The
+            # fallback re-checks the length, so a caller that passes a different
+            # tensor layout cannot silently re-index the sequences.
+            if query_start_loc_cpu is None and metadata is not None:
+                query_start_loc_cpu = getattr(
+                    metadata, "non_spec_query_start_loc_cpu", None
+                )
             return _causal_conv1d_gfx906_fallback(
             x=x,
             weight=weight,
@@ -809,6 +926,7 @@ def causal_conv1d_fn(
             has_initial_state=has_initial_state,
             activation=activation,
             pad_slot_id=pad_slot_id,
+            query_start_loc_cpu=query_start_loc_cpu,
         )
 
     args = None
@@ -1436,6 +1554,10 @@ def causal_conv1d_update(
             and x.dtype == weight.dtype
             and conv_state.dtype in (x.dtype, torch.float32)
             and (bias is None or bias.dtype == x.dtype)
+            # S18 bisect switch: VLLM_QWEN35_MTP_CONV_CUSTOM=0 skips the gfx906
+            # MTP conv-update kernel (opt-in A/B only; default keeps current
+            # behaviour) so MTP-vs-non-spec token parity can be attributed.
+            and os.getenv("VLLM_QWEN35_MTP_CONV_CUSTOM", "1") != "0"
         )
         if mtp_custom_eligible:
             try:

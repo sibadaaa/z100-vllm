@@ -113,7 +113,21 @@ if [ -z "${VLLM_CACHE_ROOT:-}" ] && [ -d /mnt/game ]; then
   export VLLM_CACHE_ROOT=/mnt/game/vllm-cache
 fi
 
+# 9. RCCL P2P requires fine-grained PCIe memory. On Z100 (hydcu/gfx906) the
+#    runtime reports hipDeviceAttributeFineGrainSupport=0 and fails every
+#    hipDeviceMallocFinegrained allocation with hipErrorOutOfMemory unless this
+#    variable is set; RCCL's p2pCanConnect() hard-requires hasFineGrain and
+#    otherwise falls back to SHM. RCCL itself warns "Missing
+#    HSA_FORCE_FINE_GRAIN_PCIE=1 from environment" at startup.
+#    Measured (4 ranks on the same PCIe switch, docs/result/z100-16-*):
+#      via P2P=56 / via SHM=0   (was via P2P=0 / via SHM=56)
+#      1 MiB all-reduce 1143 -> 143 us, 4 MiB 4388 -> 318 us
+#      <=64 KiB unchanged; pinned H2D/D2H, peer copy_ and GEMM numerics unchanged
+#    Set HSA_FORCE_FINE_GRAIN_PCIE=0 to reproduce the old SHM-only behaviour.
+export HSA_FORCE_FINE_GRAIN_PCIE="${HSA_FORCE_FINE_GRAIN_PCIE:-1}"
+
 echo "[dcu] DTK_ROOT=${DTK_ROOT} ($(cat "${DTK_ROOT}/.info/rocm_version" 2>/dev/null || echo unknown))"
+echo "[dcu] HSA_FORCE_FINE_GRAIN_PCIE=${HSA_FORCE_FINE_GRAIN_PCIE} (RCCL P2P gate; 0=SHM-only)"
 echo "[dcu] rocm_smi=${_dcu_smi:-<DTK default>} VLLM_DCU_GCN_ARCH=${VLLM_DCU_GCN_ARCH:-<auto>}"
 echo "[dcu] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES} VLLM_DCU_BF16=${VLLM_DCU_BF16:-auto}"
 echo "[dcu] VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-<vLLM default ~/.cache/vllm>}"

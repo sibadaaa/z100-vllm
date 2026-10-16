@@ -243,6 +243,20 @@ def test_cache_config_hash_ignores_prefix_cache_retention_interval():
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
 
 
+def test_cache_config_metrics_info_excludes_bookkeeping_fields():
+    """vllm:cache_config_info labels must describe the cache, not how the
+    config object was built; construction flags would only add label churn."""
+    info = CacheConfig().metrics_info()
+
+    assert {
+        "_block_size_resolved",
+        "user_specified_block_size",
+        "user_specified_mamba_block_size",
+    }.isdisjoint(info)
+    assert {"block_size", "cache_dtype", "gpu_memory_utilization"} <= set(info)
+    assert all(isinstance(value, str) for value in info.values())
+
+
 def test_envs_compile_factors_relocation_invariant(tmp_path):
     """Relocating HOME or the XDG roots must not change the compile-cache
     env hash.

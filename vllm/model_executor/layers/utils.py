@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -118,7 +119,9 @@ def triton_matmul_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.float16)
+    # NOTE(gfx906): match the output tensor's dtype (fp16 or bf16) instead of
+    # hardcoding fp16 -- a bf16 drafter behind an fp16 target runs this path.
+    c = accumulator.to(c_ptr.dtype.element_ty)
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
@@ -135,10 +138,11 @@ def triton_matmul(a, b):
         "Incompatible dimensions"
     )  # NOTE(gfx906): b.shape inv
     assert a.is_contiguous(), "Matrix A must be contiguous"
+    assert a.dtype == b.dtype, "triton_matmul requires matching input dtypes"
     M, K = a.shape
     N, K = b.shape  # NOTE(gfx906): b.shape inv
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    # Allocates output in the input dtype (fp16 target, bf16 drafter).
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -427,9 +431,22 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
 
 
 _GFX906_GEMV_THREADS = 64
+# perf1 (2026-10-13) mm probe: 128 threads wins on narrow N (in_proj_ba N=24 at
+# M=1: 12.5 vs 16.6 us; mtp.fc N=1280/K=10240 at M=3: 139.5 vs 174.0), while 64
+# threads wins on the wide unquantized lm_head (N=62080 at M=1: 893 vs 902 us,
+# M=3: 1812 vs 1879 us), so the count follows the output width.
+_GFX906_GEMV_THREADS_NARROW = 128
+_GFX906_GEMV_NARROW_MAX_N = 4096
 _GFX906_GEMV_AVAILABLE = hasattr(torch.ops, "_rocm_C") and hasattr(
     torch.ops._rocm_C, "bf16_emu_gemv"
 )
+
+
+def _gfx906_gemv_threads(n_out: int) -> int:
+    """Threads per block for the emulated dense GEMV (measured, see above)."""
+    if n_out <= _GFX906_GEMV_NARROW_MAX_N:
+        return _GFX906_GEMV_THREADS_NARROW
+    return _GFX906_GEMV_THREADS
 
 
 def _gfx906_gemv_shape_ok(n_tokens: int, n_out: int, dtype: torch.dtype) -> bool:
@@ -442,10 +459,21 @@ def _gfx906_gemv_shape_ok(n_tokens: int, n_out: int, dtype: torch.dtype) -> bool
     LDS/compute bound and *loses* to rocBLAS (0.2-0.9x).  The rule below only
     enables the cells that were measured to win, so a non-qualifying call keeps
     the previous rocBLAS behaviour unchanged.
+
+    perf1 re-measured the same cells against the *Triton* matmul this recipe
+    actually runs (fp16, `tools/dcu/perf1_gdn_gpu.sh` mm probe):
+
+    * narrow N wins at every decode M -- GDN ``in_proj_ba`` (N=24, K=5120):
+      12.5/15.3/19.0/23.5 us for M=1..4 vs 133.0/132.5/155.7/155.8, i.e. 6.6-10.6x;
+      MTP ``mtp.fc`` (N=1280, K=10240): 58.9/87.8/139.5/202.2 vs
+      342.7/339.5/415.8/411.0;
+    * the unquantized ``lm_head`` (N=62080, K=5120) wins at M<=2 (M=1: 902.8 vs
+      1589.8 us; M=2: 1412.0 vs 1588.1), ties at M=3 (1876.0 vs 1856.5) and
+      loses at M=4 (2416.5 vs 1873.6), so the wide-N allowance stops at M=2.
     """
-    if n_tokens == 1:
-        return True
-    if n_tokens == 4 and dtype == torch.bfloat16 and 128 <= n_out <= 1024:
+    if n_out <= 1280:
+        return n_tokens <= 4
+    if n_tokens <= 2:
         return True
     return False
 
@@ -462,6 +490,18 @@ def _gfx906_dense_gemv_enabled() -> bool:
     )
 
     return gfx906_emu_enabled("VLLM_DCU_USE_BF16_GEMV")
+
+
+# S22: rocBLAS vs the single-config Triton matmul for the small-M band.
+# `_GFX906_ROCBLAS_MAX_N` is the widest N (out features) where rocBLAS was
+# measured to win at M >= 4; above it the Triton path keeps the smallest M.
+_GFX906_ROCBLAS_MAX_N = 8192
+
+
+def _gfx906_smallm_rocblas_enabled() -> bool:
+    """Whether small-M unquantized GEMMs prefer rocBLAS over Triton (S22)."""
+    raw = os.environ.get("VLLM_DCU_SMALLM_GEMM", "").strip().lower()
+    return raw in ("rocblas", "1", "true", "yes", "on")
 
 
 def _gfx906_bf16_route() -> int:
@@ -492,7 +532,12 @@ def _register_gfx906_dense_gemv() -> None:
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         return torch.ops._rocm_C.bf16_emu_gemv(
-            x, weight, bias, _GFX906_GEMV_THREADS, _gfx906_bf16_route(), False
+            x,
+            weight,
+            bias,
+            _gfx906_gemv_threads(weight.shape[0]),
+            _gfx906_bf16_route(),
+            False,
         )
 
     @bf16_emu_mm.register_fake
@@ -559,7 +604,28 @@ def rocm_unquantized_gemm_impl(
         out = torch.ops.vllm.bf16_emu_mm(x_view, weight, bias)
         return out.view(*x.shape[:-1], weight.shape[0])
 
-    if n <= 16 and not on_gfx9():
+    # NOTE: upstream's cliff is 16. Raising it to 32 (to catch the DFlash2 k=7
+    # draft tower at M = 8 x concurrency = 32) was measured on Z100 and is a
+    # *regression*: decoding at c=4 went 184 -> 261 ms/step because the target
+    # model's large-N linears lose more on the Triton small-M path than the
+    # draft tower gains. Leave at 16.
+    #
+    # S22 (2026-10-16, tools/dcu/s22_draft_gemm_probe.py) measured the same
+    # branch the other way round, at the DFlash2 draft tower's real shapes and
+    # M = 1..32: the single-config `triton_matmul` below is 1.8-2.9x slower than
+    # rocBLAS (`F.linear`) at M = 8 on N = 5120/6144/4096/1536 (2.45x on
+    # 5120:17408) and 1.9-4.6x slower at M = 16/32 on every shape, while it wins
+    # only on the widest N at the smallest M (34816:5120 at M <= 8: 3.12 vs
+    # 4.59 ms).  Decode of the FP8 target runs 81.6 such calls per step
+    # (29.8 ms/step, 13.2% of the step, see OPTIMIZATION_RESULTS.md 12.6b), so
+    # the M >= 4 small-N band is worth rerouting.  Opt in with
+    # VLLM_DCU_SMALLM_GEMM=rocblas; the default keeps upstream's choice.
+    small_m_rocblas = (
+        on_gfx906()
+        and _gfx906_smallm_rocblas_enabled()
+        and ((n >= 4 and m <= _GFX906_ROCBLAS_MAX_N) or n >= 16)
+    )
+    if n <= 16 and not on_gfx9() and not small_m_rocblas:
         out = triton_matmul(x_view, weight).view(*x.shape[:-1], weight.shape[0])
         if bias is not None:
             out = out + bias

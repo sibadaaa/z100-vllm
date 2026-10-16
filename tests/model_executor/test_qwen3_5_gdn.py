@@ -25,6 +25,45 @@ from vllm.v1.attention.backends.gdn_attn import (
 )
 
 
+_GDN_ENV_SWITCHES = [
+    (
+        "VLLM_QWEN35_MTP_GDN_TRITON",
+        gating_module._gdn_mtp_triton_enabled,
+    ),
+    (
+        "VLLM_GFX906_GDN_CHUNKED_PREFILL",
+        gdn_linear_attn._gfx906_gdn_chunked_prefill_enabled,
+    ),
+]
+
+
+@pytest.mark.parametrize(("env_name", "is_enabled"), _GDN_ENV_SWITCHES)
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "Yes", "ON"])
+def test_gdn_optimization_switch_accepts_true_values(
+    monkeypatch, env_name, is_enabled, value
+):
+    monkeypatch.setenv(env_name, value)
+
+    assert is_enabled()
+
+
+@pytest.mark.parametrize(("env_name", "is_enabled"), _GDN_ENV_SWITCHES)
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
+def test_gdn_optimization_switch_disables_false_values(
+    monkeypatch, env_name, is_enabled, value
+):
+    monkeypatch.setenv(env_name, value)
+
+    assert not is_enabled()
+
+
+@pytest.mark.parametrize(("env_name", "is_enabled"), _GDN_ENV_SWITCHES)
+def test_gdn_optimization_switch_defaults_off(monkeypatch, env_name, is_enabled):
+    monkeypatch.delenv(env_name, raising=False)
+
+    assert not is_enabled()
+
+
 def test_gfx906_mtp_gdn_uses_custom_update(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -509,7 +548,9 @@ def _run_speculative_gate_selection(
     num_prefills: int,
     spec_token_indx: torch.Tensor,
     non_spec_token_indx: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    gfx906: bool = False,
+    chunked_prefill: bool = False,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[dict[str, object]]]:
     num_tokens = 4
     num_spec_tokens = spec_token_indx.numel()
     metadata = GDNAttentionMetadata(
@@ -554,20 +595,44 @@ def _run_speculative_gate_selection(
         "causal_conv1d_fn",
         lambda value, *args, **kwargs: value,
     )
-    monkeypatch.setattr(gdn_linear_attn, "_is_gfx906_rocm", lambda: False)
+    monkeypatch.setattr(gdn_linear_attn, "_is_gfx906_rocm", lambda: gfx906)
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "_gfx906_gdn_chunked_prefill_enabled",
+        lambda: chunked_prefill,
+    )
 
     captured_gates = []
+    captured_chunked_prefill: list[dict[str, object]] = []
 
     def fake_recurrent_update(
         *, a: torch.Tensor, b: torch.Tensor, q: torch.Tensor, **kwargs
     ):
-        captured_gates.append((a.clone(), b.clone()))
+        if q.numel() > 0:
+            captured_gates.append((a.clone(), b.clone()))
         return q, torch.zeros((1, 1, 1))
 
     monkeypatch.setattr(
         gdn_linear_attn,
         "fused_sigmoid_gating_delta_rule_update",
         fake_recurrent_update,
+    )
+
+    def fake_chunk_gated_delta_rule(**kwargs):
+        captured_chunked_prefill.append(kwargs)
+        return kwargs["q"].transpose(1, 2), torch.zeros((1, 1, 1))
+
+    def fail_if_fused_prefill_is_used(**kwargs):
+        raise AssertionError("gfx906 chunked-prefill route used fused prefill")
+
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "fused_sigmoid_gating_delta_rule_update",
+        (
+            fail_if_fused_prefill_is_used
+            if gfx906 and chunked_prefill
+            else fake_recurrent_update
+        ),
     )
 
     def fake_post_conv_prep(*, conv_output: torch.Tensor, **kwargs):
@@ -582,14 +647,14 @@ def _run_speculative_gate_selection(
     def rearrange(value):
         if value is None:
             return None, None, None
-        output = value.unsqueeze(0).unsqueeze(2)
+        output = value.unsqueeze(1)
         return output, output, output
 
     layer = SimpleNamespace(
         _log_projection_debug_once=lambda: None,
         prefix="layer",
         enable_packed_recurrent_decode=False,
-        kv_cache=(torch.zeros((1, 1, 1)), torch.zeros((1, 1, 1))),
+        kv_cache=(torch.zeros((1, 4, 1)), torch.zeros((1, 1, 1, 1))),
         conv1d=SimpleNamespace(weight=torch.ones((1, 1, 1)), bias=None),
         activation="silu",
         rearrange_mixed_qkv=rearrange,
@@ -600,10 +665,7 @@ def _run_speculative_gate_selection(
         head_k_dim=1,
         head_v_dim=1,
         _expand_qk_heads_for_gdn=lambda query, key: (query, key),
-        chunk_gated_delta_rule=lambda **kwargs: (
-            kwargs["q"].transpose(1, 2),
-            torch.zeros((1, 1, 1)),
-        ),
+        chunk_gated_delta_rule=fake_chunk_gated_delta_rule,
         _uses_transposed_temporal_state=lambda: False,
     )
     mixed_qkv = torch.arange(num_tokens, dtype=torch.float32).unsqueeze(1)
@@ -615,23 +677,50 @@ def _run_speculative_gate_selection(
         layer, mixed_qkv, b, a, core_attn_out
     )
 
-    assert len(captured_gates) == 1
-    actual_a, actual_b = captured_gates[0]
-    torch.testing.assert_close(actual_a, a.index_select(0, spec_token_indx))
-    torch.testing.assert_close(actual_b, b.index_select(0, spec_token_indx))
-    return actual_a, actual_b
+    if gfx906 and chunked_prefill:
+        assert len(captured_chunked_prefill) == 1
+        assert not captured_gates
+        chunk_kwargs = captured_chunked_prefill[0]
+        assert chunk_kwargs["head_first"] is False
+        assert chunk_kwargs["q"].shape[:2] == (1, non_spec_token_indx.numel())
+    else:
+        assert len(captured_gates) == 1
+
+    if captured_gates:
+        actual_a, actual_b = captured_gates[0]
+        torch.testing.assert_close(actual_a, a.index_select(0, spec_token_indx))
+        torch.testing.assert_close(actual_b, b.index_select(0, spec_token_indx))
+    return captured_gates, captured_chunked_prefill
+
+
+def test_gfx906_chunked_prefill_dispatch_uses_token_first_layout(monkeypatch):
+    spec_token_indx = torch.empty(0, dtype=torch.long)
+    non_spec_token_indx = torch.arange(4)
+
+    captured_gates, captured_chunked_prefill = _run_speculative_gate_selection(
+        monkeypatch,
+        num_prefills=1,
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=non_spec_token_indx,
+        gfx906=True,
+        chunked_prefill=True,
+    )
+
+    assert not captured_gates
+    assert len(captured_chunked_prefill) == 1
 
 
 def test_qwen3_5_all_speculative_tokens_keep_all_gates(monkeypatch):
     spec_token_indx = torch.arange(4)
 
-    actual_a, actual_b = _run_speculative_gate_selection(
+    captured_gates, _ = _run_speculative_gate_selection(
         monkeypatch,
         num_prefills=0,
         spec_token_indx=spec_token_indx,
         non_spec_token_indx=torch.empty(0, dtype=torch.long),
     )
 
+    actual_a, actual_b = captured_gates[0]
     assert actual_a.shape[0] == 4
     assert actual_b.shape[0] == 4
 
@@ -639,12 +728,13 @@ def test_qwen3_5_all_speculative_tokens_keep_all_gates(monkeypatch):
 def test_qwen3_5_mixed_batch_selects_speculative_gates(monkeypatch):
     spec_token_indx = torch.tensor([1, 3])
 
-    actual_a, actual_b = _run_speculative_gate_selection(
+    captured_gates, _ = _run_speculative_gate_selection(
         monkeypatch,
         num_prefills=1,
         spec_token_indx=spec_token_indx,
         non_spec_token_indx=torch.tensor([0, 2]),
     )
 
+    actual_a, actual_b = captured_gates[0]
     assert actual_a.flatten().tolist() == [11.0, 13.0]
     assert actual_b.flatten().tolist() == [21.0, 23.0]

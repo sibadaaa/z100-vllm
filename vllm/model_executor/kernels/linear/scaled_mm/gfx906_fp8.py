@@ -38,6 +38,7 @@ Design notes:
 """
 
 import functools
+import os
 
 import torch
 
@@ -56,9 +57,43 @@ from .ScaledMMLinearKernel import (
 logger = init_logger(__name__)
 
 # M <= _GEMV_MAX_M goes to the GEMV kernel (must match kMsMax in the .cu).
-_GEMV_MAX_M = 8
+# S18 measurement (tools/dcu/s18_fp8_block_mprobe.py, real decode shapes): the
+# GEMV cost grows ~linearly with M (M=2 ~2.1x, M=4 ~3.9x) while the tiled GEMM
+# is M-flat (M=1..4 all ~0.94x of the M=1 GEMV) -- so speculative-decoding
+# verify (M = 1 + num_spec_tokens) wants the GEMM path.  Default keeps the old
+# policy; set VLLM_DCU_FP8_GEMV_MAX_M=1 to route every M >= 2 to the GEMM.
+_GEMV_MAX_M = envs.VLLM_DCU_FP8_GEMV_MAX_M
 # GEMV threads per block: tuned value from the INT8 sdot4 project (power of two).
 _GEMV_THREADS = 64
+
+# Prefill (M > _GEMV_MAX_M) tile selection, without a rebuild.
+#
+# `csrc/rocm/fp8_emu_gemm.cu`'s cfg-0 auto rule was fitted at M = 1..129
+# (perf1 s1): cfg 10 (32x64 TM2TN4 at 4 blocks/CU) for wide grids, cfg 5 (the
+# same tile at the default occupancy cap) otherwise.  S22 measured the real
+# prefill shapes for the first time (M = 1760/3520/7920, shapes
+# 8704:5120 / 5120:4352 / 4096:5120 / 3584:5120 / 5120:1536): cfg 10 is >= cfg 5
+# on every shape and 1.40x faster on N=3584:5120 (28.40 vs 39.69 ms at M=7920),
+# the one shape the .cu rule still sends to cfg 5 (its `N >= 4096` cutoff).
+# Tiles 1..4 and 14 were all slower, so cfg 10 is the prefill optimum here.
+#
+# "0" (default) passes cfg 0 through, i.e. byte-identical to the previous
+# behaviour; "auto" applies the rule above with the N >= 3072 fix; 1..19 forces
+# that tile for every prefill GEMM (all of them are already compiled into the
+# installed .so, so no rebuild is needed to A/B).
+_PREFILL_CFG_ENV = "VLLM_DCU_FP8_PREFILL_CFG"
+
+
+def _prefill_cfg(M: int, N: int) -> int:
+    """Prefill GEMM tile for an ``[M, K] x [N, K]`` call (``cfg`` 0..19)."""
+    raw = os.environ.get(_PREFILL_CFG_ENV, "0").strip().lower()
+    if raw in ("", "0"):
+        return 0
+    if raw == "auto":
+        if N >= 6144 or (M > 32 and N >= 3072):
+            return 10
+        return 5
+    return int(raw)
 
 _FP8_EMU_MM_OP = "vllm::fp8_emu_mm"
 
@@ -203,7 +238,8 @@ def _register_fp8_emu_mm_block() -> None:
                 block_k,
             )
         return torch.ops._rocm_C.fp8_emu_gemm_block(
-            a, w, a_s, w_s, lut, bias, out_dtype, 0, block_n, block_k
+            a, w, a_s, w_s, lut, bias, out_dtype,
+            _prefill_cfg(a.shape[0], w.shape[0]), block_n, block_k,
         )
 
     @fp8_emu_mm_block.register_fake

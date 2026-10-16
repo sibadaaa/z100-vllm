@@ -47,6 +47,18 @@ class GDNAttentionMetadata:
 
     has_initial_state: torch.Tensor | None = None
     prefill_query_start_loc: torch.Tensor | None = None
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
+    """CPU twin of ``non_spec_query_start_loc``, the tensor the GDN layer hands
+    to ``causal_conv1d_fn``.
+
+    The gfx906 causal-conv fallback needs one token boundary per sequence on the
+    host; reading them off the device tensor costs a DtoH sync per boundary per
+    layer (2 x 48 per step at batch 1).  Populated only where it is free: when
+    no request in the batch is doing speculative decoding, the device
+    boundaries *are* the CPU half of the same ``CpuGpuBuffer``.  It stays None
+    for a spec-decode batch, where adaptive verification can rewrite the device
+    draft split, so a CPU twin would not be trustworthy.
+    """
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
 
@@ -299,6 +311,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_query_start_loc = None
         prefill_state_indices = None
         prefill_has_initial_state = None
+        # CPU twin of the tensor the GDN layer hands to causal_conv1d_fn, so the
+        # gfx906 per-sequence fallback does not need a DtoH sync per boundary per
+        # layer.  It costs nothing extra here: the non-spec branch reads the CPU
+        # half of the same CpuGpuBuffer, and the spec branch reuses the transfer
+        # compute_causal_conv1d_metadata already performs below.
+        non_spec_query_start_loc_cpu = None
         if num_prefills > 0:
             context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
@@ -431,6 +449,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_actual_tokens=num_actual_tokens,
             has_initial_state=has_initial_state,
             prefill_query_start_loc=prefill_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
             spec_query_start_loc=spec_query_start_loc,

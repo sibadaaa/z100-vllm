@@ -1,0 +1,35 @@
+=== arm gemvs1  env='VLLM_DCU_FP8_GEMV_STREAM=1'  so=7e62d7ecf0569249416e8b85a048c07f
+2026-10-13T11:37:06+08:00
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 10-13 11:37:14 [_aiter_ops.py:174] Could not locate PyTorch's HIP runtime; AITER JIT extensions may fail to resolve HIP symbols.
+
+rocblaslt warning: No paths matched /opt/dtk/lib/hipblaslt/library/*gfx906*co. Make sure that HIPBLASLT_TENSILE_LIBPATH is set correctly.
+         shape  mode  var  M       ms   GB/s  note
+   1280x5120    gemv   64  1   0.0269    243  rel=0.00e+00
+   1280x5120    gemv   64  2   0.0312    210  rel=0.00e+00
+   1280x5120    gemv   64  3   0.0376    174  rel=0.00e+00
+   1280x5120    gemv   64  4   0.0558    118  rel=0.00e+00
+   1280x5120    gemv   64  8   0.7034      9  rel=0.00e+00
+   3584x5120    gemv   64  1   0.0432    424  rel=0.00e+00
+   3584x5120    gemv   64  2   0.0527    348  rel=0.00e+00
+   3584x5120    gemv   64  3   0.0580    316  rel=0.00e+00
+   3584x5120    gemv   64  4   0.0863    213  rel=0.00e+00
+   3584x5120    gemv   64  8   1.9611      9  rel=0.00e+00
+   4096x5120    gemv   64  1   0.0724    290  rel=0.00e+00
+   4096x5120    gemv   64  2   0.0858    244  rel=0.00e+00
+   4096x5120    gemv   64  3   0.0992    211  rel=0.00e+00
+   4096x5120    gemv   64  4   0.1456    144  rel=0.00e+00
+   4096x5120    gemv   64  8   1.7566     12  rel=0.00e+00
+   5120x5120    gemv   64  1   0.0736    356  rel=0.00e+00
+   5120x5120    gemv   64  2   0.0896    293  rel=0.00e+00
+   5120x5120    gemv   64  3   0.0991    264  rel=0.00e+00
+   5120x5120    gemv   64  4   0.1490    176  rel=0.00e+00
+   5120x5120    gemv   64  8   2.1735     12  rel=0.00e+00
+   8704x5120    gemv   64  1   0.1069    417  rel=0.00e+00
+   8704x5120    gemv   64  2   0.1217    366  rel=0.00e+00
+   8704x5120    gemv   64  3   0.1501    297  rel=0.00e+00
+   8704x5120    gemv   64  4   0.2202    202  rel=0.00e+00
+   8704x5120    gemv   64  8   3.6284     12  rel=5.96e-05
+[probe] wrote /mnt/game/perf1/perf1_kernel_mprobe_stream1_prefunset.json

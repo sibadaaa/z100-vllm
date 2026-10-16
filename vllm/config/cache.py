@@ -317,7 +317,21 @@ class CacheConfig:
     def metrics_info(self):
         # convert cache_config to dict(key: str, value: str) for prometheus
         # metrics info
-        return {key: str(value) for key, value in self.__dict__.items()}
+        return {
+            key: str(value)
+            for key, value in self.__dict__.items()
+            if key not in self._METRICS_INFO_IGNORED_FIELDS
+        }
+
+    # Bookkeeping fields that describe how the config was constructed rather
+    # than the cache itself; they add label churn without being queryable.
+    _METRICS_INFO_IGNORED_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "_block_size_resolved",
+            "user_specified_block_size",
+            "user_specified_mamba_block_size",
+        }
+    )
 
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
