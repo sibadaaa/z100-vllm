@@ -1,4 +1,5 @@
-from importlib import import_module
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm.config.attention import AttentionConfig, HiSparseConfig
 from vllm.config.aux_output import AuxOutputConfig
@@ -19,6 +20,7 @@ from vllm.config.kernel import KernelConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.load import LoadConfig
+from vllm.config.logging import LoggingConfig
 from vllm.config.lora import LoRAConfig
 from vllm.config.mamba import MambaConfig
 from vllm.config.model import (
@@ -96,6 +98,8 @@ __all__ = [
     "KVTransferConfig",
     # From vllm.config.load
     "LoadConfig",
+    # From vllm.config.logging
+    "LoggingConfig",
     # From vllm.config.lora
     "LoRAConfig",
     # From vllm.config.mamba

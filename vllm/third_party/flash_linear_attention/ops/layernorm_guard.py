@@ -331,17 +331,8 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
         return list(keys)
 
     def compile(self, compile_key: CompileKey) -> None:
-        # Triton's Heuristics/Autotuner wrappers only forward run(); unwrap
-        # the chain to the JITFunction, which owns the compile-only warmup().
-        kernel = self.kernel
-        warmup = getattr(kernel, "warmup", None)
-        while warmup is None and hasattr(kernel, "fn"):
-            kernel = kernel.fn
-            warmup = getattr(kernel, "warmup", None)
-        if warmup is None:
-            # Warmup is an optimization-only path; skip the compile instead
-            # of crashing startup when the wrapper exposes no entry point.
-            return
+        warmup = getattr(self.kernel, "warmup", None)
+        assert warmup is not None
         variant = compile_key.input_variant
 
         def pointer(name: str, dtype: torch.dtype | None) -> TritonWarmupTensor | None:

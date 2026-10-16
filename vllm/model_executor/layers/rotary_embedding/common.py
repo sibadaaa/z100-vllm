@@ -10,7 +10,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -126,18 +125,10 @@ class ApplyRotaryEmb(CustomOp):
 
         self.apply_rotary_emb_flash_attn = None
         if not current_platform.is_cpu():
-            # [gfx906] flash_attn's triton rotary kernel is not reliable on
-            # gfx906; fall back to the PyTorch native implementation there.
-            if on_gfx906():
-                logger.info_once(
-                    "[gfx906] Falling back to PyTorch implementation for "
-                    "rotary embeddings."
-                )
-            else:
-                with suppress(ModuleNotFoundError):
-                    self.apply_rotary_emb_flash_attn = import_module(
-                        "flash_attn.ops.triton.rotary"
-                    ).apply_rotary
+            with suppress(ModuleNotFoundError):
+                self.apply_rotary_emb_flash_attn = import_module(
+                    "flash_attn.ops.triton.rotary"
+                ).apply_rotary
 
     @staticmethod
     def forward_static(

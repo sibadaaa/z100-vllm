@@ -1,17 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from .hasher import MultiModalHasher
-from .inputs import (
-    BatchedTensorInputs,
-    MultiModalKwargsItems,
-    MultiModalUUIDDict,
-    NestedTensors,
-)
-
-try:
-    from .inputs import MultiModalDataDict  # type: ignore[attr-defined]
-except ImportError:
-    from vllm.inputs.llm import MultiModalDataDict  # noqa: F401
+from .inputs import BatchedTensorInputs, MultiModalKwargsItems, NestedTensors
 from .registry import MultiModalRegistry
 
 MULTIMODAL_REGISTRY = MultiModalRegistry()
@@ -25,8 +15,6 @@ Info:
 """
 
 __all__ = [
-    "MultiModalDataDict",
-    "MultiModalUUIDDict",
     "BatchedTensorInputs",
     "MultiModalHasher",
     "MultiModalKwargsItems",

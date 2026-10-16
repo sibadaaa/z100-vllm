@@ -28,60 +28,6 @@ if current_platform.is_rocm():
     _CAST_DOT_TO_K_DTYPE = on_gfx1x()
 
 
-def _is_gfx906_rocm() -> bool:
-    capability = current_platform.get_device_capability()
-    return (
-        current_platform.is_rocm()
-        and capability is not None
-        and capability.major == 9
-        and capability.minor == 0
-    )
-
-
-def _chunk_scaled_dot_kkt_fwd_eager(
-    k: torch.Tensor,
-    g: torch.Tensor | None,
-    beta: torch.Tensor,
-    cu_seqlens: torch.LongTensor | None,
-    chunk_size: int,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    B, T, Hg, _ = k.shape
-    H = beta.shape[-1]
-    head_ratio = H // Hg
-    output = torch.zeros(B, T, H, chunk_size, device=k.device, dtype=output_dtype)
-
-    if cu_seqlens is None:
-        seq_ranges = [(b, 0, T) for b in range(B)]
-    else:
-        seq_ranges = [
-            (0, int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item()))
-            for i in range(len(cu_seqlens) - 1)
-        ]
-
-    for batch_idx, seq_start, seq_end in seq_ranges:
-        for chunk_start in range(seq_start, seq_end, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, seq_end)
-            chunk_len = chunk_end - chunk_start
-
-            for head_idx in range(H):
-                key_head_idx = head_idx // head_ratio
-                k_chunk = k[batch_idx, chunk_start:chunk_end, key_head_idx].float()
-                beta_chunk = beta[batch_idx, chunk_start:chunk_end, head_idx].float()
-                block = torch.matmul(
-                    k_chunk * beta_chunk.unsqueeze(-1), k_chunk.transpose(0, 1)
-                )
-                if g is not None:
-                    g_chunk = g[batch_idx, chunk_start:chunk_end, head_idx].float()
-                    block = block * torch.exp(
-                        g_chunk.unsqueeze(1) - g_chunk.unsqueeze(0)
-                    )
-                block = torch.tril(block, diagonal=-1).to(output_dtype)
-                output[batch_idx, chunk_start:chunk_end, head_idx, :chunk_len] = block
-
-    return output
-
-
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -115,12 +61,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     USE_G: tl.constexpr,
     CAST_DOT_TO_K_DTYPE: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -132,22 +78,19 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
 
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    p_beta = beta + bos * H + i_h + o_t * H
+    b_beta = tl.load(p_beta, mask=m_t, other=0.0)
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+        o_k = i_k * BK + tl.arange(0, BK)
+        p_k = (
+            k
+            + (bos * Hg + i_h // (H // Hg)) * K
+            + o_t[:, None] * (Hg * K)
+            + o_k[None, :]
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = tl.load(p_k, mask=m_t[:, None] & (o_k < K)[None, :], other=0.0)
         b_kb = b_k * b_beta[:, None]
         if CAST_DOT_TO_K_DTYPE:
             # RDNA: force operands to k's native dtype so WMMA is used.
@@ -157,17 +100,15 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             b_A += tl.dot(b_kb, tl.trans(b_k).to(b_kb.dtype))
 
     if USE_G:
-        p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        p_g = g + bos * H + i_h + o_t * H
+        b_g = tl.load(p_g, mask=m_t, other=0.0)
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * exp(b_g_diff)
 
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (BT * H) + tl.arange(0, BT)[None, :]
+    tl.store(p_A, b_A.to(p_A.dtype.element_ty), mask=m_t[:, None])
 
 
 def chunk_scaled_dot_kkt_fwd(
@@ -211,16 +152,6 @@ def chunk_scaled_dot_kkt_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-
-    if _is_gfx906_rocm():
-        return _chunk_scaled_dot_kkt_fwd_eager(
-            k=k,
-            g=g,
-            beta=beta,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            output_dtype=output_dtype,
-        )
 
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
     chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](

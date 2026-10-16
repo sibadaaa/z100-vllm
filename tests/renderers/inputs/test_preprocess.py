@@ -65,14 +65,3 @@ def test_parse_enc_dec_prompt_rejects_nested_non_string_prompt_field():
                 "decoder_prompt": {"prompt": [4, 5]},
             }
         )
-
-
-def test_parse_decoder_only_multimodal_prompt():
-    prompt = {
-        "prompt": "<image>describe this image",
-        "multi_modal_data": {"image": object()},
-        "mm_processor_kwargs": {"do_resize": True},
-        "multi_modal_uuids": {"image": "image-0"},
-    }
-
-    assert parse_dec_only_prompt(prompt) == prompt

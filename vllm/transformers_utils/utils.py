@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import importlib.metadata
 import json
 import os
 import struct
@@ -14,9 +13,6 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-import gguf
-from gguf import GGMLQuantizationType
 
 
 def is_s3(model_or_path: str) -> bool:
@@ -126,112 +122,3 @@ def convert_model_repo_to_path(model_repo: str) -> str:
     from modelscope.utils.file_utils import get_model_cache_root
 
     return os.path.join(get_model_cache_root(), model_repo)
-
-# --- GGUF model helpers (restored for fork GGUF support) ---
-if not hasattr(gguf, "__version__"):
-    try:
-        gguf.__version__ = importlib.metadata.version("gguf")
-    except importlib.metadata.PackageNotFoundError:
-        gguf.__version__ = "0.0.0"
-
-
-def is_s3(model_or_path: str) -> bool:
-    return model_or_path.lower().startswith("s3://")
-
-
-def is_gcs(model_or_path: str) -> bool:
-    return model_or_path.lower().startswith("gs://")
-
-
-def is_cloud_storage(model_or_path: str) -> bool:
-    return is_s3(model_or_path) or is_gcs(model_or_path)
-
-
-@cache
-def check_gguf_file(model: str | PathLike) -> bool:
-    """Check if the file is a GGUF model."""
-    model = Path(model)
-    if not model.is_file():
-        return False
-    elif model.suffix == ".gguf":
-        return True
-
-    try:
-        with model.open("rb") as f:
-            header = f.read(4)
-
-        return header == b"GGUF"
-    except Exception as e:
-        logger.debug("Error reading file %s: %s", model, e)
-        return False
-
-
-@cache
-def is_remote_gguf(model: str | Path) -> bool:
-    """Check if the model is a remote GGUF model."""
-    model = str(model)
-    if is_cloud_storage(model) or model.startswith(("http://", "https://")):
-        return False
-
-    if "/" not in model or ":" not in model:
-        return False
-
-    quant_type = model.rsplit(":", 1)[1]
-    return is_valid_gguf_quant_type(quant_type) or is_nonstandard_gguf_quant_type(
-        quant_type
-    )
-
-
-def is_valid_gguf_quant_type(gguf_quant_type: str) -> bool:
-    """Check if the quant type is a valid GGUF quant type."""
-    if getattr(GGMLQuantizationType, gguf_quant_type, None) is not None:
-        return True
-
-    # GGUF repositories commonly append a size suffix to the base type.
-    for suffix in ("_M", "_S", "_L", "_XL", "_XS", "_XXS"):
-        if gguf_quant_type.endswith(suffix):
-            base_type = gguf_quant_type[: -len(suffix)]
-            if getattr(GGMLQuantizationType, base_type, None) is not None:
-                return True
-    return False
-
-
-def is_nonstandard_gguf_quant_type(quant_type: str) -> bool:
-    """Return whether a prefixed quant name contains a known GGUF type."""
-    if "-" not in quant_type:
-        return False
-    _, remainder = quant_type.rsplit("-", 1)
-    return is_valid_gguf_quant_type(remainder)
-
-
-def split_remote_gguf(model: str | Path) -> tuple[str, str]:
-    """Split the model into repo_id and quant type."""
-    model = str(model)
-    if is_remote_gguf(model):
-        parts = model.rsplit(":", 1)
-        return (parts[0], parts[1])
-    raise ValueError(
-        f"Wrong GGUF model or invalid GGUF quant type: {model}.\n"
-        "- It should be in repo_id:quant_type format.\n"
-        f"- Valid GGMLQuantizationType values: {GGMLQuantizationType._member_names_}\n"
-        "- Dash-prefixed quant types are accepted when the suffix is valid "
-        "(e.g. UD-IQ1_S)."
-    )
-
-def is_gguf(model: str | Path) -> bool:
-    """Check if the model is a GGUF model.
-
-    Args:
-        model: Model name, path, or Path object to check.
-
-    Returns:
-        True if the model is a GGUF model, False otherwise.
-    """
-    model = str(model)
-
-    # Check if it's a local GGUF file
-    if check_gguf_file(model):
-        return True
-
-    # Check if it's a remote GGUF model (repo_id:quant_type format)
-    return is_remote_gguf(model)

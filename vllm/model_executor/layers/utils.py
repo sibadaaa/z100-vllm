@@ -7,15 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-import triton
-import triton.language as tl
 
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.rocm import on_gfx9
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
     is_flashinfer_cutedsl_bf16_gemm_supported,
@@ -24,140 +21,6 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-
-def get_autotune_config():
-    return [
-        triton.Config(
-            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
-            num_stages=3,
-            num_warps=2,
-        ),
-    ]
-
-
-def get_heuristics():
-    return {"BLOCK_SIZE_M": lambda args: min(16, triton.next_power_of_2(args["M"]))}
-
-
-# `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
-#   - A list of `triton.Config` objects that define different configurations of
-#       meta-parameters (e.g., `BLOCK_SIZE_M`) and compilation options (e.g., `num_warps`) to try
-#   - An auto-tuning *key* whose change in values will trigger evaluation of all the
-#       provided configs
-@triton.autotune(configs=get_autotune_config(), key=["M", "N", "K"])
-@triton.heuristics(values=get_heuristics())
-@triton.jit
-def triton_matmul_kernel(
-    # Pointers to matrices
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    # Matrix dimensions
-    M,
-    N,
-    K,
-    # The stride variables represent how much to increase the ptr by when moving by 1
-    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-    # by to get the element one row down (A has M rows).
-    stride_am,
-    stride_ak,  #
-    stride_bk,
-    stride_bn,  #
-    stride_cm,
-    stride_cn,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
-    """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    # See above `L2 Cache Optimizations` section for details.
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    # See above `Pointer Arithmetic` section for details
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        # We accumulate along the K dimension.
-        accumulator = tl.dot(a, b, accumulator)
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.float16)
-
-    # -----------------------------------------------------------
-    # Write back the block of the output matrix C with masks.
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-
-def triton_matmul(a, b):
-    # Check constraints.
-    assert a.shape[1] == b.shape[1], (
-        "Incompatible dimensions"
-    )  # NOTE(gfx906): b.shape inv
-    assert a.is_contiguous(), "Matrix A must be contiguous"
-    M, K = a.shape
-    N, K = b.shape  # NOTE(gfx906): b.shape inv
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
-    triton_matmul_kernel[grid](
-        a,
-        b,
-        c,  #
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(1),
-        b.stride(0),  # NOTE(gfx906): b.stride inv
-        c.stride(0),
-        c.stride(1),  #
-    )
-    return c
 
 
 def get_token_bin_counts_and_mask(
@@ -223,8 +86,7 @@ def default_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    linear_input = x if x.dtype == weight.dtype else x.to(weight.dtype)
-    return torch.nn.functional.linear(linear_input, weight, bias)
+    return torch.nn.functional.linear(x, weight, bias)
 
 
 _FlashInferBf16RuntimeCheck = Callable[
@@ -266,15 +128,12 @@ def _can_use_flashinfer_cutedsl_bf16(
     if (
         k <= 0
         or n <= 0
+        or x.numel() == 0
         or weight.shape[1] != k
         or k % 128 != 0
         or x.data_ptr() % 32 != 0
         or weight.data_ptr() % 32 != 0
     ):
-        return False
-
-    m = x.numel() // k
-    if not 1 <= m <= 32:
         return False
     return bias is None or (
         bias.is_cuda
@@ -366,6 +225,8 @@ direct_register_custom_op(
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):
+    from vllm.platforms.rocm import on_gfx1250
+
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()
         # MI300's - fp8nuz=True
@@ -373,6 +234,9 @@ def use_aiter_triton_gemm(n, m, k, dtype):
         or dtype not in [torch.float16, torch.bfloat16]
     ):
         return False
+
+    if on_gfx1250():
+        return True
 
     # use hipblaslt for the larger GEMMs
     if n > 2048 and m > 512:
@@ -426,36 +290,142 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+# On gfx11 a weight row stride that is a multiple of 2048 B makes the multi-row global
+# loads of a GEMM collide on the L2/MALL channel hash. Offsetting the stride by one
+# 128 B cache line dodges the collision and keeps each row cache-line aligned.
+def cache_aliasing_pad_elems(k: int, element_size: int) -> int:
+    """Row-stride pad, in elements, that stops an ``[n, k]`` weight aliasing on gfx11,
+    or 0 when the stride does not alias.
+
+    Args:
+        k: Number of elements per weight row.
+        element_size: Size of one element in bytes.
+
+    Returns:
+        The number of elements to add to the row stride.
+
+    """
+    if (k * element_size) % 2048 != 0:
+        return 0
+    return 128 // element_size
+
+
+def maybe_pad_weight_avoid_cache_aliasing(weight: torch.Tensor) -> torch.Tensor:
+    """Offset a dense weight's row stride so it stops aliasing.
+
+    Returns a view with the original shape whose row stride is one cache line
+    wider, or ``weight`` unchanged when the pad does not apply.
+    """
+    from vllm.platforms.rocm import on_gfx11
+
+    if not (current_platform.is_rocm() and on_gfx11()):
+        return weight
+    if weight.dim() != 2 or not weight.is_contiguous():
+        return weight
+    pad = cache_aliasing_pad_elems(weight.shape[1], weight.element_size())
+    if pad == 0:
+        return weight
+    return torch.nn.functional.pad(weight, (0, pad))[..., :-pad]
+
+
 def rocm_unquantized_gemm_impl(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    x_view = x.reshape(-1, x.size(-1))
-    n = x_view.shape[0]
+    if envs.VLLM_BATCH_INVARIANT:
+        from vllm.model_executor.determinism.batch_invariant import (
+            linear_batch_invariant,
+        )
+
+        return linear_batch_invariant(x, weight, bias)
+
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx11, on_gfx950
+
+    n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
 
-    # For FP16/BF16 without bias and k % 8 == 0, prefer skinny GEMV kernel
-    if (
-        x.dtype in [torch.float16, torch.bfloat16]
+    cu_count = num_compute_units()
+
+    _, fits_wvsplitkrc = wvsplitkrc_dispatch(n, k, m, cu_count)
+
+    skinny_operands_compatible = weight.is_contiguous() and (
+        bias is None or bias.is_contiguous()
+    )
+
+    use_skinny_reduce_counting = (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx950()
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and x.dim() == 2
+        and (
+            10 <= n <= 128
+            and k % 8 == 0
+            and k > 512
+            and m % 16 == 0
+            and fits_wvsplitkrc
+            and skinny_operands_compatible
+        )
+    )
+
+    if use_skinny_reduce_counting:
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
+        return ops.wvSplitKrc(x_view, weight, cu_count, bias)
+
+    if use_aiter_triton_gemm(n, m, k, x.dtype):
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+
+        return gemm_a16w16(x, weight, bias)
+
+    skinny_gemm_enabled = (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and (on_gfx9() or on_gfx1x())
+        # build (gfx9/gfx11 ISA); fall back to torch GEMM there.
+        # TODO GFX1250: Include once skinny GEMM is supported on gfx1250
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and k % 8 == 0
+    )
+
+    # wvSplitK allows row strides. Perf impact is only validated on gfx11.
+    weight_ok_for_wvsplitk = weight.is_contiguous() or (
+        on_gfx11() and weight.stride(1) == 1
+    )
+
+    use_wvsplitk = (
+        skinny_gemm_enabled
+        and weight_ok_for_wvsplitk
+        and (bias is None or bias.is_contiguous())
+        and (m == 1 or m > 8)
+        and 0 < n <= 5
+    )
+
+    use_llmm1 = (
+        skinny_gemm_enabled
+        and weight.is_contiguous()
         and bias is None
         and m % 4 == 0
         and n == 1
         and k <= 8192
-        and k % 8 == 0
-    ):
+    )
+
+    if use_wvsplitk:
+        # The skinny kernels assume contiguous K elements. A shape-preserving
+        # reshape can retain a transposed activation's non-contiguous strides.
+        # Note: Only build that view inside the branches that consume it.
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
+        out = ops.wvSplitK(weight, x_view, cu_count, bias)
+        return out.reshape(*x.shape[:-1], weight.shape[0])
+
+    if use_llmm1:
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
         out = ops.LLMM1(weight, x_view, 4)
-        return out.view(*x.shape[:-1], weight.shape[0])
+        return out.reshape(*x.shape[:-1], weight.shape[0])
 
-    if n <= 16 and not on_gfx9():
-        out = triton_matmul(x_view, weight).view(*x.shape[:-1], weight.shape[0])
-        if bias is not None:
-            out = out + bias
-        return out
+    if rocm_aiter_ops.is_tgemm_enabled():
+        from aiter.tuned_gemm import tgemm
 
-    linear_input = x if x.dtype == weight.dtype else x.to(weight.dtype)
-    return torch.nn.functional.linear(linear_input, weight, bias)
+        return tgemm.mm(x, weight, bias)
+
+    return torch.nn.functional.linear(x, weight, bias)
 
 
 def rocm_unquantized_gemm_fake(
@@ -470,6 +440,13 @@ def rocm_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # dispatch_unquantized_gemm() picks this backend for any ROCm build,
+    # regardless of the tensor's actual device; the custom op below is only
+    # registered for the CUDA/HIP dispatch key, so route CPU tensors (e.g.
+    # from unit tests that build layers without moving them to the GPU)
+    # through the device-agnostic fallback instead of hard-crashing.
+    if not x.is_cuda:
+        return default_unquantized_gemm(layer, x, weight, bias)
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 
@@ -561,13 +538,27 @@ def dispatch_cpu_unquantized_gemm(
     # Skip CPU GEMM dispatch for non-2D weights (e.g. MoE 3D expert weights).
     # These layers are handled by their own specialized methods.
     if layer.weight.ndim != 2:
-        # this is not a linear layer
-        # For now it should be a causal_conv1d op or MoE 3D expert weights
-        # The C++ causal_conv1d kernels use VDPBF16PS (no AMX tiles), so the
-        # VNNI weight prepack applies to any AVX-512BF16 CPU, not just AMX
-        # (e.g. AMD Zen5/Turin).
-        if torch.cpu._is_avx512_bf16_supported() and hasattr(
-            ops, "causal_conv1d_weight_pack"
+        # This is not a linear layer.
+        # For now it should be a causal_conv1d op or MoE 3D expert weights.
+        # Causal-conv weights use [dim, 1, width].
+        # The C++ causal_conv1d kernels support aarch64 with bf16 and
+        # x86 CPUs that use VDPBF16PS (no AMX tiles). So the
+        # weight prepack applies to aarch64 with bf16 and any AVX-512BF16 CPU,
+        # not just AMX (e.g. AMD Zen5/Turin).
+        is_causal_conv1d_weight = (
+            layer.weight.ndim == 3
+            and layer.weight.size(1) == 1
+            and layer.weight.size(2) == 4
+            and layer.weight.dtype == torch.bfloat16
+        )
+        is_arm_bf16 = (
+            current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+            and torch.cpu.get_capabilities().get("bf16", False)
+        )
+        if (
+            (is_arm_bf16 or torch.cpu._is_avx512_bf16_supported())
+            and is_causal_conv1d_weight
+            and hasattr(ops, "causal_conv1d_weight_pack")
         ):
             # prepack conv weight
             unpacked = (
@@ -579,7 +570,7 @@ def dispatch_cpu_unquantized_gemm(
                 .clone()
             )
             # Stash the un-packed (dim, width) weight so the speculative-decode
-            # GDN path (which uses torch conv, not the C++ kernel) can use it.
+            # and unsupported-layout fallbacks can still use ordinary weights.
             layer._cpu_unpacked_conv_weight = unpacked
             layer.weight.data = ops.causal_conv1d_weight_pack(unpacked)
         return

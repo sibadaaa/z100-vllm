@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Literal, get_args
-
-import torch
+from typing import Literal, get_args
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -32,7 +30,6 @@ QuantizationMethods = Literal[
     "compressed-tensors",
     "experts_int8",
     "quark",
-    "gguf",
     "moe_wna16",
     "torchao",
     "inc",
@@ -59,40 +56,6 @@ DEPRECATED_QUANTIZATION_METHODS = [
 
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
-
-
-class _LazyQuarkConfig(QuantizationConfig):
-    """Quark config proxy that avoids importing optional aiter dependencies.
-
-    ModelConfig probes every quantization method for override support. Importing
-    Quark during that probe can initialize ROCm aiter even when the model uses a
-    different quantization format, so defer the real import until Quark is
-    actually selected and instantiated from config.
-    """
-
-    def get_name(self) -> QuantizationMethods:
-        return "quark"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float16, torch.bfloat16]
-
-    @classmethod
-    def get_min_capability(cls) -> int:
-        return 70
-
-    @staticmethod
-    def get_config_filenames() -> list[str]:
-        return []
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> QuantizationConfig:
-        from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
-
-        return QuarkConfig.from_config(config)
-
-    def get_quant_method(self, layer, prefix):
-        raise RuntimeError("Lazy Quark config should not be used at runtime")
 
 
 def register_quantization_config(quantization: str):
@@ -150,16 +113,9 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
-    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
-        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
-
-    if quantization == "quark":
-        # [gfx906] defer the real Quark import so config probes do not
-        # initialize ROCm aiter for unrelated quantization formats.
-        return _LazyQuarkConfig
-
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
+    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 
     if current_platform.is_cuda() or current_platform.is_rocm():
         # The v4.1 class is the v4 one extended to accept model_type
@@ -193,7 +149,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         ModelOptNvFp4Config,
     )
     from .moe_wna16 import MoeWNA16Config
-    from .gguf import GGUFConfig
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
@@ -214,7 +169,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "gptq_marlin": AutoGPTQConfig,
         "compressed-tensors": CompressedTensorsConfig,
         "experts_int8": ExpertsInt8Config,
-        "gguf": GGUFConfig,
+        "quark": QuarkConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
         "inc": INCConfig,
@@ -225,7 +180,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "online": OnlineQuantizationConfig,
         # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
         # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
-        # below only applies to the `--quantization` CLI path.
+        # below only applies to the `--quantization mxfp8` CLI path.
         "mxfp8": ModelOptMxFp8Config,
     }
 

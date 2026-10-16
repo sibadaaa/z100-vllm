@@ -58,31 +58,13 @@ class AttentionConfig:
     """Force vllm to use a specific flash-attention version (2, 3, or 4).
     Only valid when using the flash-attention backend."""
 
-    use_prefill_decode_attention: bool = False
-    """Use separate prefill and decode kernels for attention instead of
-    the unified triton kernel."""
-
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
 
-    use_cudnn_prefill: bool = False
-    """Whether to use cudnn prefill."""
-
-    use_trtllm_ragged_deepseek_prefill: bool = True
-    """Whether to use TRTLLM ragged deepseek prefill."""
-
-    use_trtllm_attention: bool | None = None
-    """If set to True/False, use or don't use the TRTLLM attention backend
-    in flashinfer. If None, auto-detect the attention backend in flashinfer."""
-
-    disable_flashinfer_prefill: bool = False
-    """Whether to disable flashinfer prefill."""
-
-    disable_flashinfer_q_quantization: bool = False
-    """If set, when using fp8 kv, do not quantize Q to fp8."""
-
-    use_prefill_query_quantization: bool = False
-    """If set, quantize query for attention in prefill."""
+    tokenspeed_mla_min_split_kv: int = Field(default=1, ge=1, le=256)
+    """Minimum KV splits for TokenSpeed MLA decode. The default of 1 preserves
+    automatic scheduling. Larger values request a split floor and may increase
+    workspace memory. Only applies to the TokenSpeed MLA backend."""
 
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
@@ -116,7 +98,14 @@ class AttentionConfig:
     an SM100-class GPU, DeepGEMM >= 2.8 and the DeepSelect top-k extension
     (the top-k runs on the kernels' bf16 logits). The sparse path costs
     O(candidate blocks) per query regardless of context length, so it pays off
-    for long contexts (roughly 32K tokens and beyond) and is slower below."""
+    for long contexts (roughly 32K tokens and beyond) and is slower below.
+    On ROCm gfx950 it runs aiter's paged MXFP4 MQA-logits kernel over the
+    candidate pool instead, with fp32 logits, and keeps the masked dense walk
+    for steps whose contexts are too short for the pool to pay."""
+
+    indexer_tp_shard_min_rows: int = Field(default=65536, ge=1)
+    """Minimum total prefill rows for the sparse-attention indexer to split
+    them across TP ranks instead of scoring every row on each rank."""
 
     hisparse_config: HiSparseConfig | None = None
     """HiSparse host-resident KV configuration. Setting this enables experimental
@@ -131,6 +120,15 @@ class AttentionConfig:
     """Force sparse MLA to use forward_mqa for all requests, including prefill.
     When False (default), pure prefill batches use forward_mha when implemented.
     Set to True to always use the MQA path."""
+
+    sparse_mla_prefill_workspace_factor: int | None = Field(default=None, ge=2)
+    """Sparse MLA prefill workspace size, in multiples of `max_model_len`.
+    FlashMLA sparse gathers a prefill step's context KV into this workspace and
+    runs attention in more chunks when the step holds more. The sparse indexer's
+    prefill K buffer is sized to fit in the same memory. Lower values return
+    memory to the KV cache at long `max_model_len`; the minimum of 2 leaves room
+    for a full-length request's context-parallel shard. If None, 5 when
+    `max_model_len` is at most 256K tokens, else 2."""
 
     flex_attn_block_m: int | None = None
     """Triton kernel BLOCK_M tile size for flex attention.
@@ -181,8 +179,7 @@ class AttentionConfig:
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors: set[str] = set()
-        factors = get_hash_factors(self, ignored_factors)
+        factors = get_hash_factors(self, set())
         return hash_factors(factors)
 
     @field_validator("backend", mode="before")

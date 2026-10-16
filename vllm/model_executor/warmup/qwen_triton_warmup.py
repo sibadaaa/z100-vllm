@@ -22,6 +22,8 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 
@@ -197,6 +199,7 @@ def _warm_causal_conv1d_fwd_kernel(
         has_initial_state=has_initial_state,
         activation="silu",
         pad_slot_id=PAD_SLOT_ID,
+        null_block_id=NULL_BLOCK_ID,
         metadata=None,
         validate_data=False,
     )

@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ColQwen3.5 late-interaction retrieval model."""
+"""ColQwen3.5 late interaction model for multi-modal retrieval and reranking.
+
+ColQwen3.5 extends Qwen3.5 with a ColBERT-style late interaction head,
+producing per-token embeddings for both text and image inputs. It uses
+MaxSim scoring for retrieval/reranking tasks.
+
+This model supports the "token_embed" pooling task and is designed for
+multi-vector retrieval of documents containing both text and images.
+
+Reference: https://arxiv.org/abs/2407.01449 (ColPali)
+Based on: Qwen3.5 backbone with custom text projection
+
+Target models:
+- athrael-soju/colqwen3.5-4.5B-v3
+- vultr/VultronRetrieverPrime-Qwen3.5-8B
+"""
 
 from collections.abc import Iterable, Mapping
 
@@ -13,7 +28,9 @@ from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
+from .interfaces import SupportsLateInteraction
 from .interfaces_base import default_pooling_type
+from .qwen2_vl import Qwen2VLMultiModalDataParser
 from .qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5ProcessingInfo,
@@ -26,7 +43,14 @@ from .utils import AutoWeightsLoader, WeightsMapper
 
 
 class ColQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
-    """Use the standard Qwen3-VL processor for remote ColQwen configs."""
+    """Processing info for ColQwen3.5 models.
+
+    ColQwen3.5 models use custom HuggingFace processors (e.g.
+    ColQwen3_5Processor) that are incompatible with vLLM's
+    Qwen3VLMultiModalProcessor. We override get_hf_config() and
+    get_hf_processor() to skip the strict type check and force the
+    standard Qwen3VLProcessor.
+    """
 
     def get_hf_config(self):
         return self.ctx.get_hf_config()
@@ -34,12 +58,12 @@ class ColQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
         return self.ctx.get_hf_processor(
             Qwen3VLProcessor,
-            use_fast=kwargs.pop("use_fast", True),
             **kwargs,
         )
 
     @property
     def _supports_video(self) -> bool:
+        """Check if the HF processor supports video inputs."""
         return hasattr(self.get_hf_processor(), "video_processor")
 
     def get_video_processor(self, **kwargs: object):
@@ -61,31 +85,61 @@ class ColQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        limits = {"image": self.get_max_image_tokens()}
+        max_image_tokens = self.get_max_image_tokens()
+        result: dict[str, int] = {"image": max_image_tokens}
         if self._supports_video:
-            limits["video"] = self.get_max_video_tokens(seq_len, mm_counts)
-        return limits
+            max_video_tokens = self.get_max_video_tokens(seq_len, mm_counts)
+            result["video"] = max_video_tokens
+        return result
+
+    def get_data_parser(self):
+        hf_config = self.get_hf_config()
+        spatial_merge_size = hf_config.vision_config.spatial_merge_size
+        return Qwen2VLMultiModalDataParser(
+            spatial_merge_size,
+            video_needs_metadata=self._supports_video,
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
 
 
-@default_pooling_type(tok_pooling_type="ALL")
+@default_pooling_type(seq_pooling_type="CLS", tok_pooling_type="ALL")
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,
     info=ColQwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
-    """Qwen3.5 backbone with a ColBERT-style per-token projection head.
+class ColQwen3_5Model(
+    Qwen3_5ForConditionalGeneration,
+    SupportsLateInteraction,
+):
+    """ColQwen3.5 late interaction model for multi-modal retrieval/reranking.
 
-    Projection and L2-normalization are applied by the pooler
-    (``pooler.head.projector`` is the model's ``custom_text_proj``).
+    This model extends Qwen3_5ForConditionalGeneration with a ColBERT-style
+    linear projection layer for per-token embeddings. It supports:
+    - "token_embed" task: Per-token embeddings for late interaction scoring
+
+    The model produces L2-normalized per-token embeddings by:
+    1. Running the Qwen3.5 backbone (vision + language) to get hidden states
+    2. Projection and L2-normalization via the pooler (TokenEmbeddingPoolerHead)
+
+    Attributes:
+        custom_text_proj: Linear projection from hidden_size to embed_dim.
+            This is passed to the pooler as pooler.head.projector.
+
     """
 
+    # Mark this as a pooling model so vLLM routes to pooler path
     is_pooling_model = True
-    score_type = "late-interaction"
 
+    # Override hf_to_vllm_mapper to handle ColQwen3.5 weight naming.
+    # ColPali saves weights as "language_model.*" but vLLM's
+    # Qwen3_5ForCausalLM has them under "language_model.model.*".
+    # Visual weights ("visual.*") already match the vLLM module path.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.": "language_model.model.",
+            "mtp.": None,
         }
     )
 
@@ -93,28 +147,38 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
         config = vllm_config.model_config.hf_config
+        head_dtype = vllm_config.model_config.head_dtype
+
         hidden_size = getattr(config, "hidden_size", None)
         if hidden_size is None and hasattr(config, "text_config"):
             hidden_size = config.text_config.hidden_size
         if hidden_size is None:
             raise ValueError(
-                "Unable to determine text hidden size from config. Expected "
-                "'hidden_size' or 'text_config.hidden_size'."
+                "Unable to determine text hidden size from config. "
+                "Expected 'hidden_size' or 'text_config.hidden_size'."
             )
 
+        # (ColPali: dim, projection_dim, colbert_dim)
         self.embed_dim: int = (
             getattr(config, "embed_dim", None)
             or getattr(config, "dims", None)
             or getattr(config, "dim", None)
             or getattr(config, "projection_dim", None)
             or getattr(config, "colbert_dim", None)
-            or 128
+            or 128  # default from reference implementation
         )
+
+        # ColPali defines `custom_text_proj = nn.Linear(hidden, dim)`, i.e.
+        # bias=True by default, and the trained ColQwen3.5 checkpoints ship a
+        # `custom_text_proj.bias`. Construct with a bias and zero-initialize it:
+        # a (legacy) bias-less checkpoint then behaves identically to bias=False,
+        # while load_weights() below picks up a trained bias instead of silently
+        # dropping it (which shifts every per-token vector and the MaxSim ranking).
         self.custom_text_proj = nn.Linear(
             hidden_size,
             self.embed_dim,
             bias=True,
-            dtype=vllm_config.model_config.head_dtype,
+            dtype=head_dtype,
         )
         nn.init.zeros_(self.custom_text_proj.bias)
 
@@ -133,7 +197,7 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        """Run forward pass returning hidden states for the pooler."""
+        """Run forward pass returning hidden states for pooler."""
         return super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -142,32 +206,37 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
             **kwargs,
         )
 
+    # Names used for the projection layer across different ColQwen3.5 variants
     _PROJ_LAYER_NAMES = {
-        "custom_text_proj",
-        "embedding_proj_layer",
+        "custom_text_proj",  # ColPali naming
+        "embedding_proj_layer",  # Alternative naming
     }
 
     def _is_proj_weight(self, name: str) -> bool:
+        """Check if a weight name belongs to the projection layer."""
         return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with special handling for projection layer."""
+        weights_list = list(weights)
         proj_weights: list[tuple[str, torch.Tensor]] = []
         model_weights: list[tuple[str, torch.Tensor]] = []
-        for name, weight in weights:
-            target = proj_weights if self._is_proj_weight(name) else model_weights
-            target.append((name, weight))
 
-        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["mtp."])
+        for name, weight in weights_list:
+            if self._is_proj_weight(name):
+                proj_weights.append((name, weight))
+            else:
+                model_weights.append((name, weight))
+
+        loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(model_weights, mapper=self.hf_to_vllm_mapper)
 
         for name, weight in proj_weights:
-            param_name = name.rsplit(".", 1)[-1]
+            param_name = name.split(".")[-1]
             param = getattr(self.custom_text_proj, param_name, None)
             if param is not None:
-                default_weight_loader(
-                    param,
-                    weight.to(device=param.device, dtype=param.dtype),
-                )
+                weight = weight.to(device=param.device, dtype=param.dtype)
+                default_weight_loader(param, weight)
                 loaded.add(f"custom_text_proj.{param_name}")
                 # Also mark as loaded under pooler path since custom_text_proj
                 # is assigned to pooler.head.projector

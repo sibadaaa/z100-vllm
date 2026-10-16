@@ -122,6 +122,7 @@ def paged_attention_rocm(
     v_scale: torch.Tensor,
     fp8_out_scale: torch.Tensor | None = None,
     mfma_type: str = "fp8" if envs.VLLM_ROCM_FP8_MFMA_PAGE_ATTN else "f16",
+    use_interleaved_v_cache: bool = False,
 ) -> None:
     torch.ops._rocm_C.paged_attention(
         out,
@@ -144,6 +145,7 @@ def paged_attention_rocm(
         v_scale,
         fp8_out_scale,
         mfma_type,
+        use_interleaved_v_cache,
     )
 
 
@@ -335,114 +337,6 @@ def fused_add_rms_norm(
 ) -> None:
     # Note: this func is batch invariant
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
-
-
-def rms_norm_gated_gfx906(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    gate: torch.Tensor,
-    epsilon: float,
-    norm_before_gate: bool,
-) -> torch.Tensor:
-    return torch.ops._C.rms_norm_gated_gfx906(
-        input, weight, gate, epsilon, norm_before_gate
-    )
-
-
-if hasattr(torch.ops._C, "rms_norm_gated_gfx906"):
-
-    @register_fake("_C::rms_norm_gated_gfx906")
-    def _rms_norm_gated_gfx906_fake(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        gate: torch.Tensor,
-        epsilon: float,
-        norm_before_gate: bool,
-    ) -> torch.Tensor:
-        return torch.empty_like(input)
-
-
-def shared_expert_gate_mul(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    torch.ops._C.shared_expert_gate_mul(out, input, weight)
-
-
-def shared_expert_gate_add(
-    routed_out: torch.Tensor,
-    shared_out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    torch.ops._C.shared_expert_gate_add(routed_out, shared_out, input, weight)
-
-
-if hasattr(torch.ops._C, "shared_expert_gate_mul"):
-
-    @register_fake("_C::shared_expert_gate_mul")
-    def _shared_expert_gate_mul_fake(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> None:
-        return None
-
-
-if hasattr(torch.ops._C, "shared_expert_gate_add"):
-
-    @register_fake("_C::shared_expert_gate_add")
-    def _shared_expert_gate_add_fake(
-        routed_out: torch.Tensor,
-        shared_out: torch.Tensor,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> None:
-        return None
-
-
-def gemma_rms_norm_gfx906(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-) -> torch.Tensor:
-    return torch.ops._C.gemma_rms_norm_gfx906(input, weight, epsilon)
-
-
-def gemma_fused_add_rms_norm_gfx906(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    out, residual_out = torch.ops._C.gemma_fused_add_rms_norm_gfx906(
-        input, residual, weight, epsilon
-    )
-    return out, residual_out
-
-
-if hasattr(torch.ops._C, "gemma_rms_norm_gfx906"):
-
-    @register_fake("_C::gemma_rms_norm_gfx906")
-    def _gemma_rms_norm_gfx906_fake(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> torch.Tensor:
-        return torch.empty_like(input)
-
-
-if hasattr(torch.ops._C, "gemma_fused_add_rms_norm_gfx906"):
-
-    @register_fake("_C::gemma_fused_add_rms_norm_gfx906")
-    def _gemma_fused_add_rms_norm_gfx906_fake(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> list[torch.Tensor]:
-        return [torch.empty_like(input), torch.empty_like(residual, dtype=torch.float32)]
 
 
 def fused_qk_norm_rope(
@@ -675,85 +569,6 @@ def awq_dequantize(
     return torch.ops._C.awq_dequantize(qweight, scales, zeros, split_k_iters, thx, thy)
 
 
-def awq_gemm(
-    input: torch.Tensor,
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
-    scales: torch.Tensor,
-    split_k_iters: int,
-) -> torch.Tensor:
-    if envs.VLLM_USE_TRITON_AWQ:
-        from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
-
-        return awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
-    return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
-
-
-# gptq
-def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
-    torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
-
-
-# marlin_24
-def gptq_marlin_24_gemm(
-    a: torch.Tensor,
-    b_q_weight: torch.Tensor,
-    b_meta: torch.Tensor,
-    b_scales: torch.Tensor,
-    workspace: torch.Tensor,
-    b_q_type: ScalarType,
-    size_m: int,
-    size_n: int,
-    size_k: int,
-) -> torch.Tensor:
-    return torch.ops._C.gptq_marlin_24_gemm(
-        a, b_q_weight, b_meta, b_scales, workspace, b_q_type.id, size_m, size_n, size_k
-    )
-
-
-if hasattr(torch.ops._C, "gptq_marlin_24_gemm"):
-
-    @register_fake("_C::gptq_marlin_24_gemm")
-    def _gptq_marlin_24_gemm_fake(
-        a: torch.Tensor,
-        b_q_weight: torch.Tensor,
-        b_meta: torch.Tensor,
-        b_scales: torch.Tensor,
-        workspace: torch.Tensor,
-        b_q_type: ScalarType,
-        size_m: torch.SymInt,
-        size_n: torch.SymInt,
-        size_k: torch.SymInt,
-    ) -> torch.Tensor:
-        return torch.empty((size_m, size_n), device=a.device, dtype=a.dtype)
-
-    @register_fake("_C::gptq_marlin_gemm")
-    def _gptq_marlin_gemm_fake(
-        a: torch.Tensor,
-        c: torch.Tensor | None,
-        b_q_weight: torch.Tensor,
-        b_bias: torch.Tensor | None,
-        b_scales: torch.Tensor,
-        a_scales: torch.Tensor | None,
-        global_scale: torch.Tensor | None,
-        b_zeros: torch.Tensor | None,
-        g_idx: torch.Tensor | None,
-        perm: torch.Tensor | None,
-        workspace: torch.Tensor,
-        b_q_type_id: int,
-        size_m: torch.SymInt,
-        size_n: torch.SymInt,
-        size_k: torch.SymInt,
-        is_k_full: bool = True,
-        use_atomic_add: bool = False,
-        use_fp32_reduce: bool = False,
-        is_zp_float: bool = False,
-    ) -> torch.Tensor:
-        dtype = a.dtype
-        if dtype not in [torch.half, torch.bfloat16]:
-            dtype = b_scales.dtype
-        return torch.empty((size_m, size_n), device=a.device, dtype=dtype)
-
 if hasattr(torch.ops._C, "awq_dequantize"):
 
     @register_fake("_C::awq_dequantize")
@@ -886,207 +701,6 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gptq_gemm_rdna3
             (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
         )
 
-    @register_fake("_C::ggml_mul_mat_vec_a8")
-    def _ggml_mul_mat_vec_a8_fake(
-        W: torch.Tensor,
-        X: torch.Tensor,
-        quant_type: int,
-        row: torch.SymInt,
-    ) -> torch.Tensor:
-        return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
-
-    if hasattr(torch.ops._C, "ggml_repack_iq4_xs_to_q8_0"):
-
-        @register_fake("_C::ggml_repack_iq4_xs_to_q8_0")
-        def _ggml_repack_iq4_xs_to_q8_0_fake(
-            W: torch.Tensor,
-            row: torch.SymInt,
-            col: torch.SymInt,
-        ) -> torch.Tensor:
-            return torch.empty(
-                (row, (col // 32) * 34), dtype=torch.uint8, device=W.device
-            )
-
-    @register_fake("_C::ggml_quantize_row_q8_1")
-    def _ggml_quantize_row_q8_1_fake(X: torch.Tensor) -> torch.Tensor:
-        padded = (X.shape[1] + 511) // 512 * 512
-        return torch.empty(
-            (X.shape[0], padded // 32 * 9), dtype=torch.int32, device=X.device
-        )
-
-    if hasattr(torch.ops._C, "ggml_quantize_row_q8_1_out"):
-
-        @register_fake("_C::ggml_quantize_row_q8_1_out")
-        def _ggml_quantize_row_q8_1_out_fake(
-            X: torch.Tensor,
-            quant_X: torch.Tensor,
-        ) -> None:
-            return None
-
-    if hasattr(torch.ops._C, "ggml_silu_and_mul_quantize_row_q8_1"):
-
-        @register_fake("_C::ggml_silu_and_mul_quantize_row_q8_1")
-        def _ggml_silu_and_mul_quantize_row_q8_1_fake(
-            X: torch.Tensor,
-        ) -> torch.Tensor:
-            padded = (X.shape[1] // 2 + 511) // 512 * 512
-            return torch.empty(
-                (X.shape[0], padded // 32 * 9), dtype=torch.int32, device=X.device
-            )
-
-    if hasattr(torch.ops._C, "ggml_silu_and_mul_quantize_row_q8_1_out"):
-
-        @register_fake("_C::ggml_silu_and_mul_quantize_row_q8_1_out")
-        def _ggml_silu_and_mul_quantize_row_q8_1_out_fake(
-            X: torch.Tensor,
-            quant_X: torch.Tensor,
-        ) -> None:
-            return None
-
-    if hasattr(torch.ops._C, "ggml_sigmoid_and_mul_quantize_row_q8_1"):
-
-        @register_fake("_C::ggml_sigmoid_and_mul_quantize_row_q8_1")
-        def _ggml_sigmoid_and_mul_quantize_row_q8_1_fake(
-            X: torch.Tensor,
-            gate: torch.Tensor,
-        ) -> torch.Tensor:
-            padded = (X.shape[1] + 511) // 512 * 512
-            return torch.empty(
-                (X.shape[0], padded // 32 * 9), dtype=torch.int32, device=X.device
-            )
-
-    if hasattr(torch.ops._C, "ggml_sigmoid_and_mul_quantize_row_q8_1_out"):
-
-        @register_fake("_C::ggml_sigmoid_and_mul_quantize_row_q8_1_out")
-        def _ggml_sigmoid_and_mul_quantize_row_q8_1_out_fake(
-            X: torch.Tensor,
-            gate: torch.Tensor,
-            quant_X: torch.Tensor,
-        ) -> None:
-            return None
-
-    if hasattr(torch.ops._C, "ggml_rms_norm_gated_quantize_row_q8_1"):
-
-        @register_fake("_C::ggml_rms_norm_gated_quantize_row_q8_1")
-        def _ggml_rms_norm_gated_quantize_row_q8_1_fake(
-            X: torch.Tensor,
-            weight: torch.Tensor,
-            gate: torch.Tensor,
-            epsilon: float,
-            norm_before_gate: bool,
-        ) -> torch.Tensor:
-            padded = (X.shape[1] * X.shape[2] + 511) // 512 * 512
-            return torch.empty(
-                (X.shape[0], padded // 32 * 9), dtype=torch.int32, device=X.device
-            )
-
-    if hasattr(torch.ops._C, "ggml_rms_norm_gated_quantize_row_q8_1_out"):
-
-        @register_fake("_C::ggml_rms_norm_gated_quantize_row_q8_1_out")
-        def _ggml_rms_norm_gated_quantize_row_q8_1_out_fake(
-            X: torch.Tensor,
-            weight: torch.Tensor,
-            gate: torch.Tensor,
-            quant_X: torch.Tensor,
-            epsilon: float,
-            norm_before_gate: bool,
-        ) -> None:
-            return None
-
-    @register_fake("_C::ggml_mul_mat_vec_q8")
-    def _ggml_mul_mat_vec_q8_fake(
-        W: torch.Tensor,
-        quant_X: torch.Tensor,
-        quant_type: int,
-        row: torch.SymInt,
-        col: torch.SymInt,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return torch.empty((quant_X.shape[0], row), dtype=dtype, device=W.device)
-
-    if hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_0_fast"):
-
-        @register_fake("_C::ggml_mul_mat_vec_q8_0_fast")
-        def _ggml_mul_mat_vec_q8_0_fast_fake(
-            W: torch.Tensor,
-            quant_X: torch.Tensor,
-            row: torch.SymInt,
-            col: torch.SymInt,
-            dtype: torch.dtype,
-        ) -> torch.Tensor:
-            return torch.empty((quant_X.shape[0], row), dtype=dtype, device=W.device)
-
-    @register_fake("_C::ggml_mul_mat_vec_q8_sharded")
-    def _ggml_mul_mat_vec_q8_sharded_fake(
-        W: list[torch.Tensor],
-        quant_X: torch.Tensor,
-        quant_types: list[int],
-        col: torch.SymInt,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (quant_X.shape[0], sum(w.shape[0] for w in W)),
-            dtype=dtype,
-            device=W[0].device,
-        )
-
-    @register_fake("_C::ggml_mul_mat_vec_q8_grouped_same_type")
-    def _ggml_mul_mat_vec_q8_grouped_same_type_fake(
-        W: list[torch.Tensor],
-        quant_X: torch.Tensor,
-        quant_type: int,
-        col: torch.SymInt,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (quant_X.shape[0], sum(w.shape[0] for w in W)),
-            dtype=dtype,
-            device=W[0].device,
-        )
-
-    if hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_qkv3"):
-
-        @register_fake("_C::ggml_mul_mat_vec_q8_qkv3")
-        def _ggml_mul_mat_vec_q8_qkv3_fake(
-            W0: torch.Tensor,
-            W1: torch.Tensor,
-            W2: torch.Tensor,
-            quant_X: torch.Tensor,
-            type01: int,
-            col: torch.SymInt,
-            dtype: torch.dtype,
-        ) -> torch.Tensor:
-            return torch.empty(
-                (quant_X.shape[0], W0.shape[0] + W1.shape[0] + W2.shape[0]),
-                dtype=dtype,
-                device=W0.device,
-            )
-
-    @register_fake("_C::ggml_mul_mat_a8")
-    def _ggml_mul_mat_a8_fake(
-        W: torch.Tensor,
-        X: torch.Tensor,
-        quant_type: int,
-        row: torch.SymInt,
-    ) -> torch.Tensor:
-        batch = X.size(0)
-        return torch.empty((batch, row), dtype=X.dtype, device=W.device)
-
-    @register_fake("_C::ggml_moe_a8")
-    def _ggml_moe_a8_fake(
-        X: torch.Tensor,
-        W: torch.Tensor,
-        sorted_token_ids: torch.Tensor,
-        expert_ids: torch.Tensor,
-        num_tokens_post_padded: torch.Tensor,
-        quant_type: int,
-        row: torch.SymInt,
-        top_k: torch.SymInt,
-        tokens: torch.SymInt,
-    ) -> torch.Tensor:
-        tokens = X.size(0)
-        return torch.empty((tokens * top_k, row), dtype=torch.float16, device=W.device)
-
 
 def moe_gptq_gemm_rdna3(
     a: torch.Tensor,
@@ -1118,94 +732,6 @@ def moe_gptq_gemm_rdna3(
         mul_topk_weight,
         output_topk,
     )
-
-    if hasattr(torch.ops._C, "ggml_moe_a8_vec_out"):
-
-        @register_fake("_C::ggml_moe_a8_vec_out")
-        def _ggml_moe_a8_vec_out_fake(
-            X: torch.Tensor,
-            W: torch.Tensor,
-            topk_ids: torch.Tensor,
-            output: torch.Tensor,
-            quant_X: torch.Tensor,
-            top_k: int,
-            quant_type: int,
-            row: torch.SymInt,
-            tokens: torch.SymInt,
-        ) -> None:
-            return None
-
-    if hasattr(torch.ops._C, "ggml_moe_q8_vec"):
-
-        @register_fake("_C::ggml_moe_q8_vec")
-        def _ggml_moe_q8_vec_fake(
-            quant_X: torch.Tensor,
-            W: torch.Tensor,
-            topk_ids: torch.Tensor,
-            top_k: int,
-            quant_type: int,
-            row: torch.SymInt,
-            tokens: torch.SymInt,
-            col: torch.SymInt,
-            dtype: torch.dtype,
-        ) -> torch.Tensor:
-            return torch.empty((tokens * top_k, row), dtype=dtype, device=W.device)
-
-    if hasattr(torch.ops._C, "ggml_moe_q8_vec_weighted_sum"):
-
-        @register_fake("_C::ggml_moe_q8_vec_weighted_sum")
-        def _ggml_moe_q8_vec_weighted_sum_fake(
-            quant_X: torch.Tensor,
-            W: torch.Tensor,
-            topk_ids: torch.Tensor,
-            topk_weights: torch.Tensor,
-            top_k: int,
-            quant_type: int,
-            row: torch.SymInt,
-            tokens: torch.SymInt,
-            col: torch.SymInt,
-            dtype: torch.dtype,
-        ) -> torch.Tensor:
-            return torch.empty((tokens, row), dtype=dtype, device=W.device)
-
-    if hasattr(torch.ops._C, "ggml_moe_q8_vec_weighted_sum_out"):
-
-        @register_fake("_C::ggml_moe_q8_vec_weighted_sum_out")
-        def _ggml_moe_q8_vec_weighted_sum_out_fake(
-            quant_X: torch.Tensor,
-            W: torch.Tensor,
-            topk_ids: torch.Tensor,
-            topk_weights: torch.Tensor,
-            output: torch.Tensor,
-            top_k: int,
-            quant_type: int,
-            row: torch.SymInt,
-            tokens: torch.SymInt,
-            col: torch.SymInt,
-        ) -> None:
-            return None
-
-    if hasattr(torch.ops._C, "ggml_moe_a8_vec_silu_q8_weighted_sum_out"):
-
-        @register_fake("_C::ggml_moe_a8_vec_silu_q8_weighted_sum_out")
-        def _ggml_moe_a8_vec_silu_q8_weighted_sum_out_fake(
-            X: torch.Tensor,
-            W1: torch.Tensor,
-            W2: torch.Tensor,
-            topk_ids: torch.Tensor,
-            topk_weights: torch.Tensor,
-            w1_output: torch.Tensor,
-            quant_X: torch.Tensor,
-            quant_w1_output: torch.Tensor,
-            output: torch.Tensor,
-            top_k: int,
-            w1_type: int,
-            w2_type: int,
-            w1_row: torch.SymInt,
-            w2_row: torch.SymInt,
-            tokens: torch.SymInt,
-        ) -> None:
-            return None
 
 
 # cutlass
@@ -2425,793 +1951,6 @@ def scaled_int8_quant(
     return output, input_scales, input_azp
 
 
-# gguf
-def ggml_dequantize(
-    W: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype | None
-) -> torch.Tensor:
-    return torch.ops._C.ggml_dequantize(W, quant_type, m, n, dtype)
-
-
-def ggml_repack_iq4_xs_to_q8_0(
-    W: torch.Tensor,
-    row: int,
-    col: int,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_repack_iq4_xs_to_q8_0(W, row, col)
-
-
-def ggml_mul_mat_vec_a8(
-    W: torch.Tensor,
-    X: torch.Tensor,
-    quant_type: int,
-    row: int,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_a8(W, X, quant_type, row)
-
-
-def ggml_quantize_row_q8_1(X: torch.Tensor) -> torch.Tensor:
-    return torch.ops._C.ggml_quantize_row_q8_1(X)
-
-
-def ggml_quantize_row_q8_1_out(
-    X: torch.Tensor,
-    quant_X: torch.Tensor,
-) -> None:
-    torch.ops._C.ggml_quantize_row_q8_1_out(X, quant_X)
-
-
-def ggml_silu_and_mul_quantize_row_q8_1(X: torch.Tensor) -> torch.Tensor:
-    return torch.ops._C.ggml_silu_and_mul_quantize_row_q8_1(X)
-
-
-def ggml_silu_and_mul_quantize_row_q8_1_out(
-    X: torch.Tensor,
-    quant_X: torch.Tensor,
-) -> None:
-    torch.ops._C.ggml_silu_and_mul_quantize_row_q8_1_out(X, quant_X)
-
-
-def ggml_sigmoid_and_mul_quantize_row_q8_1(
-    X: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_sigmoid_and_mul_quantize_row_q8_1(X, gate)
-
-
-def ggml_sigmoid_and_mul_quantize_row_q8_1_out(
-    X: torch.Tensor,
-    gate: torch.Tensor,
-    quant_X: torch.Tensor,
-) -> None:
-    torch.ops._C.ggml_sigmoid_and_mul_quantize_row_q8_1_out(X, gate, quant_X)
-
-
-def ggml_rms_norm_gated_quantize_row_q8_1(
-    X: torch.Tensor,
-    weight: torch.Tensor,
-    gate: torch.Tensor,
-    epsilon: float,
-    norm_before_gate: bool,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_rms_norm_gated_quantize_row_q8_1(
-        X, weight, gate, epsilon, norm_before_gate
-    )
-
-
-def ggml_rms_norm_gated_quantize_row_q8_1_out(
-    X: torch.Tensor,
-    weight: torch.Tensor,
-    gate: torch.Tensor,
-    quant_X: torch.Tensor,
-    epsilon: float,
-    norm_before_gate: bool,
-) -> None:
-    torch.ops._C.ggml_rms_norm_gated_quantize_row_q8_1_out(
-        X, weight, gate, quant_X, epsilon, norm_before_gate
-    )
-
-
-def ggml_mul_mat_vec_q8(
-    W: torch.Tensor,
-    quant_X: torch.Tensor,
-    quant_type: int,
-    row: int,
-    col: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_q8(W, quant_X, quant_type, row, col, dtype)
-
-
-def ggml_mul_mat_vec_q8_out(
-    W: torch.Tensor,
-    quant_X: torch.Tensor,
-    Y: torch.Tensor,
-    quant_type: int,
-    row: int,
-    col: int,
-) -> None:
-    torch.ops._C.ggml_mul_mat_vec_q8_out(W, quant_X, Y, quant_type, row, col)
-
-
-def ggml_mul_mat_vec_q8_0_fast(
-    W: torch.Tensor,
-    quant_X: torch.Tensor,
-    row: int,
-    col: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_q8_0_fast(W, quant_X, row, col, dtype)
-
-
-def ggml_mul_mat_vec_a8_sharded(
-    W: list[torch.Tensor],
-    X: torch.Tensor,
-    quant_types: list[int],
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_a8_sharded(W, X, quant_types)
-
-
-def ggml_mul_mat_vec_q8_sharded(
-    W: list[torch.Tensor],
-    quant_X: torch.Tensor,
-    quant_types: list[int],
-    col: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_q8_sharded(
-        W, quant_X, quant_types, col, dtype
-    )
-
-
-def ggml_mul_mat_vec_q8_sharded_out(
-    W: list[torch.Tensor],
-    quant_X: torch.Tensor,
-    Y: torch.Tensor,
-    quant_types: list[int],
-    col: int,
-) -> None:
-    torch.ops._C.ggml_mul_mat_vec_q8_sharded_out(W, quant_X, Y, quant_types, col)
-
-
-def ggml_mul_mat_vec_q8_grouped_same_type(
-    W: list[torch.Tensor],
-    quant_X: torch.Tensor,
-    quant_type: int,
-    col: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_q8_grouped_same_type(
-        W, quant_X, quant_type, col, dtype
-    )
-
-
-def ggml_mul_mat_vec_q8_grouped_same_type_out(
-    W: list[torch.Tensor],
-    quant_X: torch.Tensor,
-    Y: torch.Tensor,
-    quant_type: int,
-    col: int,
-) -> None:
-    torch.ops._C.ggml_mul_mat_vec_q8_grouped_same_type_out(
-        W, quant_X, Y, quant_type, col
-    )
-
-
-def ggml_mul_mat_vec_q8_qkv3(
-    W0: torch.Tensor,
-    W1: torch.Tensor,
-    W2: torch.Tensor,
-    quant_X: torch.Tensor,
-    type01: int,
-    col: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_vec_q8_qkv3(
-        W0, W1, W2, quant_X, type01, col, dtype
-    )
-
-
-def ggml_mul_mat_a8(
-    W: torch.Tensor,
-    X: torch.Tensor,
-    quant_type: int,
-    row: int,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_mul_mat_a8(W, X, quant_type, row)
-
-
-def ggml_moe_a8(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    quant_type: int,
-    row: int,
-    top_k: int,
-    tokens: int,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_a8(
-        X,
-        W,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        quant_type,
-        row,
-        top_k,
-        tokens,
-    )
-
-
-def ggml_moe_a8_vec(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int,
-    quant_type: int,
-    row: torch.SymInt,
-    tokens: torch.SymInt,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_a8_vec(X, W, topk_ids, top_k, quant_type, row, tokens)
-
-
-def ggml_moe_a8_vec_out(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    topk_ids: torch.Tensor,
-    output: torch.Tensor,
-    quant_X: torch.Tensor,
-    top_k: int,
-    quant_type: int,
-    row: torch.SymInt,
-    tokens: torch.SymInt,
-) -> None:
-    torch.ops._C.ggml_moe_a8_vec_out(
-        X, W, topk_ids, output, quant_X, top_k, quant_type, row, tokens
-    )
-
-
-def ggml_moe_q8_vec(
-    quant_X: torch.Tensor,
-    W: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int,
-    quant_type: int,
-    row: torch.SymInt,
-    tokens: torch.SymInt,
-    col: torch.SymInt,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_q8_vec(
-        quant_X, W, topk_ids, top_k, quant_type, row, tokens, col, dtype
-    )
-
-
-def ggml_moe_q8_vec_weighted_sum(
-    quant_X: torch.Tensor,
-    W: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    top_k: int,
-    quant_type: int,
-    row: torch.SymInt,
-    tokens: torch.SymInt,
-    col: torch.SymInt,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_q8_vec_weighted_sum(
-        quant_X,
-        W,
-        topk_ids,
-        topk_weights,
-        top_k,
-        quant_type,
-        row,
-        tokens,
-        col,
-        dtype,
-    )
-
-
-def ggml_moe_q8_vec_weighted_sum_out(
-    quant_X: torch.Tensor,
-    W: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    output: torch.Tensor,
-    top_k: int,
-    quant_type: int,
-    row: torch.SymInt,
-    tokens: torch.SymInt,
-    col: torch.SymInt,
-) -> None:
-    torch.ops._C.ggml_moe_q8_vec_weighted_sum_out(
-        quant_X,
-        W,
-        topk_ids,
-        topk_weights,
-        output,
-        top_k,
-        quant_type,
-        row,
-        tokens,
-        col,
-    )
-
-
-def ggml_moe_a8_vec_silu_q8_weighted_sum_out(
-    X: torch.Tensor,
-    W1: torch.Tensor,
-    W2: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    w1_output: torch.Tensor,
-    quant_X: torch.Tensor,
-    quant_w1_output: torch.Tensor,
-    output: torch.Tensor,
-    top_k: int,
-    w1_type: int,
-    w2_type: int,
-    w1_row: torch.SymInt,
-    w2_row: torch.SymInt,
-    tokens: torch.SymInt,
-) -> None:
-    torch.ops._C.ggml_moe_a8_vec_silu_q8_weighted_sum_out(
-        X,
-        W1,
-        W2,
-        topk_ids,
-        topk_weights,
-        w1_output,
-        quant_X,
-        quant_w1_output,
-        output,
-        top_k,
-        w1_type,
-        w2_type,
-        w1_row,
-        w2_row,
-        tokens,
-    )
-
-
-def ggml_moe_get_block_size(quant_type: int) -> int:
-    return torch.ops._C.ggml_moe_get_block_size(quant_type)
-
-
-if hasattr(torch.ops._C, "causal_conv1d_gfx906_decode_update"):
-
-    @register_fake("_C::causal_conv1d_gfx906_decode_update")
-    def _causal_conv1d_gfx906_decode_update_fake(
-        x: torch.Tensor,
-        conv_state: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-        conv_state_indices: torch.Tensor | None,
-        pad_slot_id: int,
-        silu_activation: bool,
-    ) -> torch.Tensor:
-        return torch.empty_like(x)
-
-
-if hasattr(torch.ops._C, "causal_conv1d_gfx906_mtp_update"):
-
-    @register_fake("_C::causal_conv1d_gfx906_mtp_update")
-    def _causal_conv1d_gfx906_mtp_update_fake(
-        x: torch.Tensor,
-        conv_state: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-        state_indices: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        pad_slot_id: int,
-        silu_activation: bool,
-    ) -> torch.Tensor:
-        return torch.empty_like(x)
-
-
-if hasattr(torch.ops._C, "fused_sigmoid_gating_delta_rule_gfx906_decode"):
-
-    @register_fake("_C::fused_sigmoid_gating_delta_rule_gfx906_decode")
-    def _fused_sigmoid_gating_delta_rule_gfx906_decode_fake(
-        A_log: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        dt_bias: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state: torch.Tensor,
-        beta: float,
-        threshold: float,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> torch.Tensor:
-        return torch.empty((1, q.size(1), v.size(2), v.size(3)),
-                           dtype=q.dtype,
-                           device=q.device)
-
-
-if hasattr(torch.ops._C, "fused_sigmoid_gating_delta_rule_gfx906_prefill"):
-
-    @register_fake("_C::fused_sigmoid_gating_delta_rule_gfx906_prefill")
-    def _fused_sigmoid_gating_delta_rule_gfx906_prefill_fake(
-        A_log: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        dt_bias: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        beta: float,
-        threshold: float,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> torch.Tensor:
-        return torch.empty((1, q.size(1), v.size(2), v.size(3)),
-                           dtype=q.dtype,
-                           device=q.device)
-
-
-if hasattr(torch.ops._C, "fused_sigmoid_gating_delta_rule_gfx906_indexed_decode"):
-
-    @register_fake("_C::fused_sigmoid_gating_delta_rule_gfx906_indexed_decode")
-    def _fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_fake(
-        A_log: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        dt_bias: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state: torch.Tensor,
-        state_indices: torch.Tensor,
-        beta: float,
-        threshold: float,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> torch.Tensor:
-        return torch.empty((1, q.size(1), v.size(2), v.size(3)),
-                           dtype=q.dtype,
-                           device=q.device)
-
-
-if hasattr(torch.ops._C,
-           "fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state"):
-
-    @register_fake(
-        "_C::fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state")
-    def _fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state_fake(
-        A_log: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        dt_bias: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state: torch.Tensor,
-        state_indices: torch.Tensor,
-        beta: float,
-        threshold: float,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> torch.Tensor:
-        return torch.empty((1, q.size(1), v.size(2), v.size(3)),
-                           dtype=q.dtype,
-                           device=q.device)
-
-
-if hasattr(torch.ops._C,
-           "fused_sigmoid_gating_delta_rule_gfx906_mtp_update"):
-
-    @register_fake("_C::fused_sigmoid_gating_delta_rule_gfx906_mtp_update")
-    def _fused_sigmoid_gating_delta_rule_gfx906_mtp_update_fake(
-        A_log: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        dt_bias: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state: torch.Tensor,
-        state_indices: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        beta: float,
-        threshold: float,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> torch.Tensor:
-        return torch.empty((q.size(1), v.size(2), v.size(3)),
-                           dtype=q.dtype,
-                           device=q.device)
-
-
-if hasattr(torch.ops._C, "fused_recurrent_gated_delta_rule_gfx906_packed_decode"):
-
-    @register_fake("_C::fused_recurrent_gated_delta_rule_gfx906_packed_decode")
-    def _fused_recurrent_gated_delta_rule_gfx906_packed_decode_fake(
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        state: torch.Tensor,
-        out: torch.Tensor,
-        state_indices: torch.Tensor,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-        use_tiled_qk_head_mapping: bool,
-        use_transposed_state: bool,
-    ) -> torch.Tensor:
-        return torch.empty_like(out)
-
-
-if hasattr(torch.ops._C,
-           "causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode"):
-
-    @register_fake(
-        "_C::causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode")
-    def _causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode_fake(
-        mixed_qkv: torch.Tensor,
-        conv_state: torch.Tensor,
-        conv_weight: torch.Tensor,
-        conv_bias: torch.Tensor | None,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        state: torch.Tensor,
-        out: torch.Tensor,
-        state_indices: torch.Tensor,
-        pad_slot_id: int,
-        scale: float,
-        silu_activation: bool,
-        use_qk_l2norm_in_kernel: bool,
-        use_tiled_qk_head_mapping: bool,
-        use_transposed_state: bool,
-    ) -> torch.Tensor:
-        return torch.empty_like(out)
-
-
-if hasattr(
-        torch.ops._C,
-        "causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode"):
-
-    @register_fake(
-        "_C::causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode")
-    def _causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode_fake(
-        mixed_qkv: torch.Tensor,
-        conv_state: torch.Tensor,
-        conv_weight: torch.Tensor,
-        conv_bias: torch.Tensor | None,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        state: torch.Tensor,
-        out: torch.Tensor,
-        state_indices: torch.Tensor,
-        pad_slot_id: int,
-        scale: float,
-        silu_activation: bool,
-        use_qk_l2norm_in_kernel: bool,
-        use_tiled_qk_head_mapping: bool,
-        use_transposed_state: bool,
-    ) -> torch.Tensor:
-        return torch.empty_like(out)
-
-
-def causal_conv1d_gfx906_decode_update(
-    x: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    conv_state_indices: torch.Tensor | None,
-    pad_slot_id: int,
-    silu_activation: bool,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_gfx906_decode_update(
-        x, conv_state, weight, bias, conv_state_indices, pad_slot_id,
-        silu_activation)
-
-
-def causal_conv1d_gfx906_mtp_update(
-    x: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    state_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    pad_slot_id: int,
-    silu_activation: bool,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_gfx906_mtp_update(
-        x, conv_state, weight, bias, state_indices, cu_seqlens,
-        num_accepted_tokens, pad_slot_id, silu_activation)
-
-
-def fused_sigmoid_gating_delta_rule_gfx906_decode(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    state: torch.Tensor,
-    beta: float,
-    threshold: float,
-    scale: float,
-    use_qk_l2norm_in_kernel: bool,
-) -> torch.Tensor:
-    return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_decode(
-        A_log, a, b, dt_bias, q, k, v, state, beta, threshold, scale,
-        use_qk_l2norm_in_kernel)
-
-
-def fused_sigmoid_gating_delta_rule_gfx906_prefill(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    beta: float,
-    threshold: float,
-    scale: float,
-    use_qk_l2norm_in_kernel: bool,
-) -> torch.Tensor:
-    return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_prefill(
-        A_log, a, b, dt_bias, q, k, v, state, cu_seqlens, beta, threshold,
-        scale, use_qk_l2norm_in_kernel)
-
-
-def fused_sigmoid_gating_delta_rule_gfx906_indexed_decode(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    state: torch.Tensor,
-    state_indices: torch.Tensor,
-    beta: float,
-    threshold: float,
-    scale: float,
-    use_qk_l2norm_in_kernel: bool,
-) -> torch.Tensor:
-    return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_indexed_decode(
-        A_log, a, b, dt_bias, q, k, v, state, state_indices, beta, threshold,
-        scale, use_qk_l2norm_in_kernel)
-
-
-def fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    state: torch.Tensor,
-    state_indices: torch.Tensor,
-    beta: float,
-    threshold: float,
-    scale: float,
-    use_qk_l2norm_in_kernel: bool,
-) -> torch.Tensor:
-    return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
-        A_log, a, b, dt_bias, q, k, v, state, state_indices, beta, threshold,
-        scale, use_qk_l2norm_in_kernel)
-
-
-def fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    state: torch.Tensor,
-    state_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-    scale: float | None = None,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> torch.Tensor:
-    if scale is None:
-        scale = k.size(-1)**-0.5
-    return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
-        A_log, a, b, dt_bias, q, k, v, state, state_indices, cu_seqlens,
-        num_accepted_tokens, beta, threshold, scale,
-        use_qk_l2norm_in_kernel)
-
-
-def fused_recurrent_gated_delta_rule_gfx906_packed_decode(
-    mixed_qkv: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    state: torch.Tensor,
-    out: torch.Tensor,
-    state_indices: torch.Tensor,
-    scale: float,
-    use_qk_l2norm_in_kernel: bool,
-    use_tiled_qk_head_mapping: bool,
-    use_transposed_state: bool,
-) -> torch.Tensor:
-    return torch.ops._C.fused_recurrent_gated_delta_rule_gfx906_packed_decode(
-        mixed_qkv, a, b, A_log, dt_bias, state, out, state_indices, scale,
-        use_qk_l2norm_in_kernel, use_tiled_qk_head_mapping,
-        use_transposed_state)
-
-
-def causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode(
-    mixed_qkv: torch.Tensor,
-    conv_state: torch.Tensor,
-    conv_weight: torch.Tensor,
-    conv_bias: torch.Tensor | None,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    state: torch.Tensor,
-    out: torch.Tensor,
-    state_indices: torch.Tensor,
-    pad_slot_id: int,
-    scale: float,
-    silu_activation: bool,
-    use_qk_l2norm_in_kernel: bool,
-    use_tiled_qk_head_mapping: bool,
-    use_transposed_state: bool,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode(
-        mixed_qkv, conv_state, conv_weight, conv_bias, a, b, A_log, dt_bias,
-        state, out, state_indices, pad_slot_id, scale, silu_activation,
-        use_qk_l2norm_in_kernel, use_tiled_qk_head_mapping,
-        use_transposed_state)
-
-
-def causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode(
-    mixed_qkv: torch.Tensor,
-    conv_state: torch.Tensor,
-    conv_weight: torch.Tensor,
-    conv_bias: torch.Tensor | None,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    state: torch.Tensor,
-    out: torch.Tensor,
-    state_indices: torch.Tensor,
-    pad_slot_id: int,
-    scale: float,
-    silu_activation: bool,
-    use_qk_l2norm_in_kernel: bool,
-    use_tiled_qk_head_mapping: bool,
-    use_transposed_state: bool,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode(
-        mixed_qkv, conv_state, conv_weight, conv_bias, a, b, A_log, dt_bias,
-        state, out, state_indices, pad_slot_id, scale, silu_activation,
-        use_qk_l2norm_in_kernel, use_tiled_qk_head_mapping,
-        use_transposed_state)
-
-
 # mamba
 def selective_scan_fwd(
     u: torch.Tensor,
@@ -3423,14 +2162,6 @@ def moe_sum(
     torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
 
 
-def moe_weighted_sum(
-    input: torch.Tensor,
-    weights: torch.Tensor,
-    output: torch.Tensor,
-):
-    torch.ops._moe_C.moe_weighted_sum(input, weights, output)
-
-
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -3462,6 +2193,32 @@ def moe_align_block_size(
         experts_ids,
         num_tokens_post_pad,
         expert_map,
+        scatter_idx,
+    )
+
+
+def fused_globalize_align_block_size(
+    topk_idx: torch.Tensor,
+    psum: torch.Tensor,
+    rank_expert_offset: int,
+    global_num_experts: int,
+    local_num_experts: int,
+    block_size: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    scatter_idx: torch.Tensor | None = None,
+) -> None:
+    torch.ops._moe_C.fused_globalize_align_block_size(
+        topk_idx,
+        psum,
+        rank_expert_offset,
+        global_num_experts,
+        local_num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
         scatter_idx,
     )
 
@@ -3532,9 +2289,9 @@ def moe_wna16_gemm(
     BLOCK_SIZE_K: int,
     bit: int,
 ) -> torch.Tensor:
-    if not current_platform.is_cuda_alike():
+    if not current_platform.is_cuda():
         raise NotImplementedError(
-            "The optimized moe_wna16_gemm kernel is only available on CUDA or ROCm platforms"
+            "The optimized moe_wna16_gemm kernel is only available on CUDA platforms"
         )
     torch.ops._moe_C.moe_wna16_gemm(
         input,
@@ -3799,6 +2556,7 @@ def reshape_and_cache(
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    interleaved_v: bool = False,
 ) -> None:
     torch.ops._C_cache_ops.reshape_and_cache(
         key,
@@ -3809,6 +2567,7 @@ def reshape_and_cache(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        interleaved_v,
     )
 
 
@@ -3858,6 +2617,8 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     skip_index_branch: bool = False,
     q_fp8_out: torch.Tensor | None = None,
     q_fp8_scale: float = 1.0,
+    kv_k_scale: torch.Tensor | None = None,
+    kv_v_scale: torch.Tensor | None = None,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -3881,7 +2642,14 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     attention's flat TMA descriptor.
 
     If ``q_fp8_out`` is given, the same normalized q is also written in FP8
-    E4M3 using ``q_fp8_scale`` as its dequantization scale.
+    E4M3 using ``q_fp8_scale`` as its dequantization scale. Without ``q_out``,
+    q is then written only in FP8 and the q slice of ``qkv`` is left as is.
+
+    ``kv_cache_dtype="nvfp4"`` quantizes k/v into the packed HND
+    ``[num_blocks, 2 * num_kv_heads, block_size, 72]`` uint8 cache using the
+    device dequantization scales ``kv_k_scale``/``kv_v_scale``. Slot
+    ``2 * head + side`` (K = 0, V = 1) holds that head's E2M1 data followed by
+    its E4M3 block scales, so every head is one contiguous run of the page.
 
     When ``skip_index_branch`` is true, sparse rows still keep their packed
     ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
@@ -3912,6 +2680,8 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         skip_index_branch,
         q_fp8_out,
         q_fp8_scale,
+        kv_k_scale,
+        kv_v_scale,
     )
 
 
@@ -4430,6 +3200,26 @@ def mnnvl_lamport_reduce_scatter(
     )
 
 
+def mnnvl_multimem_reduce_scatter(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    local_buffer: int,
+    multicast_buffer: int,
+    stage_sz_bytes: int,
+    block_limit: int,
+) -> None:
+    torch.ops._C_custom_ar.mnnvl_multimem_reduce_scatter(
+        fa,
+        inp,
+        out,
+        local_buffer,
+        multicast_buffer,
+        stage_sz_bytes,
+        block_limit,
+    )
+
+
 def dispose(fa: int) -> None:
     torch.ops._C_custom_ar.dispose(fa)
 
@@ -4917,7 +3707,7 @@ def causal_conv1d_fwd_cpu(
     cache_indices: torch.Tensor | None,
     has_initial_state: torch.Tensor | None,
     silu_activation: bool,
-    is_vnni: bool,
+    is_weight_packed: bool,
 ) -> torch.Tensor:
     return torch.ops._C.causal_conv1d_fwd_cpu(
         x,
@@ -4929,7 +3719,7 @@ def causal_conv1d_fwd_cpu(
         has_initial_state,
         silu_activation,
         -1,
-        is_vnni,
+        is_weight_packed,
     )
 
 
@@ -4940,7 +3730,7 @@ def causal_conv1d_update_cpu(
     bias: torch.Tensor | None,
     silu_activation: bool,
     conv_state_indices: torch.Tensor | None,
-    is_vnni: bool,
+    is_weight_packed: bool,
     num_accepted_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._C.causal_conv1d_update_cpu(
@@ -4952,7 +3742,7 @@ def causal_conv1d_update_cpu(
         num_accepted_tokens,
         conv_state_indices,
         -1,
-        is_vnni,
+        is_weight_packed,
     )
 
 
@@ -5685,23 +4475,22 @@ def cpu_gemm_wna16(
     pack_factor: int,
     isa_hint: str,
 ) -> torch.Tensor:
-    output = torch.empty((input.size(0), scales.size(1)), dtype=input.dtype)
+    # Match int4_scaled_mm_cpu: flatten >2-D activations to [M, K] for the
+    # C++ kernel, then restore the original leading dims on the output.
+    x_shape = input.shape
+    x_2d = input.reshape(-1, x_shape[-1]) if len(x_shape) > 2 else input
+    out = torch.empty((x_2d.size(0), scales.size(1)), dtype=input.dtype)
     torch.ops._C.cpu_gemm_wna16(
-        input,
+        x_2d,
         q_weight,
-        output,
+        out,
         scales,
         zeros,
         bias,
         pack_factor,
         isa_hint,
     )
-    return output
-
-
-def cpu_activation_lut_bf16(input: torch.Tensor, activation: str) -> torch.Tensor:
-    out = torch.empty_like(input)
-    torch.ops._C.activation_lut_bf16(out, input, activation)
+    out = out.reshape(x_shape[:-1] + (out.size(-1),)) if len(x_shape) > 2 else out
     return out
 
 

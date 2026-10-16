@@ -11,7 +11,6 @@ import os
 
 import torch
 
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -67,13 +66,18 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    i_t = tl.program_id(0).to(tl.int64)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_t = o_t < T
+    m_x = m_t[:, None] & (o_d[None, :] < D)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 @triton.jit
@@ -111,23 +115,6 @@ def l2norm_fwd(
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
     if D > BD:
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
-
-    capability = current_platform.get_device_capability()
-    if (
-        current_platform.is_rocm()
-        and capability is not None
-        and capability.major == 9
-        and capability.minor == 0
-    ):
-        x_float = x.float()
-        y = x_float * torch.rsqrt(
-            torch.sum(x_float * x_float, dim=-1, keepdim=True) + eps
-        )
-        if output_dtype is not None:
-            y = y.to(output_dtype)
-        else:
-            y = y.to(x.dtype)
-        return y.view(x_shape_og)
 
     if not USE_DEFAULT_FLA_NORM:
         MBLOCK = 32

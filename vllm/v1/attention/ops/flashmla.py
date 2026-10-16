@@ -50,10 +50,6 @@ def _is_flashmla_available() -> tuple[bool, str | None]:
 
 def is_flashmla_dense_supported() -> tuple[bool, str | None]:
     """Return: is_supported_flag, unsupported_reason (optional)."""
-    # Disable on ROCm: gfx906 has no FlashMLA support (requires CUDA SM90+).
-    if current_platform.is_rocm():
-        return False, "FlashMLA is not supported on ROCm (requires CUDA SM90+)"
-
     is_available, maybe_reason = _is_flashmla_available()
     if not is_available:
         return False, maybe_reason
