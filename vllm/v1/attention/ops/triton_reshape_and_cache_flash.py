@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-from functools import lru_cache
-
 import torch
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -18,65 +15,6 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 FP8_MIN, FP8_MAX = get_fp8_min_max()
 
 _NATIVE_KV_CACHE_DTYPES = {"auto", "float16", "bfloat16", "float32", "half", "float"}
-
-# gfx906 escape hatch: set VLLM_GFX906_TRITON_RESHAPE_CACHE=0 to route the
-# cache update through a PyTorch-eager fallback instead of the Triton kernel.
-ENABLE_GFX906_TRITON_RESHAPE_CACHE = os.getenv(
-    "VLLM_GFX906_TRITON_RESHAPE_CACHE", "1"
-).lower() in {"1", "true", "yes", "on"}
-
-
-@lru_cache(maxsize=1)
-def _is_gfx906_rocm() -> bool:
-    capability = current_platform.get_device_capability()
-    return (
-        current_platform.is_rocm()
-        and capability is not None
-        and capability.major == 9
-        and capability.minor == 0
-    )
-
-
-def _reshape_and_cache_flash_eager(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-) -> None:
-    fp8_kv_cache = kv_cache_dtype.startswith("fp8")
-    if key.shape[0] != slot_mapping.shape[0]:
-        key = key[: slot_mapping.shape[0]]
-        value = value[: slot_mapping.shape[0]]
-
-    valid_mask = slot_mapping >= 0
-    valid_slots = slot_mapping.clamp_min(0).to(torch.long)
-    src_key = key
-    src_value = value
-
-    if fp8_kv_cache:
-        src_key = (src_key / k_scale).to(key_cache.dtype)
-        src_value = (src_value / v_scale).to(value_cache.dtype)
-
-    block_size = key_cache.shape[1]
-    block_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
-    block_offset = valid_slots.remainder(block_size)
-    cached_key = key_cache[block_idx, block_offset]
-    cached_value = value_cache[block_idx, block_offset]
-    valid_mask = valid_mask.view(valid_mask.shape[0], 1, 1)
-    key_cache[block_idx, block_offset] = torch.where(
-        valid_mask,
-        src_key.to(key_cache.dtype),
-        cached_key,
-    )
-    value_cache[block_idx, block_offset] = torch.where(
-        valid_mask,
-        src_value.to(value_cache.dtype),
-        cached_value,
-    )
 
 
 def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
@@ -114,6 +52,9 @@ def reshape_and_cache_kernel_flash(
     block_size: tl.constexpr,
     x: tl.constexpr,
     USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
+    # >0 writes V interleaved as [Block, Head, Slot//kx, Dim, kx] (head-major
+    # layout only); 0 keeps the standard [Block, Head, Dim, Slot] V layout.
+    INTERLEAVED_V_PACK_FACTOR: tl.constexpr,
     # FP8 flags
     FP8_KV_CACHE: tl.constexpr,
     # tune parameters
@@ -138,13 +79,25 @@ def reshape_and_cache_kernel_flash(
         # Decompose the tile index back into head and dim coordinates.
         cur_head = tile_pos // head_size
         cur_dim = tile_pos % head_size
-        # Value addressing (4D): [Block, Head, Dim, Slot]
-        tgt_idx_v = (
-            block_idx * block_stride
-            + cur_head * head_stride
-            + cur_dim * dim_stride_v
-            + block_offset * 1
-        )
+        # Value addressing: standard 4D [Block, Head, Dim, Slot], or the
+        # interleaved 5D [Block, Head, Slot//kx, Dim, kx] the fused AITER
+        # writer emits and the interleaved read path expects.
+        if INTERLEAVED_V_PACK_FACTOR > 0:
+            tgt_idx_v = (
+                block_idx * block_stride
+                + cur_head * head_stride
+                + (block_offset // INTERLEAVED_V_PACK_FACTOR)
+                * (head_size * INTERLEAVED_V_PACK_FACTOR)
+                + cur_dim * INTERLEAVED_V_PACK_FACTOR
+                + (block_offset % INTERLEAVED_V_PACK_FACTOR)
+            )
+        else:
+            tgt_idx_v = (
+                block_idx * block_stride
+                + cur_head * head_stride
+                + cur_dim * dim_stride_v
+                + block_offset * 1
+            )
         # Key addressing (5D): [Block, Head, Dim//8, Slot, 8]
         tgt_idx_k = (
             block_idx * block_stride
@@ -433,11 +386,18 @@ def triton_reshape_and_cache_flash(
     kv_cache_dtype: str,  # "auto", "fp8"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
+    interleaved_v_pack_factor: int = 0,  # >0: interleave V (head-major); 0: standard
 ):
     num_heads = key.shape[1]
     head_size = key.shape[2]
 
     use_head_major_layout = key_cache.ndim == 5
+    if interleaved_v_pack_factor and not use_head_major_layout:
+        raise NotImplementedError(
+            "Interleaved V-cache write is only implemented for the head-major "
+            "(5D) cache layout; got a non-head-major cache with "
+            f"interleaved_v_pack_factor={interleaved_v_pack_factor}."
+        )
     if use_head_major_layout:
         block_size = key_cache.shape[3]
         x = key_cache.shape[4]
@@ -475,25 +435,6 @@ def triton_reshape_and_cache_flash(
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
-
-    # gfx906 eager fallback (opt-out escape hatch, off by default).
-    if (
-        _is_gfx906_rocm()
-        and not ENABLE_GFX906_TRITON_RESHAPE_CACHE
-        and key_cache.ndim == 4
-    ):
-        _reshape_and_cache_flash_eager(
-            key=key,
-            value=value,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            slot_mapping=slot_mapping,
-            kv_cache_dtype=kv_cache_dtype,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        return
-
     # heuristics instead of autotuning
     TILE_SIZE = min(2048, triton.next_power_of_2(n))
     if current_platform.is_rocm() or current_platform.is_xpu():
@@ -533,6 +474,7 @@ def triton_reshape_and_cache_flash(
         block_size=block_size,
         x=x,
         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
+        INTERLEAVED_V_PACK_FACTOR=interleaved_v_pack_factor,
         FP8_KV_CACHE=FP8_KV_CACHE,
         # autotune parameters
         TILE_SIZE=TILE_SIZE,

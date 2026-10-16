@@ -32,7 +32,6 @@ from vllm.model_executor.layers.fused_moe.utils import (
     warn_if_moe_use_td_ineffective,
 )
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import next_power_of_2
@@ -1098,9 +1097,6 @@ def get_config_file_name(
     # Set device_name to H200 if a device from the H200 family is detected
     if "H200" in device_name.split("_"):
         device_name = "NVIDIA_H200"
-    dtype_selector = "" if not dtype else f",dtype={dtype}"
-    block_shape_selector = ("" if not block_shape or not all(block_shape) else
-                            f",block_shape={block_shape}").replace(" ", "")
     gfx906_names = [
         "Instinct_MI50",
         "Instinct_MI60",
@@ -1111,6 +1107,10 @@ def get_config_file_name(
     ]
     if any(s in device_name for s in gfx906_names):
         device_name = "AMD_GFX906"
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    ).replace(" ", "")
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
 
 
@@ -1174,7 +1174,6 @@ def get_moe_configs(
         "Using default MoE config. Performance might be sub-optimal! "
         "Config file not found at %s",
         ", ".join(config_file_paths),
-        scope="local",
     )
     return None
 
@@ -1239,25 +1238,17 @@ def get_moe_wna16_block_config(
     if not use_moe_wna16_cuda:
         # triton moe wna16 kernel
         if num_valid_tokens // real_top_k == 1:
-            block_size_n = 32
-            block_size_k = 64
+            # if bs=1, use a smaller BLOCK_SIZE_N
+            return {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64}
         else:
-            block_size_n = 64
-            block_size_k = 32
-        while block_size_k > 16 and size_k % block_size_k != 0:
-            block_size_k //= 2
-        if size_k % block_size_k != 0:
-            block_size_k = 1 << (size_k.bit_length() - 1)
-            while block_size_k > size_k or size_k % block_size_k != 0:
-                block_size_k //= 2
-        return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
+            return {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}
     else:
         # cuda moe wna16 kernel
         # set default block_size 128, and increase them when num_blocks
         # is too large.
         block_size_n = 128
-        block_size_k = min(128, size_k)
-        if block_size_k <= group_size and group_size <= size_k:
+        block_size_k = 128
+        if block_size_k <= group_size:
             block_size_k = group_size
 
         num_n_blocks = size_k // block_size_k
@@ -1301,12 +1292,15 @@ def get_moe_wna16_block_config(
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
 
-def should_moe_wna16_use_cuda(num_valid_tokens: int, group_size: int,
-                              num_experts: int, bit: int):
-    if current_platform.is_rocm() and on_gfx906():
-        return bit in (4, 8) and group_size in [32, 64, 128]
-    return current_platform.is_cuda_alike() and bit in (4, 8) and \
-        group_size in [32, 64, 128] and num_valid_tokens / num_experts <= 6
+def should_moe_wna16_use_cuda(
+    num_valid_tokens: int, group_size: int, num_experts: int, bit: int
+):
+    return (
+        current_platform.is_cuda()
+        and bit == 4
+        and group_size in [32, 64, 128]
+        and num_valid_tokens / num_experts <= 6
+    )
 
 
 def get_default_config(

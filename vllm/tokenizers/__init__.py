@@ -11,7 +11,6 @@ from .registry import (
 )
 
 __all__ = [
-    "MistralTokenizer",
     "TokenizerLike",
     "TokenizerRegistry",
     "cached_get_tokenizer",
@@ -19,13 +18,3 @@ __all__ = [
     "cached_tokenizer_from_config",
     "maybe_make_thread_pool",
 ]
-
-
-def __getattr__(name: str):
-    # Lazy export: .mistral pulls in entrypoints.chat_utils, which circles
-    # back here through config.reasoning during package init.
-    if name == "MistralTokenizer":
-        from .mistral import MistralTokenizer
-
-        return MistralTokenizer
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

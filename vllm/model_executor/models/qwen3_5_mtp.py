@@ -2,17 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
-import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 
 import torch
 from torch import nn
+from transformers import Qwen3_5MoeTextConfig, Qwen3_5TextConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.utils import (
+    is_model_fused_shared_expert_compatible,
+)
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -23,49 +25,37 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_moe_expert_param_name,
 )
+from vllm.model_executor.models.interfaces import LocalArgmaxMixin
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
+    Qwen3_5Model,
     Qwen3_5RMSNorm,
     _make_qwen35_fused_expert_params_mapping,
     _maybe_unsqueeze_shared_expert_gate,
 )
-from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
+from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextSparseMoeBlock,
+    QwenNextMixtureOfExperts,
+)
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     _merge_multimodal_embeddings,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
+    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 
 logger = init_logger(__name__)
-
-
-def _maybe_convert_gguf_rms_norm_weight(
-    name: str,
-    weight: torch.Tensor,
-    modules: dict[str, nn.Module],
-    is_gguf: bool,
-) -> torch.Tensor:
-    if not is_gguf:
-        return weight
-
-    module_name, _, param_leaf = name.rpartition(".")
-    if param_leaf == "weight" and isinstance(
-        modules.get(module_name), Qwen3_5RMSNorm
-    ):
-        return weight - 1.0
-    return weight
 
 
 @support_torch_compile(
@@ -80,6 +70,8 @@ def _maybe_convert_gguf_rms_norm_weight(
     }
 )
 class Qwen3_5MultiTokenPredictor(nn.Module):
+    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -98,13 +90,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens",
         )
 
+        # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
+        # missing from hf_quant_config.json exclude_modules. Force unquantized.
+        # Ref: https://github.com/vllm-project/vllm/pull/38650
+        # Ref: https://github.com/NVIDIA/Model-Optimizer/pull/1124
         fc_quant = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
         self.fc = ColumnParallelLinear(
@@ -117,14 +111,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
+        # GPTQ: quantized checkpoints may exclude MTP from quantization via
+        # quantization_config.dynamic with "-:pattern" entries. When detected,
+        # disable quantization for MTP layers so they use unquantized params.
         original_quant = vllm_config.quant_config
-        if quant_config and quant_config.get_name() != "modelopt_fp4":
-            hf_quant_config = getattr(
-                model_config.hf_config, "quantization_config", None
-            )
-            if isinstance(hf_quant_config, dict):
-                dynamic = hf_quant_config.get("dynamic", {})
-                if any(key.startswith("-:") and "mtp" in key for key in dynamic):
+        if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
+            hf_qc = getattr(model_config.hf_config, "quantization_config", None)
+            if isinstance(hf_qc, dict):
+                dynamic = hf_qc.get("dynamic", {})
+                if any(k.startswith("-:") and "mtp" in k for k in dynamic):
                     vllm_config.quant_config = None
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
@@ -135,11 +130,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             for idx in range(self.num_mtp_layers)
         )
         vllm_config.quant_config = original_quant
-
+        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
+            self.layers,
+            Qwen3NextSparseMoeBlock,
+            "mlp",
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
-
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -160,7 +158,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        # Branch on the inputs, not the rank: the drafter is built entirely on
+        # the last PP stage, where `is_first_rank` is False.
+        if intermediate_tensors is None:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
@@ -170,12 +170,16 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = self.fc(hidden_states)
             residual = None
         else:
-            assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        hidden_states, residual = self.layers[current_step_idx](
+        mtp_layer = self.layers[current_step_idx]
+        if mtp_layer.use_attn_reduce_scatter_for_moe:
+            assert hidden_states.shape[0] == positions.shape[-1]
+            hidden_states = sequence_parallel_chunk(hidden_states)
+            assert residual is None
+        hidden_states, residual = mtp_layer(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
@@ -187,58 +191,18 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if mtp_layer.use_attn_reduce_scatter_for_moe:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states[: positions.shape[-1]]
         return hidden_states
 
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ) -> bool:
-        param = params_dict[name]
-        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        loaded_local_expert = False
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            success = weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-                return_success=True,
-            )
-            if success:
-                loaded_local_expert = True
-
-        return loaded_local_expert
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        # Upstream renamed FusedMoE.make_expert_params_mapping into
-        # RoutedExperts.build_expert_params_mapping; an empty
-        # routed_experts_prefix and no LoRA prefix keep the returned tuples
-        # identical to the old format.
-        expert_params_mapping = RoutedExperts.build_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts
-            if hasattr(self.config, "num_experts")
-            else 0,
-            routed_experts_prefix="",
+        weights = maybe_fuse_shared_experts(
+            weights,
+            enabled=self.is_fused_shared_expert_enabled,
+            n_routed_experts=getattr(self.config, "num_experts", 0),
+            n_shared_experts=1,
+            ckpt_prefix="mlp.shared_expert",
         )
 
         params_dict = dict(self.named_parameters())
@@ -383,7 +347,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -396,13 +360,6 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
-        cache_config = vllm_config.cache_config
-        if cache_config.mamba_cache_mode == "all":
-            raise NotImplementedError(
-                "Qwen3_5MTP currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
-            )
-
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
@@ -424,6 +381,10 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(
         self,
@@ -451,7 +412,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
 
         return inputs_embeds
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -461,12 +422,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids,
-            positions,
-            hidden_states,
-            intermediate_tensors,
-            inputs_embeds,
-            kwargs.get("spec_step_idx", 0),
+            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
         )
         return hidden_states
 
@@ -477,25 +433,20 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        modules = dict(self.named_modules())
-        is_gguf = (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "gguf"
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return not name.startswith("mtp.") and not any(
+            key in name for key in ["embed_tokens", "lm_head"]
         )
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
             for name, weight in weights:
+                if self.is_unused_checkpoint_weight(name):
+                    continue
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
-                elif any(key in name for key in ["embed_tokens", "lm_head"]):
-                    if "embed_tokens" in name:
-                        name = name.replace("language_model.", "")
-                else:
-                    continue
-                weight = _maybe_convert_gguf_rms_norm_weight(
-                    name, weight, modules, is_gguf
-                )
+                elif "embed_tokens" in name:
+                    name = name.replace("language_model.", "")
                 yield name, weight
 
         loader = AutoWeightsLoader(self)

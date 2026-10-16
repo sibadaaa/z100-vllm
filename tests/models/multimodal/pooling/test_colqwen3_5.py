@@ -1,32 +1,135 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for ColQwen3.5 late interaction model for multi-modal retrieval.
+
+ColQwen3.5 is a multi-vector retrieval model based on Qwen3.5 backbone with
+ColBERT-style late interaction scoring (MaxSim). It produces per-token
+embeddings for both text and image inputs.
+"""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from ....conftest import VllmRunner
 
-def _vllm_config(contract=None, *, text_contract=None):
-    hf_config = SimpleNamespace()
-    text_config = SimpleNamespace(mamba_ssm_dtype=None)
-    if contract is not None:
-        hf_config.retrieval_attention_contract = contract
-    if text_contract is not None:
-        text_config.retrieval_attention_contract = text_contract
-    model_config = SimpleNamespace(
-        hf_config=hf_config,
-        hf_text_config=text_config,
+MODELS = [
+    "athrael-soju/colqwen3.5-4.5B-v3",
+]
+
+EMBED_DIMS = {
+    "athrael-soju/colqwen3.5-4.5B-v3": 320,
+}
+
+TEXT_QUERIES = [
+    "What is the capital of France?",
+    "Describe the contents of the document.",
+]
+
+TEXT_DOCUMENTS = [
+    "The capital of France is Paris.",
+    "This document contains important financial data.",
+]
+
+DTYPE = "half"
+
+
+@pytest.fixture(scope="module", params=MODELS)
+def colqwen3_5_model(request, vllm_runner):
+    model = request.param
+    with vllm_runner(
+        model,
+        runner="pooling",
+        dtype=DTYPE,
+        max_model_len=4096,
+        enforce_eager=True,
+    ) as vllm_model:
+        yield model, vllm_model
+
+
+def _run_token_embed_test(
+    vllm_model: VllmRunner,
+    model: str,
+) -> None:
+    """Verify per-token embedding shape and L2 normalization."""
+    outputs = vllm_model.token_embed([TEXT_QUERIES[0]])
+
+    assert len(outputs) == 1
+    emb = torch.tensor(outputs[0])
+    # Token embeddings should be 2D: [num_tokens, embed_dim]
+    assert emb.dim() == 2
+    assert emb.shape[1] == EMBED_DIMS[model]
+    assert emb.shape[0] > 1
+
+    # Verify L2 normalization
+    norms = torch.norm(emb, p=2, dim=-1)
+    torch.testing.assert_close(
+        norms,
+        torch.ones_like(norms),
+        rtol=1e-2,
+        atol=1e-2,
     )
-    cache_config = SimpleNamespace(mamba_ssm_cache_dtype="auto")
-    return SimpleNamespace(model_config=model_config, cache_config=cache_config)
+
+
+def _run_late_interaction_test(
+    vllm_model: VllmRunner,
+) -> None:
+    """Verify MaxSim scoring matches manual computation."""
+    from vllm.entrypoints.pooling.scoring.utils import compute_maxsim_score
+
+    q_outputs = vllm_model.token_embed([TEXT_QUERIES[0]])
+    d_outputs = vllm_model.token_embed([TEXT_DOCUMENTS[0]])
+
+    q_emb = torch.tensor(q_outputs[0])
+    d_emb = torch.tensor(d_outputs[0])
+
+    manual_score = compute_maxsim_score(q_emb, d_emb).item()
+
+    vllm_scores = vllm_model.score(TEXT_QUERIES[0], TEXT_DOCUMENTS[0])
+
+    assert len(vllm_scores) == 1
+    assert vllm_scores[0] == pytest.approx(manual_score, rel=0.01)
+
+
+def _run_relevance_test(
+    vllm_model: VllmRunner,
+) -> None:
+    """Verify that relevant documents score higher than irrelevant ones."""
+    query = "What is machine learning?"
+    documents = [
+        "Machine learning is a subset of artificial intelligence.",
+        "The weather forecast shows rain tomorrow.",
+        "Deep learning uses neural networks for complex tasks.",
+    ]
+
+    scores = vllm_model.score(query, documents)
+
+    assert len(scores) == 3
+    assert scores[0] > scores[1], "ML doc should score higher than weather doc"
+    assert scores[2] > scores[1], "DL doc should score higher than weather doc"
+
+
+def test_colqwen3_5_token_embed(colqwen3_5_model) -> None:
+    model, vllm_model = colqwen3_5_model
+    _run_token_embed_test(vllm_model, model)
+
+
+def test_colqwen3_5_late_interaction_scoring(colqwen3_5_model) -> None:
+    _, vllm_model = colqwen3_5_model
+    _run_late_interaction_test(vllm_model)
+
+
+def test_colqwen3_5_relevance_ordering(colqwen3_5_model) -> None:
+    _, vllm_model = colqwen3_5_model
+    _run_relevance_test(vllm_model)
 
 
 @pytest.mark.parametrize(
     ("contract", "expected_is_causal"),
     [("causal", True), ("bidirectional", False)],
 )
-def test_colqwen3_5_applies_declared_attention_contract(
+def test_colqwen3_5_config_applies_declared_attention_contract(
     contract: str,
     expected_is_causal: bool,
 ) -> None:
@@ -36,51 +139,63 @@ def test_colqwen3_5_applies_declared_attention_contract(
     )
 
     assert MODELS_CONFIG_MAP["ColQwen3_5"] is ColQwen3_5Config
-    vllm_config = _vllm_config(contract)
-    ColQwen3_5Config.verify_and_update_config(vllm_config)
-    assert vllm_config.model_config.hf_config.is_causal is expected_is_causal
-    assert vllm_config.model_config.hf_text_config.is_causal is expected_is_causal
+
+    hf_config = SimpleNamespace(retrieval_attention_contract=contract)
+    text_config = SimpleNamespace()
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=text_config,
+    )
+    ColQwen3_5Config.verify_and_update_model_config(model_config)
+    assert hf_config.is_causal is expected_is_causal
+    assert text_config.is_causal is expected_is_causal
 
 
 @pytest.mark.parametrize(
-    ("contract", "text_contract"),
+    "hf_config",
     [
-        (None, None),
-        ("unsupported", None),
-        ("causal", "bidirectional"),
+        SimpleNamespace(),
+        SimpleNamespace(retrieval_attention_contract="unsupported"),
+        SimpleNamespace(
+            retrieval_attention_contract="causal",
+            text_config=SimpleNamespace(retrieval_attention_contract="bidirectional"),
+        ),
     ],
 )
-def test_colqwen3_5_rejects_invalid_attention_contract(
-    contract: str | None,
-    text_contract: str | None,
-) -> None:
+def test_colqwen3_5_config_rejects_invalid_attention_contract(hf_config) -> None:
     from vllm.model_executor.models.config import ColQwen3_5Config
 
+    text_config = getattr(hf_config, "text_config", SimpleNamespace())
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=text_config,
+    )
     with pytest.raises(ValueError, match="retrieval_attention_contract"):
-        ColQwen3_5Config.verify_and_update_config(
-            _vllm_config(contract, text_contract=text_contract)
-        )
+        ColQwen3_5Config.verify_and_update_model_config(model_config)
 
 
-def test_encoder_only_attention_has_no_kv_cache_spec() -> None:
-    from vllm.attention.backends.abstract import AttentionType
-    from vllm.attention.layer import Attention
-
-    attention = SimpleNamespace(attn_type=AttentionType.ENCODER_ONLY)
-    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
-    assert Attention.get_kv_cache_spec(attention, vllm_config) is None
-
-
-def test_triton_backend_supports_encoder_only_attention() -> None:
-    from vllm.attention.backends.abstract import AttentionType
-    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
-
-    assert TritonAttentionBackend.supports_attn_type(AttentionType.ENCODER_ONLY)
-
-
-def test_bidirectional_contract_builds_encoder_only_attention(monkeypatch) -> None:
-    from vllm.attention.backends.abstract import AttentionType
+def test_colqwen3_5_bidirectional_contract_builds_encoder_only_attention(
+    monkeypatch,
+) -> None:
     from vllm.model_executor.models import qwen3_next
+    from vllm.model_executor.models.config import ColQwen3_5Config
+    from vllm.v1.attention.backend import AttentionType
+
+    hf_config = SimpleNamespace(retrieval_attention_contract="bidirectional")
+    text_config = SimpleNamespace(
+        hidden_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        max_position_embeddings=4096,
+        rope_parameters={},
+        rms_norm_eps=1e-6,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=text_config,
+    )
+    ColQwen3_5Config.verify_and_update_model_config(model_config)
 
     captured = {}
 
@@ -105,36 +220,17 @@ def test_bidirectional_contract_builds_encoder_only_attention(monkeypatch) -> No
         qwen3_next, "Qwen3NextRMSNorm", lambda *args, **kwargs: torch.nn.Identity()
     )
     monkeypatch.setattr(qwen3_next, "Attention", FakeAttention)
-    monkeypatch.setattr(
-        qwen3_next,
-        "current_platform",
-        SimpleNamespace(
-            get_device_capability=lambda: None,
-            is_rocm=lambda: False,
-            is_cuda=lambda: False,
-        ),
-    )
 
-    config = SimpleNamespace(
-        hidden_size=256,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=128,
-        max_position_embeddings=4096,
-        rope_parameters={},
-        partial_rotary_factor=1.0,
-        rms_norm_eps=1e-6,
-        is_causal=False,
-    )
-    qwen3_next.Qwen3NextAttention(config)
-    assert captured["attn_type"] == AttentionType.ENCODER_ONLY
+    qwen3_next.Qwen3NextAttention(text_config)
+
+    assert captured["attn_type"] is AttentionType.ENCODER_ONLY
 
 
-def test_colqwen3_5_registry_import() -> None:
-    from vllm.model_executor.models.registry import ModelRegistry
+def test_colqwen3_5_encoder_only_attention_has_no_kv_cache_spec() -> None:
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
 
-    model_cls = ModelRegistry._try_load_model_cls("ColQwen3_5")
-    assert model_cls is not None
-    assert model_cls.__name__ == "ColQwen3_5Model"
-    assert model_cls.default_pooling_type == "ALL"
-    assert model_cls.score_type == "late-interaction"
+    attention = SimpleNamespace(attn_type=AttentionType.ENCODER_ONLY)
+    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+
+    assert Attention.get_kv_cache_spec(attention, vllm_config) is None

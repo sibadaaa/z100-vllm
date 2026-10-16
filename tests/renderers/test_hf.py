@@ -3,16 +3,12 @@
 
 import jinja2
 import pytest
-import torch
-from types import SimpleNamespace
 
 from vllm.config import ModelConfig
-from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.exceptions import VLLMValidationError
-from vllm.inputs import EmbedsPrompt
+from vllm.renderers.chat_utils import load_chat_template
 from vllm.renderers.hf import (
-    HfRenderer,
     _consolidate_system_messages,
     _convert_developer_to_system,
     _detect_content_format,
@@ -1078,27 +1074,3 @@ class TestConsolidateSystemMessages:
         assert len(conversation) == original_len
         assert conversation[0]["role"] == "user"
         assert conversation[1]["role"] == "system"
-
-
-def test_process_embeds_preserves_token_mask():
-    """Mixed-mode prompt_embeds keep their token-id mask through preprocessing.
-
-    `prompt_is_token_ids` marks which positions carry real token IDs (to be
-    embedded by the model) versus pre-computed embedding rows; it must reach
-    the engine input unchanged, and a batch-of-one embeds tensor must be
-    squeezed to (seq_len, hidden_size).
-    """
-    renderer = HfRenderer.__new__(HfRenderer)
-    renderer.model_config = SimpleNamespace(enable_prompt_embeds=True)
-
-    processed = renderer._process_embeds(
-        EmbedsPrompt(
-            prompt_embeds=torch.ones((1, 2, 3), dtype=torch.float32),
-            prompt_token_ids=[11, 22],
-            prompt_is_token_ids=[True, False],
-        )
-    )
-
-    assert processed["prompt_embeds"].shape == (2, 3)
-    assert processed["prompt_token_ids"] == [11, 22]
-    assert processed["is_token_ids"] == [True, False]

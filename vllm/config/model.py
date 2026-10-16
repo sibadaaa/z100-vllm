@@ -3,32 +3,6 @@
 
 from collections.abc import Callable
 from dataclasses import InitVar, field
-from importlib.util import find_spec
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, get_args
-
-import torch
-from pydantic import ConfigDict, SkipValidation, field_validator, model_validator
-from pydantic.dataclasses import dataclass
-from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
-
-try:
-    # Transformers v5
-    from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
-except ImportError:
-    # Transformers v4
-    from transformers.configuration_utils import (
-        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES,
-    )
-
-import vllm.envs as envs
-from vllm.config.multimodal import (
-    MMCacheType,
-    MMEncoderTPMode,
-    MMTensorIPC,
-    MultiModalConfig,
-)
-
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
@@ -52,13 +26,7 @@ from vllm.config.quantization import QuantizationConfigArgs
 from vllm.config.scheduler import RunnerType
 from vllm.config.utils import config, getattr_iter
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.transformers_utils.gguf_utils import (
-    detect_gguf_multimodal,
-    gguf_multimodal_processor_repo,
-    maybe_patch_hf_config_from_gguf,
-    qwen35_gguf_tokenizer_path,
-)
+from vllm.platforms import CpuArchEnum, current_platform
 from vllm.tasks import PoolingTask, ScoreType, SupportedTask
 from vllm.transformers_utils.config import (
     ConfigFormat,
@@ -69,7 +37,7 @@ from vllm.transformers_utils.config import (
     get_pooling_config,
     get_sentence_transformer_tokenizer_config,
     is_encoder_decoder,
-    is_rope_parameters_nested,
+    iter_rope_parameters,
     mrope_num_dims,
     try_get_dense_modules,
     try_get_generation_config,
@@ -81,19 +49,13 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
 from vllm.transformers_utils.repo_utils import resolve_revision
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from vllm.transformers_utils.utils import (
-    check_gguf_file,
-    is_gguf,
-    is_remote_gguf,
-    maybe_model_redirect,
-    split_remote_gguf,
-)
+from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.utils.import_utils import LazyLoader
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
+    from transformers import PreTrainedConfig
 
     import vllm.model_executor.layers.quantization as me_quant
     import vllm.model_executor.models as me_models
@@ -102,7 +64,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.v1.sample.logits_processor import LogitsProcessor
 else:
-    PretrainedConfig = Any
+    PreTrainedConfig = Any
 
     me_quant = LazyLoader(
         "model_executor", globals(), "vllm.model_executor.layers.quantization"
@@ -114,63 +76,6 @@ else:
     LogitsProcessor = Any
 
 logger = init_logger(__name__)
-
-ConfigFormat = Any
-
-
-def _tu_config():
-    from vllm.transformers_utils import config as tu_config
-
-    return tu_config
-
-
-def get_config(*args, **kwargs):
-    return _tu_config().get_config(*args, **kwargs)
-
-
-def get_hf_image_processor_config(*args, **kwargs):
-    return _tu_config().get_hf_image_processor_config(*args, **kwargs)
-
-
-def get_hf_text_config(*args, **kwargs):
-    return _tu_config().get_hf_text_config(*args, **kwargs)
-
-
-def get_pooling_config(*args, **kwargs):
-    return _tu_config().get_pooling_config(*args, **kwargs)
-
-
-def get_sentence_transformer_tokenizer_config(*args, **kwargs):
-    return _tu_config().get_sentence_transformer_tokenizer_config(*args, **kwargs)
-
-
-def is_encoder_decoder(*args, **kwargs):
-    return _tu_config().is_encoder_decoder(*args, **kwargs)
-
-
-def try_get_dense_modules(*args, **kwargs):
-    return _tu_config().try_get_dense_modules(*args, **kwargs)
-
-
-def try_get_generation_config(*args, **kwargs):
-    return _tu_config().try_get_generation_config(*args, **kwargs)
-
-
-def try_get_safetensors_metadata(*args, **kwargs):
-    return _tu_config().try_get_safetensors_metadata(*args, **kwargs)
-
-
-def try_get_tokenizer_config(*args, **kwargs):
-    return _tu_config().try_get_tokenizer_config(*args, **kwargs)
-
-
-def uses_mrope(*args, **kwargs):
-    return _tu_config().uses_mrope(*args, **kwargs)
-
-
-def uses_xdrope_dim(*args, **kwargs):
-    return _tu_config().uses_xdrope_dim(*args, **kwargs)
-
 
 # Process-local record of which (arch, target) model-class overrides have been
 # registered in *this* process. Must not live on ModelConfig: that instance is
@@ -184,7 +89,6 @@ ConvertOption = Literal["auto", ConvertType]
 TokenizerMode = Literal[
     "auto",
     "hf",
-    "slow",
     "mistral",
     "deepseek_v32",
     "deepseek_v4",
@@ -200,15 +104,43 @@ PROCESSED_LOGPROBS_MODES: tuple[LogprobsMode, ...] = (
     "processed_logits",
     "processed_logprobs",
 )
-HfOverrides = dict[str, Any] | Callable[[PretrainedConfig], PretrainedConfig]
+HfOverrides = dict[str, Any] | Callable[[PreTrainedConfig], PreTrainedConfig]
 ModelImpl = Literal["auto", "vllm", "transformers", "terratorch"]
 LayerBlockType = Literal["attention", "linear_attention", "mamba"]
+
+_ATTENTION_LAYER_TYPES = frozenset(
+    {
+        "full_attention",
+        "indexed_attention",
+        # TODO: Delete below once Transformers 5.18.0 is the minimum required version.
+        "deepseek_sparse_attention",
+        "qwen_sparse_attention",
+    }
+)
+"""`layer_types` spellings that consume a full attention KV cache. Sparse
+attention still caches every token, so it counts as attention here."""
 
 _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
     "generate": [],
     "pooling": ["embed", "classify"],
     "draft": [],
 }
+
+
+def _modelopt_mixed_has_nvfp4(quant_config: dict[str, Any] | None) -> bool:
+    """Whether a ModelOpt MIXED_PRECISION checkpoint quantizes any layer to NVFP4.
+
+    ``W4A16_NVFP4`` is excluded on purpose: it quantizes weights only, so there
+    is no activation quantization for the fusion passes to act on.
+    """
+    layers = (quant_config or {}).get("quantized_layers")
+    if not isinstance(layers, dict):
+        return False
+    return any(
+        isinstance(info, dict) and info.get("quant_algo") == "NVFP4"
+        for info in layers.values()
+    )
+
 
 AttnTypeStr = Literal[
     "decoder", "encoder", "encoder_only", "encoder_decoder", "attention_free", "hybrid"
@@ -243,7 +175,6 @@ class ModelConfig:
     - "auto" will use the tokenizer from `mistral_common` for Mistral models
       if available, otherwise it will use the "hf" tokenizer.
     - "hf" will use the fast tokenizer if available.
-    - "slow" will always use the slow tokenizer.
     - "mistral" will always use the tokenizer from `mistral_common`.
     - "deepseek_v32" will always use the tokenizer from `deepseek_v32`.
     - "deepseek_v4" will always use the tokenizer from `deepseek_v4`.
@@ -278,9 +209,9 @@ class ModelConfig:
     We must set the global seed because otherwise,
     different tensor parallel workers would sample different tokens,
     leading to inconsistent results."""
-    hf_config: PretrainedConfig = field(init=False)
+    hf_config: PreTrainedConfig = field(init=False)
     """The Hugging Face config of the model."""
-    hf_text_config: PretrainedConfig = field(init=False)
+    hf_text_config: PreTrainedConfig = field(init=False)
     """The Hugging Face config of the text model (same as hf_config for text models)."""
     is_submodel_config: bool = field(default=False, init=False)
     """Whether this is a submodule view derived by `VllmConfig.with_hf_config`
@@ -379,12 +310,8 @@ class ModelConfig:
     window functionality of the model, capping to sliding window size. If the
     model does not support sliding window, this argument is ignored."""
     disable_cascade_attn: bool = True
-    """Disable cascade attention for V1. While cascade attention does not
-    change the mathematical correctness, disabling it could be useful for
-    preventing potential numerical issues. This defaults to True, so users
-    must opt in to cascade attention by setting this to False. Even when this
-    is set to False, cascade attention will only be used when the heuristic
-    tells that it's beneficial."""
+    """Deprecated: cascade attention has been removed, so this has no effect.
+    It will be removed in v0.33.0."""
     skip_tokenizer_init: bool = False
     """Skip initialization of tokenizer and detokenizer. Expects valid
     `prompt_token_ids` and `None` for prompt from the input. The generated
@@ -441,12 +368,18 @@ class ModelConfig:
     hip platforms are supported)."""
     sleep_preserve_parameter_names: list[str] = field(default_factory=list)
     """Parameter-name globs to preserve across level-2 sleep.
+    Use target globs for frozen Engram table weights and scales omitted by the
+    trainer (e.g. ``*.engram.embed_tokens.weight*``).
+    Use ``draft.<name>`` for draft-private parameters, or ``draft.*`` for all.
     The sender must omit these parameters; loaders must preserve their storage."""
     sleep_mode_backend: str = "cumem"
     """Mechanism used to free and restore GPU state for sleep mode. ``"cumem"``
     (default) uses the built-in ``CuMemAllocator`` and is behavior-compatible
     with prior releases. Additional backends (CUDA checkpoint, CRIU, durable
     snapshot) may be registered in-tree or by plugins (RFC #34303)."""
+    sleep_mode_offload_cudagraph: bool = False
+    """Back up CUDA graph memory to CPU during sleep, restored in place on wake.
+    Takes effect with enable_sleep_mode, the cumem backend and CUDA graphs."""
     enable_nccl_comm_suspend: bool = False
     """Enable releasing NCCL communicator memory during sleep mode
     (``ncclCommSuspend``/``ncclCommResume``). Experimental; when disabled
@@ -574,11 +507,15 @@ class ModelConfig:
         # here early.
         if self.multimodal_config:
             factors["language_model_only"] = self.multimodal_config.language_model_only
+            # Sizes Qwen3.5's M-RoPE cache.
+            factors["video_pruning"] = (
+                self.multimodal_config.is_multimodal_pruning_enabled()
+            )
         return hash_factors(factors)
 
     def _update_nested(
         self,
-        target: PretrainedConfig | dict[str, Any],
+        target: PreTrainedConfig | dict[str, Any],
         updates: dict[str, Any],
     ) -> None:
         """Recursively updates a config or dict with nested updates."""
@@ -606,82 +543,20 @@ class ModelConfig:
 
     def _apply_dict_overrides(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         overrides: dict[str, Any],
     ) -> None:
         """Apply dict overrides, handling both nested configs and dict values."""
-        from transformers import PretrainedConfig
+        from transformers import PreTrainedConfig
 
         for key, value in overrides.items():
             attr = getattr(config, key, None)
-            if attr is not None and isinstance(attr, PretrainedConfig):
+            if attr is not None and isinstance(attr, PreTrainedConfig):
                 # It's a nested config - recursively update it
                 self._update_nested(attr, value)
             else:
                 # It's a dict-valued parameter - set it directly
                 setattr(config, key, value)
-
-    def _maybe_use_local_gguf_companion_tokenizer(self) -> None:
-        if not check_gguf_file(self.model):
-            return
-
-        model_path = Path(self.model)
-        if not model_path.is_file():
-            return
-
-        if self.tokenizer is not None and self.tokenizer != self.model:
-            return
-
-        direct_repo = model_path.with_name(model_path.stem + "-repo")
-        if direct_repo.is_dir():
-            self.tokenizer = str(direct_repo)
-            logger.info("Using local GGUF companion tokenizer: %s", self.tokenizer)
-            return
-
-        model_prefix = model_path.stem.split("-Q", 1)[0]
-        candidates = sorted(
-            p
-            for p in model_path.parent.iterdir()
-            if p.is_dir()
-            and p.name.endswith("-repo")
-            and p.name.startswith(model_prefix)
-        )
-        if len(candidates) == 1:
-            self.tokenizer = str(candidates[0])
-            logger.info("Using local GGUF companion tokenizer: %s", self.tokenizer)
-
-    def _maybe_use_local_gguf_companion_config(self) -> None:
-        if self.hf_config_path is not None or not check_gguf_file(self.model):
-            return
-
-        if self.tokenizer is None or self.tokenizer == self.model:
-            return
-
-        tokenizer_path = Path(self.tokenizer)
-        if not tokenizer_path.is_dir():
-            return
-
-        if (tokenizer_path / "config.json").is_file():
-            self.hf_config_path = str(tokenizer_path)
-            logger.info("Using local GGUF companion config: %s", self.hf_config_path)
-
-    def _maybe_use_qwen35_gguf_tokenizer(self) -> None:
-        if self.tokenizer is None or self.tokenizer != self.model:
-            return
-
-        processor_repo = gguf_multimodal_processor_repo(self.model)
-        if processor_repo is not None:
-            self.tokenizer = processor_repo
-            logger.info(
-                "Using original multimodal GGUF processor repository: %s",
-                self.tokenizer,
-            )
-            return
-
-        tokenizer_path = qwen35_gguf_tokenizer_path(self.model)
-        if tokenizer_path is not None:
-            self.tokenizer = tokenizer_path
-            logger.info("Using qwen35 GGUF metadata tokenizer: %s", self.tokenizer)
 
     def __post_init__(
         self,
@@ -704,8 +579,6 @@ class ModelConfig:
         mm_encoder_fp8_scale_save_margin: float | None,
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
-        # Keep this order in sync with the InitVar field declarations above;
-        # pydantic binds these positionally, so a mismatch shifts values.
         video_pruning_rate: float | None,
         video_pruning_method: str | None,
         mm_tensor_ipc: MMTensorIPC,
@@ -722,15 +595,12 @@ class ModelConfig:
         # The tokenizer is consistent with the model by default.
         if self.tokenizer is None:
             self.tokenizer = self.model
-        self._maybe_use_local_gguf_companion_tokenizer()
-        self._maybe_use_qwen35_gguf_tokenizer()
         if self.tokenizer_revision is None:
             self.tokenizer_revision = self.revision
         self.tokenizer = maybe_model_redirect(self.tokenizer)
 
         if isinstance(self.hf_config_path, str):
             self.hf_config_path = maybe_model_redirect(self.hf_config_path)
-        self._maybe_use_local_gguf_companion_config()
 
         if callable(self.hf_overrides):
             hf_overrides_kw: dict[str, Any] = {}
@@ -751,22 +621,27 @@ class ModelConfig:
         self.maybe_pull_model_tokenizer_for_runai(self.model, self.tokenizer)
 
         # If loading model/tokenizer from HF Hub, resolve the revision once
-        # to prevent resolving it multiple times downstream.
-        # If the weights come from a different repo, we cannot eagerly resolve revision
-        weights_from_model = not self.model_weights or self.model_weights == self.model
-        # If the config comes from a different repo, we cannot eagerly resolve revision
-        config_from_model = not self.hf_config_path or self.hf_config_path == self.model
-        can_resolve_model_revision = config_from_model and weights_from_model
-        if can_resolve_model_revision:
-            self.revision = resolve_revision(
-                self.model,
+        # to prevent resolving it multiple times downstream. A resolved revision
+        # only pins the repo it was resolved for, so each repo needs its own call.
+        self.revision = resolve_revision(
+            self.model,
+            self.revision,
+            self.hf_token,
+        )
+
+        # The config can live in another repo, which `self.revision` does not pin.
+        # It stays `None` if the config comes from `self.model`, so that call sites
+        # fall back to `self.revision` the same way they fall back to `self.model`.
+        self._hf_config_revision = None
+        if self.hf_config_path and self.hf_config_path != self.model:
+            self._hf_config_revision = resolve_revision(
+                self.hf_config_path,
                 self.revision,
                 self.hf_token,
             )
 
         if (
-            can_resolve_model_revision
-            and self.tokenizer == self.model
+            self.tokenizer == self.model
             and self.tokenizer_revision == requested_revision
         ):
             self.tokenizer_revision = self.revision
@@ -794,29 +669,13 @@ class ModelConfig:
         hf_config = get_config(
             self.hf_config_path or self.model,
             self.trust_remote_code,
-            self.revision,
+            self._hf_config_revision or self.revision,
             self.code_revision,
             self.config_format,
             hf_overrides_kw=hf_overrides_kw,
             hf_overrides_fn=hf_overrides_fn,
             token=self.hf_token,
         )
-        hf_config = maybe_patch_hf_config_from_gguf(
-            self.model,
-            hf_config,
-        )
-
-        if (
-            check_gguf_file(self.model)
-            and detect_gguf_multimodal(self.model) is None
-            and getattr(hf_config, "model_type", "")
-            in ("qwen3_5", "qwen3_5_text", "qwen35")
-            and hasattr(hf_config, "text_config")
-        ):
-            hf_config = hf_config.get_text_config()
-            if not getattr(hf_config, "architectures", None):
-                hf_config.architectures = ["Qwen3_5ForCausalLM"]
-
         self.hf_config = hf_config
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
@@ -950,16 +809,13 @@ class ModelConfig:
 
         self.original_max_model_len = self.max_model_len
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
-        is_text_only_gguf = check_gguf_file(self.model) and getattr(
-            self.hf_config, "model_type", ""
-        ).endswith("_text")
 
         if self.is_encoder_decoder:
             mm_processor_cache_gb = 0
             logger.info("Encoder-decoder model detected, disabling mm processor cache.")
 
         # Init multimodal config if needed
-        if self._model_info.supports_multimodal and not is_text_only_gguf:
+        if self._model_info.supports_multimodal:
             self.hf_image_processor_config = get_hf_image_processor_config(
                 self.model, hf_token=self.hf_token, revision=self.revision
             )
@@ -1037,14 +893,6 @@ class ModelConfig:
                     "--renderer-num-workers 1 (the default), or "
                     "disable the cache with --mm-processor-cache-gb 0."
                 )
-
-        # Multimodal GGUF models must use original repo for mm processing
-        if is_gguf(self.tokenizer) and self.multimodal_config is not None:
-            raise ValueError(
-                "Loading a multimodal GGUF model needs to use original "
-                "tokenizer. Please specify the unquantized hf model's "
-                "repo name or path using the --tokenizer argument."
-            )
 
             # Rebuild after multimodal_config exists so text-only mm_prefix
             # clearing is applied (and cached for later with_hf_config calls).
@@ -1685,6 +1533,14 @@ class ModelConfig:
         self,
         parallel_config: ParallelConfig,
     ) -> None:
+        if parallel_config.enable_hc_sp and parallel_config.tensor_parallel_size > 1:
+            if not current_platform.is_cuda_alike():
+                raise ValueError("--enable-hc-sp currently requires CUDA or ROCm")
+            if not self.registry.is_hc_sp_supported_model(self.architectures, self):
+                raise ValueError("--enable-hc-sp is not supported for this model")
+            if parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("--enable-hc-sp requires PP=1")
+
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
         if total_num_attention_heads % tensor_parallel_size != 0:
@@ -1753,17 +1609,6 @@ class ModelConfig:
                 "or pipeline_parallel_size > 1."
             )
 
-        if (
-            self.multimodal_config is not None
-            and self.multimodal_config.mm_tensor_ipc == "torch_shm"
-            and parallel_config.world_size_across_dp > 1
-        ):
-            raise ValueError(
-                "mm_tensor_ipc='torch_shm' is not supported with "
-                "data_parallel_size > 1 or tensor_parallel_size > 1 "
-                "or pipeline_parallel_size > 1."
-            )
-
     def get_sliding_window(self) -> int | None:
         """Get the sliding window size from the HF text config if present."""
         return getattr(self.hf_text_config, "sliding_window", None)
@@ -1777,8 +1622,8 @@ class ModelConfig:
     def get_inputs_embeds_size(self) -> int:
         # The size of inputs_embeds is usually identical to the size
         # of the hidden states, however there are exceptions, such as
-        # embedding models like CLIP and SigLIP
-        names = ("projection_dim", "projection_size")
+        # OPT's projected token embeddings and embedding models like CLIP/SigLIP.
+        names = ("word_embed_proj_dim", "projection_dim", "projection_size")
         return getattr_iter(
             self.hf_text_config, names, default_factory=self.get_hidden_size
         )
@@ -1915,7 +1760,8 @@ class ModelConfig:
             if layer_types_value is not None:
                 if block_type == "attention":
                     return sum(
-                        t == "full_attention" for t in layer_types_value[start:end]
+                        t in _ATTENTION_LAYER_TYPES
+                        for t in layer_types_value[start:end]
                     )
                 elif block_type == "linear_attention":
                     return sum(
@@ -1979,7 +1825,7 @@ class ModelConfig:
             config = try_get_generation_config(
                 self.hf_config_path or self.model,
                 trust_remote_code=self.trust_remote_code,
-                revision=self.revision,
+                revision=self._hf_config_revision or self.revision,
                 code_revision=self.code_revision,
                 config_format=self.config_format,
                 hf_token=self.hf_token,
@@ -2022,6 +1868,8 @@ class ModelConfig:
 
         available_params = [
             "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
             "temperature",
             "top_k",
             "top_p",
@@ -2050,40 +1898,6 @@ class ModelConfig:
                 str(diff_sampling_param),
                 scope="local",
             )
-
-        if check_gguf_file(self.model) and getattr(
-            self.hf_config, "model_type", ""
-        ) in (
-            "qwen3_5",
-            "qwen3_5_text",
-            "qwen35",
-        ):
-            # Only inject the Qwen-recommended penalty under the "auto"
-            # (model defaults) semantics. With --generation-config vllm the
-            # neutral defaults must stay clean: the injected penalty makes
-            # every default request hit the spec-decode penalty guard on
-            # MTP deployments.
-            if self.generation_config == "auto":
-                diff_sampling_param.setdefault("repetition_penalty", 1.2)
-            eos_ids: list[int] = []
-            generation_eos = config.get("eos_token_id")
-            if isinstance(generation_eos, int):
-                eos_ids.append(generation_eos)
-            elif isinstance(generation_eos, list):
-                eos_ids.extend(eos for eos in generation_eos if isinstance(eos, int))
-
-            text_eos = getattr(self.hf_text_config, "eos_token_id", None)
-            if isinstance(text_eos, int):
-                eos_ids.append(text_eos)
-            elif isinstance(text_eos, list):
-                eos_ids.extend(eos for eos in text_eos if isinstance(eos, int))
-
-            if eos_ids:
-                stop_ids = list(diff_sampling_param.get("stop_token_ids", []))
-                for eos_id in eos_ids:
-                    if eos_id not in stop_ids:
-                        stop_ids.append(eos_id)
-                diff_sampling_param["stop_token_ids"] = stop_ids
 
         return diff_sampling_param
 
@@ -2223,10 +2037,6 @@ class ModelConfig:
     @property
     def has_inner_state(self):
         return self._model_info.has_inner_state
-
-    @property
-    def supports_mamba_prefix_caching(self) -> bool:
-        return self._model_info.supports_mamba_prefix_caching
 
     @property
     def supports_replayssm(self) -> bool:
@@ -2467,13 +2277,20 @@ class ModelConfig:
         return getattr(self.hf_config, "quantization_config", None) is not None
 
     def is_nvfp4_quantized(self) -> bool:
+        quant_config = self.model_arch_config.quantization_config
+
         # ModelOpt NVFP4 checkpoints resolve to modelopt_fp4 quantization method
         if self.quantization in ("modelopt_fp4",):
             return True
 
+        # A checkpoint mixing NVFP4 with another algorithm declares
+        # quant_algo MIXED_PRECISION and resolves to modelopt_mixed, so the
+        # per-layer algorithms decide.
+        if self.quantization == "modelopt_mixed":
+            return _modelopt_mixed_has_nvfp4(quant_config)
+
         # For Compressed Tensors we look for `"format": "nvfp4-pack-quantized"`
         # in the quantization config
-        quant_config = self.model_arch_config.quantization_config
         return (
             self.quantization == "compressed-tensors"
             and quant_config is not None
@@ -2565,18 +2382,19 @@ _FLOAT16_NOT_SUPPORTED_MODELS = {
 
 
 def _is_valid_dtype(model_type: str, dtype: torch.dtype):
-    # NOTE(gfx906): ignore numerical instability
+    if model_type in _FLOAT16_NOT_SUPPORTED_MODELS and dtype == torch.float16:  # noqa: E501, SIM103
+        return False
+
     return True
 
 
 def _check_valid_dtype(model_type: str, dtype: torch.dtype):
-    # NOTE(gfx906): ignore numerical instability
     if model_type in _FLOAT16_NOT_SUPPORTED_MODELS and dtype == torch.float16:
-        logger.warning(
-            f"Although using float16 in model type {model_type!r} "
-            f"may introduce potential numerical instability issues."
-            " gfx906 only supports float16, so we continue to use."
+        reason = _FLOAT16_NOT_SUPPORTED_MODELS[model_type]
+        raise ValueError(
+            f"The model type {model_type!r} does not support float16. Reason: {reason}"
         )
+
     return True
 
 
@@ -2626,7 +2444,7 @@ def _resolve_auto_dtype(
 
 def _get_and_verify_dtype(
     model_id: str,
-    config: PretrainedConfig,
+    config: PreTrainedConfig,
     dtype: str | torch.dtype,
     *,
     is_pooling_model: bool,
@@ -2647,6 +2465,12 @@ def _get_and_verify_dtype(
                 config_dtype,
                 is_pooling_model=is_pooling_model,
             )
+            if (
+                current_platform.is_cpu()
+                and current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC
+                and torch_dtype in (torch.float16, torch.float32)
+            ):
+                torch_dtype = torch.bfloat16
         else:
             if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
                 raise ValueError(f"Unknown dtype: {dtype!r}")
@@ -2673,7 +2497,7 @@ def _get_and_verify_dtype(
 
 
 def _get_head_dtype(
-    config: PretrainedConfig, dtype: torch.dtype, runner_type: str
+    config: PreTrainedConfig, dtype: torch.dtype, runner_type: str
 ) -> torch.dtype:
     head_dtype: str | torch.dtype | None = getattr(config, "head_dtype", None)
 
@@ -2697,7 +2521,7 @@ def _get_head_dtype(
 
 
 def _get_and_verify_max_len(
-    hf_config: PretrainedConfig,
+    hf_config: PreTrainedConfig,
     model_arch_config: ModelArchitectureConfig,
     tokenizer_config: dict | None,
     max_model_len: int | None,
@@ -2749,24 +2573,14 @@ def _get_and_verify_max_len(
         )
         derived_max_model_len = default_max_len
 
-    # In Transformers v5 rope_parameters could be TypedDict or dict[str, TypedDict].
-    # To simplify the verification, we convert it to dict[str, TypedDict].
-    rope_parameters = getattr(hf_config, "rope_parameters", None)
-    if rope_parameters and not is_rope_parameters_nested(rope_parameters):
-        rope_parameters = {"": rope_parameters}
-    if rope_parameters is not None:
-        # Layers without RoPE do not contribute to context length scaling.
-        rope_parameters = {
-            layer_type: rp
-            for layer_type, rp in rope_parameters.items()
-            if rp is not None
-        }
+    # Layers without RoPE do not contribute to context length scaling.
+    rope_parameters = list(iter_rope_parameters(hf_config))
 
     # NOTE(woosuk): Gemma3's max_model_len (128K) is already scaled by RoPE
     # scaling, so we skip applying the scaling factor again.
-    if rope_parameters is not None and "gemma3" not in hf_config.model_type:
+    if rope_parameters and "gemma3" not in hf_config.model_type:
         scaling_factor = 1.0
-        for rp in rope_parameters.values():
+        for rp in rope_parameters:
             # No need to consider "type" key because of patch_rope_parameters when
             # loading HF config
             rope_type = rp["rope_type"]
@@ -2806,9 +2620,7 @@ def _get_and_verify_max_len(
     if max_model_len is None or max_model_len == -1:
         # For LongRoPE, default to original_max_position_embeddings to avoid
         # performance degradation for shorter sequences
-        if rope_parameters is not None and any(
-            rp["rope_type"] == "longrope" for rp in rope_parameters.values()
-        ):
+        if any(rp["rope_type"] == "longrope" for rp in rope_parameters):
             max_model_len = int(
                 getattr(
                     hf_config, "original_max_position_embeddings", derived_max_model_len

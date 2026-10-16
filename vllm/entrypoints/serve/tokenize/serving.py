@@ -5,7 +5,6 @@ from typing import Any, Final
 
 from fastapi import Request
 
-from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
     OpenAIServingModels,
@@ -23,6 +22,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.inputs import TokensPrompt, tokens_input
 from vllm.logger import init_logger
+from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import TokenizerLike
 
@@ -123,16 +123,6 @@ class ServingTokenization(BaseServing):
             max_model_len=self.model_config.max_model_len,
         )
 
-    def _validate_detokenize_bounds(
-        self, request: DetokenizeRequest
-    ) -> ErrorResponse | None:
-        if len(request.tokens) > self.model_config.max_model_len:
-            return self.create_error_response(
-                f"tokens length ({len(request.tokens)}) exceeds "
-                f"max_model_len ({self.model_config.max_model_len})."
-            )
-        return None
-
     async def create_detokenize(
         self,
         request: DetokenizeRequest,
@@ -141,10 +131,6 @@ class ServingTokenization(BaseServing):
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
-
-        bounds_error = self._validate_detokenize_bounds(request)
-        if bounds_error is not None:
-            return bounds_error
 
         request_id = f"tokenize-{self._base_request_id(raw_request)}"
 

@@ -63,10 +63,9 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,
     "safetensors": DefaultModelLoader,
+    "gguf": GGUFModelLoader,
     "sharded_state": ShardedStateLoader,
     "tensorizer": TensorizerLoader,
-    "gguf": GGUFModelLoader,
-
 }
 
 

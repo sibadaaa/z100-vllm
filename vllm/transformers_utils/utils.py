@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import importlib.metadata
 import json
 import os
 import struct
@@ -10,13 +9,12 @@ from os import PathLike
 from pathlib import Path
 from typing import Any
 
+from gguf import GGMLQuantizationType
+
 import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-import gguf
-from gguf import GGMLQuantizationType
 
 
 def is_s3(model_or_path: str) -> bool:
@@ -127,25 +125,6 @@ def convert_model_repo_to_path(model_repo: str) -> str:
 
     return os.path.join(get_model_cache_root(), model_repo)
 
-# --- GGUF model helpers (restored for fork GGUF support) ---
-if not hasattr(gguf, "__version__"):
-    try:
-        gguf.__version__ = importlib.metadata.version("gguf")
-    except importlib.metadata.PackageNotFoundError:
-        gguf.__version__ = "0.0.0"
-
-
-def is_s3(model_or_path: str) -> bool:
-    return model_or_path.lower().startswith("s3://")
-
-
-def is_gcs(model_or_path: str) -> bool:
-    return model_or_path.lower().startswith("gs://")
-
-
-def is_cloud_storage(model_or_path: str) -> bool:
-    return is_s3(model_or_path) or is_gcs(model_or_path)
-
 
 @cache
 def check_gguf_file(model: str | PathLike) -> bool:
@@ -217,6 +196,7 @@ def split_remote_gguf(model: str | Path) -> tuple[str, str]:
         "- Dash-prefixed quant types are accepted when the suffix is valid "
         "(e.g. UD-IQ1_S)."
     )
+
 
 def is_gguf(model: str | Path) -> bool:
     """Check if the model is a GGUF model.

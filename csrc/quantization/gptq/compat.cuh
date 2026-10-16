@@ -13,9 +13,9 @@ Copied from https://github.com/turboderp/exllamav2
 // the static_assert at the bottom of this file uses it to confirm the
 // `__DTK_ARCH__` decision below against the overload set the compiler sees.
 // A preprocessor test cannot do the probing itself (`::value` is not valid in
-// `#if`), and a version test cannot be trusted: DTK 26.04 reports HIP 6.3 while
-// its <hip/amd_detail/amd_hip_fp16.h> declares `__half2 atomicAdd(__half2*,
-// __half2)` unconditionally.
+// `#if`), and the HIP_VERSION gate below cannot be trusted either: DTK 26.04
+// reports HIP 6.3 while its <hip/amd_detail/amd_hip_fp16.h> declares
+// `__half2 atomicAdd(__half2*, __half2)` unconditionally.
 template <typename T, typename = void>
 struct vllm_gptq_has_native_half2_atomic_add : std::false_type {};
 template <typename T>
@@ -35,11 +35,11 @@ struct vllm_gptq_has_native_half2_atomic_add<
 #if defined(__CUDA_ARCH__) || defined(USE_ROCM)
   #if !defined(__DTK_ARCH__)
     #ifdef USE_ROCM
-      // Community ROCm provides the `half2` overload from 6.2 on. There is no
-      // feature-test macro for it, so gate on the documented version; a wrong
-      // guess fails the static_assert below rather than miscompiling.
+      // Upstream's own gate: the `half2` overload landed in ROCm 7.13 as far as
+      // this file is concerned. A wrong guess fails the static_assert below
+      // rather than miscompiling.
       #if defined(HIP_VERSION) && \
-          (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) >= 602
+          (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) >= 713
         #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 0
       #else
         #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 1
@@ -95,7 +95,8 @@ __device__ __forceinline__ void atomicAdd_half2(half2* address, half2 val) {
   } while (assumed != old);
 }
 
-#if defined(__CUDA_ARCH__) || defined(USE_ROCM)
+#if defined(__CUDA_ARCH__) || \
+    (defined(USE_ROCM) && (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) < 713)
   #if __CUDA_ARCH__ < 700 || defined(USE_ROCM)
 
     #if VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED

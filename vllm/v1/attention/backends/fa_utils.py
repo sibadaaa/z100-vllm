@@ -52,10 +52,7 @@ elif current_platform.is_rocm():
             from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
 
         _ROCM_FLASH_ATTN_AVAILABLE = True
-    except (ImportError, KeyError):
-        # ImportError: package missing. KeyError: the installed AMD
-        # flash-attn shim falls back to aiter, which raises KeyError for
-        # GPUs it does not support (e.g. gfx906); treat as unavailable.
+    except ImportError:
 
         def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
             package = "aiter" if on_gfx1250() else "flash-attn"
@@ -343,6 +340,8 @@ def flash_attn_supports_mla():
 
         except (ImportError, AssertionError):
             pass
+    elif current_platform.is_xpu():
+        return True
     return False
 
 

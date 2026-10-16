@@ -223,11 +223,3 @@ def test_multi_modal_uuids_preserved_when_caching_disabled(mm_uuids, expected):
     )
 
     assert processed_mm_uuids == expected
-
-
-def test_mm_cache_hooks_are_safe_when_renderer_has_no_cache():
-    """stat/clear hooks must not blow up when the processor cache is off."""
-    renderer = _build_renderer(mm_cache_gb=0)
-
-    assert renderer.stat_mm_cache() is None
-    renderer.clear_mm_cache()

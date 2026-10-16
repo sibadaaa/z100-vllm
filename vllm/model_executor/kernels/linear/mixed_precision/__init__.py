@@ -10,9 +10,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.cpu import (
 from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
     CutlassW4A8LinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.gfx906_gptq_wna16 import (
-    Gfx906GPTQWNA16LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
     Dynamic4bitLinearKernel,
 )

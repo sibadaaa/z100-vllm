@@ -7,8 +7,6 @@ from typing import Final
 import torch
 
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
-from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -29,9 +27,6 @@ class ConchLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        if current_platform.is_rocm() and on_gfx906():
-            return False, "Conch Triton kernels do not compile for ROCm gfx906"
-
         if c.weight_type not in _CONCH_SUPPORTED_WEIGHT_TYPES:
             error_msg = (
                 f"Weight type ({c.weight_type}) not supported by "
@@ -118,6 +113,8 @@ class ConchLinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_s_name, transform_w_s)
         if self.config.zero_points:
             self._transform_param(layer, self.w_zp_name, transform_w_zp)
+        elif self.w_zp_name is not None:
+            layer.register_parameter(self.w_zp_name, None)
 
     def apply_weights(
         self,
@@ -129,17 +126,28 @@ class ConchLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp = self._get_weight_params(layer)
 
+        # Map channelwise group_size=-1 to the actual input dimension K.
+        # The conch kernel computes stride_mul = block_k / group_size;
+        # passing -1 produces a negative stride that reads out-of-bounds
+        # scale values for all K-blocks after the first.
+        group_size = self.config.group_size
+        if group_size == -1:
+            group_size = x.shape[-1]
+
+        x_2d = x.reshape(-1, x.shape[-1])
+        out_shape = x.shape[:-1] + (self.config.partition_weight_shape[1],)
+
         output = mixed_precision_gemm(
-            x=x,
+            x=x_2d,
             w_q_packed=w_q.data,
             w_s=w_s.data,
             w_zp=w_zp.data if w_zp is not None else None,
             weight_size_bits=self.config.weight_type.size_bits,
             weight_bias=self.config.weight_type.bias,
-            group_size=self.config.group_size,
+            group_size=group_size,
         )
 
         if bias is not None:
             output.add_(bias)  # In-place add
 
-        return output
+        return output.reshape(out_shape)

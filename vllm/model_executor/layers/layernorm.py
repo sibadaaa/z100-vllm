@@ -12,7 +12,7 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
-from vllm.platforms import current_platform
+from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
@@ -64,6 +64,9 @@ class RMSNorm(CustomOp):
         self.weight = torch.ones(hidden_size, dtype=weight_dtype)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
+            # Dummy weights keep norms neutral: random ones would shrink every
+            # activation and skew data-dependent kernels (e.g. sparse top-k).
+            set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
 
         # When has_weight=False, pass weight=None so implementations that
         # support a weightless path can skip the per-channel multiply.
@@ -155,6 +158,7 @@ class GemmaRMSNorm(CustomOp):
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
+        set_weight_attrs(self.weight, {"dummy_weight_value": 0.0})
         self.variance_epsilon = eps
 
     def forward_native(
@@ -169,8 +173,11 @@ class GemmaRMSNorm(CustomOp):
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
     @staticmethod
-    def _use_gfx906_kernel(x: torch.Tensor, weight: torch.Tensor,
-                           residual: torch.Tensor | None) -> bool:
+    def _use_gfx906_kernel(
+        x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor | None
+    ) -> bool:
+        from vllm.platforms import current_platform
+
         if not current_platform.is_rocm() or not x.is_cuda:
             return False
         try:
@@ -214,7 +221,6 @@ class GemmaRMSNorm(CustomOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
-
         return self.forward_native(x, residual)
 
     def forward_xpu(
@@ -252,6 +258,81 @@ class GemmaRMSNorm(CustomOp):
             out, x, self.weight.data, self.variance_epsilon
         )
         return out
+
+
+@CustomOp.register("layer_norm")
+class LayerNorm(CustomOp):
+    """Standard (mean-centered) LayerNorm.
+
+    Drop-in for a bare `nn.LayerNorm` that dispatches to a fused XPU kernel
+    when one is available, and to the native implementation otherwise.
+
+    Normalization runs in the wider of the input and parameter dtypes and the
+    result is cast back to the input dtype, so `dtype=torch.float32` gives an
+    fp32 reduction for a lower-precision input.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.normalized_shape = (hidden_size,)
+        self.eps = eps
+        weight_dtype = dtype or torch.get_default_dtype()
+        self.weight: nn.Parameter | None = None
+        self.bias: nn.Parameter | None = None
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+            set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=weight_dtype))
+                set_weight_attrs(self.bias, {"dummy_weight_value": 0.0})
+
+    def _compute_dtype(self, x: torch.Tensor) -> torch.dtype:
+        if self.weight is None:
+            return x.dtype
+        return torch.promote_types(x.dtype, self.weight.dtype)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        compute_dtype = self._compute_dtype(x)
+        if compute_dtype != x.dtype:
+            return F.layer_norm(
+                x.to(compute_dtype),
+                self.normalized_shape,
+                self.weight,
+                self.bias,
+                self.eps,
+            ).type_as(x)
+        return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_layer_norm
+
+        if (
+            self.weight is None
+            or self.bias is None
+            or not hasattr(torch.ops._C, "layer_norm")
+            # The kernel reduces in the input dtype, so a widened reduction
+            # takes the native path.
+            or self._compute_dtype(x) != x.dtype
+        ):
+            return self.forward_native(x)
+        # empty_like preserves x's strides, but the kernel requires a
+        # contiguous out (unlike x, which it can handle non-contiguous).
+        out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+        torch.ops.vllm.xpu_layer_norm(out, x, self.weight, self.bias, self.eps)
+        return out
+
+    def extra_repr(self) -> str:
+        return f"hidden_size={self.normalized_shape[0]}, eps={self.eps}"
 
 
 # --8<-- [start:rms_norm_gated]
@@ -298,16 +379,10 @@ class RMSNormGated(CustomOp):
         self.eps = eps
         self.activation = activation
         self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
-        capability = current_platform.get_device_capability()
-        self._use_native_rocm_gfx90 = (
-            current_platform.is_rocm()
-            and capability is not None
-            and capability.major == 9
-            and capability.minor == 0
-        )
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -381,33 +456,6 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if (
-            self._use_native_rocm_gfx90
-            and z is not None
-            and self.group_size is None
-            and x.dim() == 2
-            and z.dim() == 2
-            and x.is_cuda
-            and z.is_cuda
-            and x.dtype == z.dtype == self.weight.dtype
-        ):
-            from vllm import _custom_ops as ops
-
-            if x.stride(-1) != 1:
-                x = x.contiguous()
-            if z.stride(-1) != 1:
-                z = z.contiguous()
-            return ops.rms_norm_gated_gfx906(
-                x,
-                self.weight,
-                z,
-                self.eps,
-                self.norm_before_gate,
-            )
-
-        if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
-            return self.forward_native(x, z)
-
         from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
             rmsnorm_fn,
         )
@@ -427,19 +475,3 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.forward_cuda(x, z)
-
-
-class LayerNorm(nn.Module):
-    """Layer Normalization."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        return F.layer_norm(
-            x.float(), (self.dim,), self.weight, self.bias, self.eps
-        ).type_as(x)

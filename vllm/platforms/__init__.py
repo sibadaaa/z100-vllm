@@ -275,11 +275,11 @@ def cpu_platform_plugin() -> str | None:
 
 
 builtin_platform_plugins = {
-    #'tpu': tpu_platform_plugin,
-    #'cuda': cuda_platform_plugin,
-    'rocm': rocm_platform_plugin,
-    #'xpu': xpu_platform_plugin,
-    #'cpu': cpu_platform_plugin,
+    "tpu": tpu_platform_plugin,
+    "cuda": cuda_platform_plugin,
+    "rocm": rocm_platform_plugin,
+    "xpu": xpu_platform_plugin,
+    "cpu": cpu_platform_plugin,
 }
 
 
