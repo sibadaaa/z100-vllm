@@ -307,7 +307,10 @@ export VLLM_CACHE_ROOT=/mnt/game/vllm-cache-rocm10
 # amdsmi 27.1.0 由 PYTHONPATH 里的 _rocm_sdk_devel/share/amd_smi 提供（P0.2 已装 devel wheel）
 export VLLM_WORKER_MULTIPROC_METHOD=spawn   # 沿用 DTK 时代稳妥选择
 export TOKENIZERS_PARALLELISM=false
-export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+# 不要设置 PYTORCH_HIP_ALLOC_CONF=expandable_segments:True（见 §9.2-F3）：
+# torch 2.16 + ROCm 10.1 gfx906 上 expandable segments 的 VMM 路径会让首次
+# GPU 分配永久挂死在 drm_syncobj_timeline_wait_timeout；unset 即正常。
+unset PYTORCH_HIP_ALLOC_CONF 2>/dev/null || true
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0,1,2,3}
 # 注意：不要 unset 镜像自带的 ROCBLAS_TENSILE_LIBPATH —— ROCm 10.1 的 rocBLAS 有完整
 # gfx906 Tensile 目录（/opt/rocm/core-10.1/lib/rocblas/library/gfx906，210 个文件），镜像 ENV 已设对。
@@ -712,7 +715,7 @@ triton 3.6(rocm101) 还是 kernel 本身。
 | R2 | GDN/FLA 在新 triton 上数值不达标（G8 一票否决） | 中/高 | G8 max|diff|>1e-4 或 NaN | 复核 triton build/SFU 门禁与 `triton.__file__`；用 triton-z100 的 gfx906 路由/SFU 修补流程定位；必要时回退 DTK |
 | R3 | vLLM C++ kernel 仍有 SFU 类数值错误（漏编/漏路径） | 低/高 | L2 中 layernorm/activation/attention 与 fp64 偏差大 | 确认全部 4 扩展由补丁 clang 编译；抽查 SFU kernel 反汇编含 `s_nop`；必要时整树 clean 重编 |
 | R4 | bf16 策略选错（D6）导致与 DTK 基线不可比/数值漂移 | 中/中 | G9 token 分歧、L2 bf16 用例异常 | 以 L-1 DTK 基线为准做 A/B（bf16 vs fp16 两臂）；默认按 Q1 结论 |
-| R5 | 新 torch allocator/graph 行为差异（显存、hang） | 中/中 | L5 VRAM 漂移、`kfd_wait_on_events`、OOM | eager 口径；`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True`；对比 DTK `Available KV cache` |
+| R5 | 新 torch allocator/graph 行为差异（显存、hang） | 中/中 | L5 VRAM 漂移、`kfd_wait_on_events`、OOM | eager 口径；**不要开 `expandable_segments`（本栈会挂死，见 §9.2-F3）**；对比 DTK `Available KV cache` |
 | R6 | 基线非同树导致 perf 判定争议 | 高/低 | 争论"退化"来源 | 先做 L-1 同树基线（本计划已排）；否则阈值放宽 0.90× 并注明量级比较 |
 | R7 | 镜像缺依赖/网络受限导致环境重建失败 | 低/中 | apt/pip 不可达 | 全部大文件本地缓存（rocm wheels/torch/triton/models）；apt 走 aliyun、pip 走清华 |
 | R8 | torch `USE_LIBUV=0`/RCCL env 漏配导致启动失败 | 中/低 | `DistStoreError` / `ARSMI_lib` | env 脚本固化（P0.3）；L0 门禁覆盖 |
@@ -742,6 +745,16 @@ triton 3.6(rocm101) 还是 kernel 本身。
 | Q1 | **gfx906 bf16 开放** | 按 D6 把 `_rocm_supported_dtypes()` 的 gfx906 分支泛化为 `gfx906_bf16_enabled()` 探针；保留 `VLLM_DCU_BF16` 三态；G9 用 bf16 与 DTK 基线可直接对比 |
 | Q2 | **接受 RCCL 重编为 P0 并行任务** | 按 §6.1-P0.5 取源码、`-DAMDGPU_TARGETS=gfx906` 重编、objdump + 4 卡 all_reduce 验收；失败按 R1 降级并升级 |
 | Q8 | **切换前先修 F1** | 先恢复 S7c fp16 标量守卫（**注意：merge 已把文件移到 `csrc/activation_kernels.cu`**，守卫源在 `/mnt/game/port/gfx906-vllm-211/csrc/libtorch_stable/activation_kernels.cu`）并重编 DTK `_C_stable_libtorch`，再冻结 L-1 基线 |
+
+### 9.2 执行期发现（2026-10-18，执行中新增/更正的事实）
+
+| # | 发现 | 对计划的影响 |
+|---|---|---|
+| **F3** | **`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` 在本栈会让首次 GPU 分配永久挂死**：进程停在 `drm_syncobj_timeline_wait_timeout`（无限超时，等待 timeline point 1），CPU/GPU 0%、无 dmesg 报错，且会连锁让后续进程一起挂。A/B 实测（同容器同 wheel）：设置 → `torch.ones(4,device='cuda')` 挂死；**不设置 → alloc/sync/randn 全 OK，`verify-gpu.py` 全 PASS**。 | §6.1-P0.3 环境契约**必须 `unset PYTORCH_HIP_ALLOC_CONF`**（已改）；§10.2 同步。DTK 栈不适用（该值源于 DTK 时代）。这是 torch 2.16 + ROCm 10.1 gfx906 的 VMM 路径问题，已并入 R5 对策。 |
+| **F4** | 镜像里的 `rocm_sdk_devel` wheel **只带 `$SP/rocm_sdk_devel/_devel.tar`**（3.1 GB），必须 `tar xf $SP/rocm_sdk_devel/_devel.tar -C $SP` 解包，torch RUNPATH 指向的 `_rocm_sdk_devel/lib` 与 amdsmi 的 `share/amd_smi` 才会存在；只 pip install 会导致 `import torch` 直接失败（RUNPATH 解析不到库）。 | §6.1-P0.2 补该步骤。 |
+| **F5** | RCCL 源码实际在 **`ROCm/rocm-systems` monorepo** 的 `projects/rccl`，pin = `7da43026e4f2ef7600433c38c820732f7a205d22`（`release/therock-10.1` tip），与 SDK 完全同源；且 SDK `librccl.so.1` 的 `.hip_fatbin` 是 **NOBITS（完全无 device code）**，不只是缺 gfx906——这解释了 world_size=1 也报 `invalid device function`。 | §6.1-P0.5 源码获取路径更正；R1 的"重编是唯一通路"依据加强。 |
+| **F6** | clang 24（SFU 补丁版）拒绝在函数级 `static constexpr` 初始化里调用 `__device__ constexpr` 的 `Utils::get_warp_size()`（`WARP_SIZE` 宏），报 `reference to __device__ function in global initializer`；改为普通 `constexpr` 局部即可（`csrc/activation_kernels.cu` 3 处，已修，commit `29d605c44`）。 | §6.2-P1 编译期已知修复项，已入库。 |
+| **F7** | DTK `_C_stable_libtorch` 的 F1 重编最终身份 = **HEAD `29d605c44` + md5 `e303b0b2…`**（`590dc52e…` 是前一 HEAD `8b18b93cc` 的构建）；L-1 基线与新栈验收必须绑定同一 HEAD。 | §7-L-1 身份记录口径：以"实际 HEAD + 4 个 .so md5"为准。 |
 
 ---
 
@@ -775,7 +788,7 @@ VLLM_ROCM_USE_SKINNY_GEMM=0     VLLM_USE_AOT_COMPILE=0
 PYTHONPATH=/mnt/game/port/gfx906-vllm-rocm101:/mnt/game/triton-z100-rocm101/install
 TRITON_CACHE_DIR=/mnt/game/triton-z100-rocm101/cache/jit
 VLLM_CACHE_ROOT=/mnt/game/vllm-cache-rocm10
-TOKENIZERS_PARALLELISM=false    PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+TOKENIZERS_PARALLELISM=false    # PYTORCH_HIP_ALLOC_CONF 保持未设置（F3）
 VLLM_WORKER_MULTIPROC_METHOD=spawn   HIP_VISIBLE_DEVICES=0,1,2,3
 ```
 
