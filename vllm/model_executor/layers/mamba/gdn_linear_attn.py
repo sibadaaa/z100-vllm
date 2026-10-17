@@ -159,7 +159,15 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
-@CustomOp.register("chunk_gated_delta_rule")
+# Fork-specific GDN implementation (gfx906 packed decode, chunked-prefill A/B
+# switches, MTP update).  The upstream re-sync also brought
+# mamba/gdn/qwen_gdn_linear_attn.py, which registers the canonical
+# "chunk_gated_delta_rule" name, and both modules are imported on the qwen3_5
+# path (this one via models/qwen3_5.py, the upstream one via the gdn_attn
+# backend) -> duplicate CustomOp registration crashed serve init.  This class is
+# instantiated directly (self.chunk_gated_delta_rule = ChunkGatedDeltaRule()),
+# so it does not need the canonical registry name.
+@CustomOp.register("chunk_gated_delta_rule_z100")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
         super().__init__()
