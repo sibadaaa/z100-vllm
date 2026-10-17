@@ -1,0 +1,28 @@
+# Runtime requirements for the self-built PyTorch 2.16 + ROCm 10.1 (TheRock)
+# gfx906 stack.  See docs/z100-torch216-rocm101-adapt-plan.md.
+#
+# This file deliberately does NOT pin torch / triton / amdsmi: all three are
+# locally built artifacts and must never be resolved from PyPI or the
+# community ROCm 7.x index (that stack is ABI-incompatible with this one):
+#
+#   torch   -> /mnt/game/torch-rocm10/wheel-sfu/
+#              torch-2.16.0.dev20261016+rocm10.1-cp312-cp312-linux_x86_64.whl
+#   triton  -> /mnt/game/triton-z100-rocm101/install on PYTHONPATH, or its
+#              dist/triton-3.6.0-cp312-cp312-linux_x86_64.whl; never the
+#              `triton`, `triton-rocm` or `pytorch-triton-rocm` PyPI packages
+#   amdsmi  -> ROCm SDK 27.1.0 from
+#              _rocm_sdk_devel/share/amd_smi/amdsmi on PYTHONPATH; never
+#              PyPI `amdsmi==7.0.2`
+#
+# torchvision/torchaudio are not built for this stack and are optional at
+# vLLM runtime (lazy imports).  numba is only needed for N-gram speculative
+# decoding.  Keep the common section in sync with requirements/common.txt.
+
+-r common.txt
+
+numba == 0.61.2 # Required for N-gram speculative decoding
+
+packaging>=24.2
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=8
+jinja2>=3.1.6

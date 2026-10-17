@@ -248,8 +248,16 @@ def _read_dcu_sysfs(device_index: int, attr: str, transform):
 
 
 def rocminfo_candidates() -> list[str]:
-    """Candidate ``rocminfo`` binaries, community ROCm first, DTK second."""
-    candidates = ["/opt/rocm/bin/rocminfo"]
+    """Candidate ``rocminfo`` binaries, community ROCm first, DTK second.
+
+    TheRock / ROCm SDK installs keep their tools under ``$ROCM_PATH/bin``
+    and do not populate ``/opt/rocm/bin``, so honour ``ROCM_PATH`` first.
+    """
+    candidates: list[str] = []
+    rocm_path = os.environ.get("ROCM_PATH")
+    if rocm_path:
+        candidates.append(str(Path(rocm_path) / "bin" / "rocminfo"))
+    candidates.append("/opt/rocm/bin/rocminfo")
     dtk_root = os.environ.get("DTKROOT")
     if dtk_root:
         candidates.append(str(Path(dtk_root) / "bin" / "rocminfo"))

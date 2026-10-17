@@ -284,18 +284,18 @@ def _rocm_supported_dtypes() -> list[torch.dtype]:
     gfx906 (Vega20 / Hygon DCU Z100) has no bf16 instructions at all: the
     ISA provides neither a bf16 conversion nor a bf16 dot product, so any
     bf16 math is emulated in software. Emulation can still be numerically
-    correct, so on **Hygon DCU (DTK)** gfx906 bf16 is offered only when the
-    device probe (see ``vllm.platforms.hygon_dtk``) confirms it, or when the
-    user forces it with ``VLLM_DCU_BF16=1``. float16 stays first, so
-    ``--dtype auto`` keeps preferring the natively accelerated dtype.
+    correct, so gfx906 bf16 is offered only when the device probe (see
+    ``vllm.platforms.hygon_dtk``) confirms it, or when the user forces it
+    with ``VLLM_DCU_BF16=1``. float16 stays first, so ``--dtype auto`` keeps
+    preferring the natively accelerated dtype.
 
-    The branch is deliberately scoped to ``is_hygon_dtk()``: on a community
-    ROCm gfx906 host (MI50 / Radeon VII) the dtype list must stay exactly as
-    it was before this adaptation.
+    The probe runs torch ops only and therefore covers both the DTK and the
+    community/self-built ROCm stack: a stack whose bf16 support is absent or
+    inaccurate keeps the fp16-only list.
     """
     if _ON_GFX906:
         dtypes = [torch.float16, torch.float32]
-        if is_hygon_dtk() and gfx906_bf16_enabled():
+        if gfx906_bf16_enabled():
             dtypes.insert(1, torch.bfloat16)
         return dtypes
     return [torch.float16, torch.bfloat16, torch.float32]

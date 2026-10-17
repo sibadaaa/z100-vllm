@@ -119,6 +119,11 @@ def _is_hygon_dtk() -> bool:
     return _DTK_PREFIX is not None
 
 
+def _is_rocm101() -> bool:
+    """Whether this is the self-built torch 2.16 + ROCm 10.1 (TheRock) stack."""
+    return os.environ.get("VLLM_ROCM101") == "1" or "+rocm10.1" in torch.__version__
+
+
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
@@ -1264,9 +1269,15 @@ def get_requirements() -> list[str]:
         requirements = modified_requirements
     elif _is_hip():
         # DTK replaces torch/triton/amdsmi with vendor wheels and must never
-        # resolve the community ROCm index; see requirements/dcu.txt.
-        requirements = _read_requirements("dcu.txt" if _is_hygon_dtk() else "rocm.txt")
-        requirements = _read_requirements("rocm.txt")
+        # resolve the community ROCm index; see requirements/dcu.txt.  The
+        # self-built torch 2.16 + ROCm 10.1 stack pins its artifacts locally
+        # as well; see requirements/rocm101.txt.
+        if _is_hygon_dtk():
+            requirements = _read_requirements("dcu.txt")
+        elif _is_rocm101():
+            requirements = _read_requirements("rocm101.txt")
+        else:
+            requirements = _read_requirements("rocm.txt")
         if "develop" in sys.argv[1:] and "--no-deps" not in sys.argv[1:]:
             _check_requirements_preinstalled(requirements)
     elif _is_tpu():
