@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression guard for the gfx906 + DTK 26.04 fp16 packed-SiLU miscompile.
 
-``csrc/libtorch_stable/activation_kernels.cu`` used to send every fp16 ``_C``
+``csrc/activation_kernels.cu`` (formerly ``csrc/libtorch_stable/``) used to
+send every fp16 ``_C``
 activation through the ``__half2`` vectorized branch.  On Hygon Z100 (gfx906)
 with DTK 26.04 that branch is miscompiled: a few percent of the elements come
 back as inf/NaN (and, for ``silu_and_mul_with_clamp``, as wrong finite values),

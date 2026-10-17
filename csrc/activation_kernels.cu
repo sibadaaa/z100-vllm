@@ -8,6 +8,7 @@
 #endif
 
 #include <cmath>
+#include <cstring>
 #include <type_traits>
 
 #include "core/cuda_compat.h"
@@ -236,6 +237,43 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
 
 }  // namespace vllm
 
+// Precision guard for the gfx906 + DTK 26.04 fp16 packed-activation miscompile.
+//
+// On Hygon Z100 (gfx906) with DTK 26.04 the fp16 `__half2` branches of the
+// activation kernels below return inf/NaN -- and wrong finite values -- for a
+// few percent of the elements, non-deterministically; the scalar branches of
+// the very same kernels are exact.  Stay on the scalar branch for fp16 there.
+// See docs/result/z100-07b-eager-nan-result.md and
+// docs/result/z100-07c-packed-silu-csrc-fix-result.md.
+//
+// Why this exact guard:
+//   * `__DTK_ARCH__` comes from DTK's `ATen/dtk_macros.h`, which DTK's hipify
+//     injects into every generated file (see cmake/hipify.py, which re-adds it
+//     as a prelude for the stable-ABI extensions).  It is visible in the HOST
+//     pass, where this launch code runs; community ROCm / CUDA builds do not
+//     define it, so there the helper folds to a constant `false` and `use_vec`
+//     keeps its original value bit for bit.
+//   * `__gfx906__` must NOT be used here: clang defines it only in the device
+//     pass, so a host-side test on it would always be false (verified with
+//     `hipcc -x hip --cuda-host-only -S`).
+//   * the runtime `gcnArchName` prefix test keeps other DTK architectures on the
+//     original vectorized path.
+#if defined(__DTK_ARCH__)
+static inline bool dtk_gfx906_fp16_no_packed(
+    torch::headeronly::ScalarType dtype) {
+  if (dtype != torch::headeronly::ScalarType::Half) {
+    return false;
+  }
+  return std::strncmp(get_device_prop()->gcnArchName, "gfx906", 6) == 0;
+}
+#else
+static inline bool dtk_gfx906_fp16_no_packed(
+    torch::headeronly::ScalarType dtype) {
+  (void)dtype;
+  return false;
+}
+#endif
+
 // Launch activation and gating kernel.
 // Use ACT_FIRST (bool) indicating whether to apply the activation function
 // first. HAS_CLAMP (bool) enables pre-activation clamping: gate input is
@@ -256,7 +294,8 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
           ? vllm::VecTraits<true>::ARCH_MAX_VEC_SIZE                           \
           : vllm::VecTraits<false>::ARCH_MAX_VEC_SIZE;                         \
   int vec_size = support_vec / input.element_size();                           \
-  const bool use_vec = (d % vec_size == 0);                                    \
+  const bool use_vec =                                                         \
+      (d % vec_size == 0) && !dtk_gfx906_fp16_no_packed(dtype);                \
   const torch::stable::accelerator::DeviceGuard device_guard(                  \
       input.get_device_index());                                               \
   const cudaStream_t stream = get_current_cuda_stream();                       \
@@ -962,7 +1001,8 @@ __global__ void masked_activation_kernel(
           ? vllm::VecTraits<true>::ARCH_MAX_VEC_SIZE                           \
           : vllm::VecTraits<false>::ARCH_MAX_VEC_SIZE;                         \
   int vec_size = support_vec / input.element_size();                           \
-  const bool use_vec = (d % vec_size == 0);                                    \
+  const bool use_vec =                                                         \
+      (d % vec_size == 0) && !dtk_gfx906_fp16_no_packed(dtype);                \
   const torch::stable::accelerator::DeviceGuard device_guard(                  \
       input.get_device_index());                                               \
   const cudaStream_t stream = get_current_cuda_stream();                       \
@@ -1365,7 +1405,8 @@ __global__ void activation_kernel(
           ? vllm::VecTraits<true>::ARCH_MAX_VEC_SIZE                           \
           : vllm::VecTraits<false>::ARCH_MAX_VEC_SIZE;                         \
   int vec_size = support_vec / input.element_size();                           \
-  const bool use_vec = (d % vec_size == 0);                                    \
+  const bool use_vec =                                                         \
+      (d % vec_size == 0) && !dtk_gfx906_fp16_no_packed(dtype);                \
   const torch::stable::accelerator::DeviceGuard device_guard(                  \
       input.get_device_index());                                               \
   const cudaStream_t stream = get_current_cuda_stream();                       \
