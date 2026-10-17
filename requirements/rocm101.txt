@@ -21,6 +21,7 @@
 -r common.txt
 
 numba == 0.61.2 # Required for N-gram speculative decoding
+gguf # imported unconditionally by vllm/transformers_utils/gguf_utils.py
 
 packaging>=24.2
 setuptools>=77.0.3,<81.0.0
