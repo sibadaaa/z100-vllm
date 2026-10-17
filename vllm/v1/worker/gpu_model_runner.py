@@ -554,6 +554,12 @@ class GPUModelRunner(
         self.mm_registry = MULTIMODAL_REGISTRY
         self.uses_mrope = model_config.uses_mrope
         self.mrope_num_dims = model_config.mrope_num_dims
+        # _try_prepare_single_decode_inputs reads this, but the merge that
+        # brought the V1 runner file over from the fork tree never defined it
+        # (no ModelConfig property exists either).  0 == no xdrope model, which
+        # is the only case these checkpoints exercise; keeping the V1 runner
+        # usable matters as an escape hatch for V2 runner regressions.
+        self.uses_xdrope_dim = 0
         self.supports_mm_inputs = model_config.supports_multimodal_inputs
 
         if self.model_config.is_encoder_decoder:
