@@ -767,6 +767,10 @@ triton 3.6(rocm101) 还是 kernel 本身。
 | **F17** | 4 个 gfx906 内核测试（`test_gfx906_bf16_gemv` / `test_gfx906_fp8_emu` / `test_gfx906_int8_sdot4` / `test_gfx906_packed_silu_fp16`）的 skip 门禁是 `is_hygon_dtk() and on_gfx906()`，在 ROCm 10.1 栈上 **170 个 item 全部 skip**（L2 覆盖缺口）。 | 门禁已改为 `on_gfx906()`（测试文件，commit 见 `tests/`）；新栈 L2 需重跑这 4 个文件补齐覆盖，与 DTK 结果逐项比较。 |
 | **F18** | ROCm 10.1 下 **RCCL 重建验收通过**：`rocm-systems@7da43026` 用 `-DGPU_TARGETS=gfx906` 重编后，4 卡 all_reduce（5120 + 1 MiB）PASS，`/proc/self/maps` 证明加载 `/mnt/game/rccl-gfx906/lib/librccl.so.1.0`，NCCL_DEBUG 显示真实 kernel collective 路径。 | P0-R 完成，TP>1 通信通路打通（R1 关闭）。 |
 | **F19** | **新栈 attention 单测与 serving 行为的矛盾**：18:40 的新栈 L2 中 v1/legacy attention 单测 **39/39 + 18/18 全过**，但 17:5x 同文件在 `HIP_VISIBLE_DEVICES=3` 下失败（inf）、且 serving 输出 NaN/logprobs NaN（eager 替换后正确）。 | F14 降级为"serving 路径/特定条件下的异常"，需在 serving 上重复复测定性（设备差异/非确定性/形状路径）；eager fallback 暂保留为验证通道，**不可据此判定 kernel 普遍错误**。 |
+| **F20** | ROCm 10.1 的 MIOpen **缺 `libMIOpenCKGroupedConv_gfx906.so`**：gfx906 causal_conv1d fallback 的 grouped conv1d（groups=channels）会选中 CK grouped-conv solver，随后加载内核失败（`hipErrorInvalidKernelFile`），错误在下一次 HIP 调用处才抛出。 | env 契约加 `MIOPEN_DEBUG_AMD_ROCM_CK_GROUPED_CONV_{FWD,BWD}=0`（已验证 bf16/fp16 C2048/C4096 形状恢复）。 |
+| **F21** | **新栈 bf16 在真实模型上 NaN**（Qwen3-0.6B/4B bf16 的 logprobs 全 NaN → HTTP 400；同一模型 fp16 正常；torch 级 bf16 单 op 却全 finite）。Q1 "bf16 开放"决策因此回退。 | `_rocm_supported_dtypes()` 恢复 `is_hygon_dtk() and probe`（bf16 仍 DTK-only）；生产 `--dtype float16` 不受影响；新栈 G9 用 fp16，并以 DTK fp16 对照（已采集，4B fp16≡bf16 token 流）。 |
+| **F22** | **新栈 Qwen3.5-4B（GDN）serve 启动受阻**：权重加载/KV cache 初始化完成后，在 kernel warmup 附近被 hycu 驱动 kill（`hycu: killed process … comm:python3`），加 `VLLM_SKIP_KERNEL_WARMUP=1` 仍在同一位置被 kill；0.6B（dense）同栈正常。形似 GDN/FLA 内核在 gfx906+ROCm10.1 上的非法 GPU 访问。 | 4B G9/L3 与 27B TP4 端到端在修复前挂起；已加 `VLLM_SKIP_KERNEL_WARMUP` 调试开关便于定位。0.6B dense G9 已完成（finite PASS，2/3 prompt 12/12 一致，1 条在 margin 0.0156 nat 位置分歧，归入 attention fallback 数值差异）。 |
+
 
 
 ---

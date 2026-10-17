@@ -60,6 +60,15 @@ export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-9.0.6}"
 # Fine-grained PCIe memory is required for RCCL P2P on Z100 (see env.sh §9).
 export HSA_FORCE_FINE_GRAIN_PCIE="${HSA_FORCE_FINE_GRAIN_PCIE:-1}"
 
+# 3b. MIOpen: the ROCm 10.1 runtime ships no libMIOpenCKGroupedConv_gfx906.so,
+#     so MIOpen's CK grouped-conv solver is selected and then fails to load its
+#     kernel ("hipErrorInvalidKernelFile"), which surfaces on the next op that
+#     checks the HIP error state.  The gfx906 causal_conv1d fallback issues a
+#     grouped conv1d (groups=channels), so disable that solver explicitly and
+#     let MIOpen pick a working one.
+export MIOPEN_DEBUG_AMD_ROCM_CK_GROUPED_CONV_FWD="${MIOPEN_DEBUG_AMD_ROCM_CK_GROUPED_CONV_FWD:-0}"
+export MIOPEN_DEBUG_AMD_ROCM_CK_GROUPED_CONV_BWD="${MIOPEN_DEBUG_AMD_ROCM_CK_GROUPED_CONV_BWD:-0}"
+
 # 4. torch / RCCL build-time choices (both mandatory):
 #    * USE_LIBUV=0: the wheel was built with USE_TENSORPIPE=0, i.e. without libuv;
 #      unset it and the distributed store dies with "use_libuv was requested but

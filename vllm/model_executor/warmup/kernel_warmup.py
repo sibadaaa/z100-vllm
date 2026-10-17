@@ -160,6 +160,24 @@ def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+    # Bring-up escape hatch: on the self-built ROCm 10.1 stack some GDN/FLA
+    # Triton kernels can hang or take very long during the startup warmup (see
+    # docs/result/z100-rocm101-acceptance.md F22).  Skipping only loses the
+    # pre-compiled caches; kernels still JIT on first use, so this is safe for
+    # correctness bring-up but not for benchmarking.
+    import os as _os
+
+    if _os.environ.get("VLLM_SKIP_KERNEL_WARMUP", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        logger.warning_once(
+            "VLLM_SKIP_KERNEL_WARMUP=1: skipping kernel warmup (bring-up only)."
+        )
+        return
+
     if not worker.use_v2_model_runner:
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
