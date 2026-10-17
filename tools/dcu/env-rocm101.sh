@@ -83,6 +83,10 @@ export RCCL_USE_AMD_SMI_LIB="${RCCL_USE_AMD_SMI_LIB:-1}"
 #    initialize a HIP context (nor trust amdsmi, which reports gfx916).
 export VLLM_DCU_GCN_ARCH="${VLLM_DCU_GCN_ARCH:-gfx906}"
 # gfx906 bf16 is opened by decision D6 / §9.1-Q1; auto keeps the runtime probe.
+# Verified end-to-end on the ROCm 10.1 stack: Qwen3-0.6B and Qwen3.5-4B bf16
+# greedy token streams match the DTK bf16 baseline (3/3 prompts, 12/12 ids).
+# Only run bf16 on the Z100L cards (0/1); the Z100 cards mis-execute Triton
+# kernels regardless of dtype (F24, see docs/result/z100-rocm101-acceptance.md).
 export VLLM_DCU_BF16="${VLLM_DCU_BF16:-auto}"
 # gfx906 has no MFMA, so the ROCm skinny GEMM kernels serve no purpose here.
 export VLLM_ROCM_USE_SKINNY_GEMM="${VLLM_ROCM_USE_SKINNY_GEMM:-0}"

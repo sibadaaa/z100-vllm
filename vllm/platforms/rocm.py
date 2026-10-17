@@ -289,16 +289,16 @@ def _rocm_supported_dtypes() -> list[torch.dtype]:
     with ``VLLM_DCU_BF16=1``. float16 stays first, so ``--dtype auto`` keeps
     preferring the natively accelerated dtype.
 
-    Scope note (ROCm 10.1 stack, 2026-10-18): on the self-built torch 2.16 +
-    ROCm 10.1 stack the probe passes (torch bf16 ops are finite) but real
-    model execution produces NaN logits on Qwen3-0.6B/Qwen3.5-4B while fp16 is
-    correct (see docs/result/z100-rocm101-acceptance.md finding F21), so bf16
-    stays DTK-only until the model-level NaN is explained.  Production runs
-    use --dtype float16 and are unaffected.
+    Both stacks are covered: the probe runs torch ops only, and on the
+    ROCm 10.1 stack real-model bf16 execution was verified correct (Qwen3-0.6B
+    and Qwen3.5-4B greedy token streams identical to fp16, finite logprobs; see
+    docs/result/z100-rocm101-acceptance.md).  Note the earlier bf16 NaN report
+    was a misattribution of the Z100-SKU runtime fault (F24): it reproduces on
+    cards 2/3 whatever the dtype, while cards 0/1 run bf16 correctly.
     """
     if _ON_GFX906:
         dtypes = [torch.float16, torch.float32]
-        if is_hygon_dtk() and gfx906_bf16_enabled():
+        if gfx906_bf16_enabled():
             dtypes.insert(1, torch.bfloat16)
         return dtypes
     return [torch.float16, torch.bfloat16, torch.float32]
