@@ -1,3 +1,4 @@
+#include "core/cuda_compat.h"
 #include "dispatch_utils.h"
 
 #include <torch/cuda.h>
@@ -287,12 +288,113 @@ static __global__ void topKPerRowDecode(const float* logits, const int* seqLens,
 
   // The range of logits within the row.
   int rowStart = 0;
-  int seq_len = seqLens[rowIdx / next_n];
-  int rowEnd = seq_len - next_n + (rowIdx % next_n) + 1;
+  int batch_idx = rowIdx / next_n;
+  int next_n_idx = rowIdx % next_n;
+  // seqLensIs2D=0: 1D seqLens — all rows in a batch share the same seq_len;
+  //               kernel computes per-row effective length via offset.
+  // seqLensIs2D=1: 2D seqLens — each logit row has its own pre-computed
+  //               effective length (flat index rowIdx = b*next_n + j maps
+  //               directly to seqLens[b, j] in C-contiguous layout).
+  int seq_len = seqLensIs2D ? seqLens[rowIdx] : seqLens[batch_idx];
+  int rowEnd =
+      seqLensIs2D ? max(0, seq_len) : max(0, seq_len - next_n + next_n_idx + 1);
+
+  // Local pointers to this block
+  if constexpr (!multipleBlocksPerRow && !mergeBlocks) {
+    outIndices += static_cast<int64_t>(rowIdx) * topK;
+  } else if constexpr (multipleBlocksPerRow) {
+    const auto blockSize = rowEnd / gridDim.y;  // 16384 / 2 = 8192
+    rowStart = blockSize * blockIdx.y;          // 8192 * 1 = 8192
+    rowEnd = gridDim.y == blockIdx.y + 1 ? rowEnd : rowStart + blockSize;
+    outIndices +=
+        static_cast<int64_t>(rowIdx) * gridDim.y * topK + blockIdx.y * topK;
+    outLogits +=
+        static_cast<int64_t>(rowIdx) * gridDim.y * topK + blockIdx.y * topK;
+  } else if constexpr (mergeBlocks) {
+    rowEnd = numBlocksToMerge * topK;
+    indices += static_cast<int64_t>(rowIdx) * numBlocksToMerge * topK;
+    outIndices += static_cast<int64_t>(rowIdx) * topK;
+  }
+  logits += static_cast<int64_t>(rowIdx) * stride0;
+
+  topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort,
+                multipleBlocksPerRow, mergeBlocks>(
+      indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
+}
+
+#ifdef USE_ROCM
+// Measured native-kernel policy for gfx950, FP32, and k=1024. This
+// active-column split crossover is independent of the Python AITER/native
+// backend crossover; the two policies can be retuned separately. At exactly
+// 64K, an eager call may select AITER while a captured native replay uses two
+// splits.
+constexpr int kGfx950C4AShortRowNumBlocks = 3;
+constexpr int kGfx950C4ALongRowNumBlocks = 2;
+constexpr int kGfx950C4ATwoSplitMinRowLength = 64 * 1024;
+
+template <int kNumThreadsPerBlock, bool mergeBlocks = false>
+static __global__
+__launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeDeviceLengthAware(
+    const float* logits, const int* seqLens, int* outIndices, int stride0,
+    int stride1, const int topK, int next_n, int seqLensIs2D = 0,
+    float* outLogits = nullptr, const int* indices = nullptr) {
+  static constexpr int kNumBins = 2048;
+  int rowIdx = blockIdx.x;
+  int batch_idx = rowIdx / next_n;
+  int next_n_idx = rowIdx % next_n;
+  int seq_len = seqLensIs2D ? seqLens[rowIdx] : seqLens[batch_idx];
+  int rowEnd =
+      seqLensIs2D ? max(0, seq_len) : max(0, seq_len - next_n + next_n_idx + 1);
+  const int activeBlocks = rowEnd >= kGfx950C4ATwoSplitMinRowLength
+                               ? kGfx950C4ALongRowNumBlocks
+                               : kGfx950C4AShortRowNumBlocks;
+  int rowStart = 0;
+
+  if constexpr (!mergeBlocks) {
+    if (blockIdx.y >= activeBlocks) return;
+    const auto blockSize = rowEnd / activeBlocks;
+    rowStart = blockSize * blockIdx.y;
+    rowEnd = activeBlocks == blockIdx.y + 1 ? rowEnd : rowStart + blockSize;
+    outIndices +=
+        static_cast<int64_t>(rowIdx) * kGfx950C4AShortRowNumBlocks * topK +
+        blockIdx.y * topK;
+    outLogits +=
+        static_cast<int64_t>(rowIdx) * kGfx950C4AShortRowNumBlocks * topK +
+        blockIdx.y * topK;
+  } else {
+    rowEnd = activeBlocks * topK;
+    indices +=
+        static_cast<int64_t>(rowIdx) * kGfx950C4AShortRowNumBlocks * topK;
+    outIndices += static_cast<int64_t>(rowIdx) * topK;
+  }
+  logits += static_cast<int64_t>(rowIdx) * stride0;
+
+  topKPerRowJob<kNumThreadsPerBlock, kNumBins, true, !mergeBlocks, mergeBlocks,
+                true>(indices, logits, rowStart, rowEnd, outIndices, outLogits,
+                      stride1, topK);
+}
+
+// The grid and workspace stay fixed while graph replays change device lengths.
+__device__ int gfx950TopK512ActiveBlocks(int rowLength, int numRows,
+                                         int maxBlocks) {
+  int activeBlocks = 1;
+  if (numRows <= 32 && rowLength > 16 * 1024) {
+    activeBlocks = rowLength <= 128 * 1024   ? 8
+                   : rowLength <= 256 * 1024 ? 10
+                                             : 16;
+  } else if (numRows <= 128 && rowLength > 64 * 1024) {
+    activeBlocks = rowLength <= 512 * 1024 ? 4 : 10;
+  } else if (numRows > 128 && numRows <= 256 && rowLength > 256 * 1024) {
+    activeBlocks = numRows <= 160 ? 3 : 2;
+  }
+  // Every block in a merged row must contain at least k real indices.
+  return min(min(activeBlocks, maxBlocks), max(1, rowLength / 512));
+}
 
   topKPerRowJob<kNumThreadsPerBlock, kNumBins, kTopK>(
       logits, rowStart, rowEnd, rowIdx, outIndices, stride0, stride1);
 }
+#endif  // USE_ROCM
 
 }  // namespace vllm
 

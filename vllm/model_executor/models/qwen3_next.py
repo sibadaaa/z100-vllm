@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
+from transformers import Qwen3NextConfig
 
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.layers.attention import Attention
@@ -90,6 +91,7 @@ from vllm.transformers_utils.configs import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import (
     EagleModelMixin,
@@ -142,7 +144,12 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        reduce_results: bool = True,
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -227,7 +234,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
             n_shared_experts=1 if self.shared_expert is None else None,
+            reduce_results=reduce_results,
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
+            shared_expert_prefix=f"{prefix}.shared_expert",
             shared_expert_gate=self.shared_expert_gate
             if self.shared_expert is None
             else None,
@@ -1311,6 +1320,7 @@ class Qwen3NextAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mrope_positions_factor: int = 4,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1361,6 +1371,7 @@ class Qwen3NextAttention(nn.Module):
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
+            mrope_positions_factor=mrope_positions_factor,
         )
 
         attn_type = (
@@ -1811,6 +1822,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
 
 class QwenNextMixtureOfExperts(MixtureOfExperts):
+    model: Qwen3NextModel
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1875,12 +1889,8 @@ class Qwen3NextForCausalLM(
         config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
-        assert not cache_config.enable_prefix_caching, (
-            "Qwen3Next currently does not support prefix caching"
-        )
         self.quant_config = vllm_config.quant_config
 
         super().__init__()

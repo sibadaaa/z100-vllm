@@ -25,9 +25,10 @@ from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.renderers import BaseRenderer, renderer_from_config
-from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
-from vllm.tokenizers import MistralTokenizer, TokenizerLike
+from vllm.renderers.inputs.preprocess import parse_model_prompt
+from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
+from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine import EngineCoreRequest
@@ -97,72 +98,16 @@ class InputProcessor:
 
     def _validate_logprobs(
         self,
-        params: SamplingParams,
-    ) -> None:
-        max_logprobs = self.model_config.max_logprobs
-        if max_logprobs == -1:
-            max_logprobs = self.model_config.get_vocab_size()
+    ) -> Callable[[SamplingParams], None]:
+        """Load the custom logits processor classes and return the per-request
+        params validator for the active model runner."""
+        custom_logitsprocs = self.model_config.logits_processors
+        if self.vllm_config.use_v2_model_runner:
+            if self.model_config.runner_type == "pooling" and not custom_logitsprocs:
+                return lambda _: None
 
-        # Validate sample logprobs.
-        if params.logprobs:
-            num_logprobs = params.logprobs
-            if num_logprobs == -1:
-                num_logprobs = self.model_config.get_vocab_size()
-            if num_logprobs > max_logprobs:
-                raise ValueError(
-                    f"Requested sample logprobs of {num_logprobs}, "
-                    f"which is greater than max allowed: {max_logprobs}"
-                )
-
-        # Validate prompt logprobs.
-        if params.prompt_logprobs:
-            num_prompt_logprobs = params.prompt_logprobs
-            if num_prompt_logprobs == -1:
-                num_prompt_logprobs = self.model_config.get_vocab_size()
-            if num_prompt_logprobs > max_logprobs:
-                raise ValueError(
-                    f"Requested prompt logprobs of {num_prompt_logprobs}, "
-                    f"which is greater than max allowed: {max_logprobs}"
-                )
-
-    def _validate_sampling_params(
-        self,
-        params: SamplingParams,
-    ) -> None:
-        self._validate_structured_output(params)
-        self._validate_logit_bias(params)
-
-        if params.allowed_token_ids is None:
-            return
-        if not params.allowed_token_ids:
-            raise ValueError("allowed_token_ids is not None and empty!")
-        if self.tokenizer is None:
-            # When skip_tokenizer_init=True, we can't validate token IDs
-            # Skip validation and let the model handle invalid tokens
-            return
-        vocab_size = len(self.tokenizer)
-        if not all(0 <= tid < vocab_size for tid in params.allowed_token_ids):
-            raise ValueError("allowed_token_ids contains out-of-vocab token id!")
-
-    def _validate_logit_bias(
-        self,
-        params: SamplingParams,
-    ) -> None:
-        """Validate logit_bias token IDs are within vocabulary range."""
-        if not params.logit_bias:
-            return
-
-        vocab_size = self.model_config.get_vocab_size()
-        invalid_token_ids = []
-
-        for token_id in params.logit_bias:
-            if token_id < 0 or token_id >= vocab_size:
-                invalid_token_ids.append(token_id)
-
-        if invalid_token_ids:
-            raise ValueError(
-                f"token_id(s) {invalid_token_ids} in logit_bias contain "
-                f"out-of-vocab token ids. Vocabulary size: {vocab_size}"
+            from vllm.v1.worker.gpu.sample.logits_processor import (
+                build_custom_logits_processors_params_validator,
             )
 
     def _validate_supported_sampling_params(
@@ -201,29 +146,84 @@ class InputProcessor:
                 "structured_outputs."
             )
 
+    def resolve_watermarking(self, params: SamplingParams | BeamSearchParams) -> bool:
+        """Return whether watermarking will be applied to this request.
+
+        ``None`` and ``True`` request watermarking, while ``False`` opts out.
+        If watermarking is unavailable or incompatible with the request, emit
+        a warning and return ``False``.
+        """
+        return self.vllm_config._check_supports_watermarking(params)
+
+    def apply_watermarking(self, params: SamplingParams, watermarking: bool) -> None:
+        """Store the resolved `watermarking` on request-local params.
+
+        Also records whether watermarking was requested on a watermarking
+        engine but could not be applied, as opposed to an explicit opt-out.
+        """
+        # Sticky, so resolving an already resolved request keeps the flag.
+        params._watermarking_skipped = params._watermarking_skipped or (
+            self.vllm_config.watermark_config is not None
+            and params.watermarking is not False
+            and not watermarking
+        )
+        params.watermarking = watermarking
+
     def _validate_params(
         self,
         params: SamplingParams | PoolingParams,
-    ):
-        """
-        Validate supported SamplingParam.
-        Should raise ValueError if unsupported for API Server.
-        """
+        supported_tasks: tuple[SupportedTask, ...],
+    ) -> bool | None:
+        """Raise `ValueError` if SamplingParams or PoolingParams is not valid.
 
-        if isinstance(params, PoolingParams):
-            return
+        Returns the resolved `watermarking` value for `SamplingParams` (`None`
+        for `PoolingParams`). The caller applies it to its private copy of the
+        params so that a caller-owned params object is never mutated.
+        """
+        watermarking: bool | None = None
+        if isinstance(params, SamplingParams):
+            supported_generation_tasks = [
+                task for task in supported_tasks if task in GENERATION_TASKS
+            ]
+            if not supported_generation_tasks:
+                raise VLLMValidationError("This model does not support generation")
+
+            params.verify(
+                self.model_config,
+                self.speculative_config,
+                self.structured_outputs_config,
+                self.tokenizer,
+            )
+            if params.prompt_logprob_token_ids is not None:
+                if not self.vllm_config.use_v2_model_runner:
+                    raise VLLMValidationError(
+                        "prompt_logprob_token_ids requires the V2 model runner "
+                        "(VLLM_USE_V2_MODEL_RUNNER=1).",
+                        parameter="prompt_logprob_token_ids",
+                    )
+                if self.vllm_config.cache_config.kv_sharing_fast_prefill:
+                    raise VLLMValidationError(
+                        "prompt_logprob_token_ids is incorrect with "
+                        "--kv-sharing-fast-prefill; disable it for scoring.",
+                        parameter="prompt_logprob_token_ids",
+                    )
 
         self._validate_logprobs(params)
         self._validate_sampling_params(params)
         self._validate_supported_sampling_params(params)
 
-    def _validate_multi_modal_uuids(self, prompt: PromptType | EngineInput) -> None:
-        """
-        Validate that user-provided multi_modal_uuids align with
-        multi_modal_data in the incoming request prompt(s).
-        Only checks lengths; `None` entries are allowed and will be
-        auto-hashed downstream.
-        """
+            if self.model_config.is_diffusion:
+                # Without --diffusion-config the served canvas is unknown here;
+                # the ids and the read-only normalisation are still checked.
+                validate_diffusion_sampling_params(
+                    params,
+                    canvas_length=(
+                        self.diffusion_config.canvas_length
+                        if self.diffusion_config is not None
+                        else None
+                    ),
+                    vocab_size=self.model_config.get_vocab_size(),
+                )
 
         def _validate_single_prompt(single_prompt: dict | str) -> None:
             if not isinstance(single_prompt, dict):
@@ -253,6 +253,33 @@ class InputProcessor:
                         f"multi_modal_uuids for modality '{modality}' must "
                         "be provided if multi_modal_data is provided."
                     )
+            if params.thinking_token_budget is not None and (
+                self.vllm_config.reasoning_config is None
+                or not self.vllm_config.reasoning_config.enabled
+            ):
+                raise VLLMValidationError(
+                    "thinking_token_budget is set but reasoning_config is "
+                    "not configured. Please set --reasoning-parser "
+                    "and/or --reasoning-config to use thinking_token_budget."
+                )
+            if (
+                params.trace_decode_token_ids
+                and not self.model_config.enable_trace_replay
+            ):
+                raise VLLMValidationError(
+                    "trace_decode_token_ids is set but trace replay is not "
+                    "enabled. Start the engine with --enable-trace-replay "
+                    "to use it."
+                )
+            # Resolved last so that feature gates above report the missing
+            # feature rather than its incompatibility with watermarking.
+            watermarking = self.resolve_watermarking(params)
+        elif isinstance(params, PoolingParams):
+            supported_pooling_tasks = [
+                task for task in supported_tasks if task in POOLING_TASKS
+            ]
+            if not supported_pooling_tasks:
+                raise VLLMValidationError("This model does not support pooling")
 
         # Handle explicit encoder/decoder prompts or singleton prompt
         if isinstance(prompt, dict) and "encoder_prompt" in prompt:
@@ -263,7 +290,36 @@ class InputProcessor:
             if dec is not None:
                 _validate_single_prompt(cast(dict | str, dec))
         else:
-            _validate_single_prompt(prompt)  # type: ignore[arg-type]
+            raise TypeError(
+                f"params must be either SamplingParams or PoolingParams, "
+                f"but got {type(params).__name__}"
+            )
+
+        return watermarking
+
+    def _normalize_trace_replay_params(
+        self, sampling_params: SamplingParams, prompt_len: int
+    ) -> None:
+        """Apply trace replay's generation semantics to request-local params."""
+        trace_token_ids = sampling_params.trace_decode_token_ids
+        assert trace_token_ids
+        assert sampling_params.max_tokens is not None
+
+        max_trace_len = max(self.model_config.max_model_len - prompt_len, 1)
+        trace_token_ids = trace_token_ids[:max_trace_len]
+        sampling_params.trace_decode_token_ids = trace_token_ids
+
+        # Apply this after the generation config so its EOS token cannot stop
+        # replay before the trace is exhausted.
+        sampling_params.max_tokens = min(
+            len(trace_token_ids), sampling_params.max_tokens
+        )
+        sampling_params.min_tokens = 0
+        sampling_params.ignore_eos = True
+        sampling_params._eos_token_id = None
+        sampling_params.stop = []
+        sampling_params.stop_token_ids = []
+        sampling_params._all_stop_token_ids = set()
 
     def _validate_lora(self, lora_request: LoRARequest | None) -> None:
         if lora_request is None:
@@ -454,6 +510,7 @@ class InputProcessor:
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
+        watermarking = self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
         self._validate_params(params)
 
@@ -554,6 +611,32 @@ class InputProcessor:
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
+            # Resolve on the request-local copy: `params` may be shared across
+            # prompts, requests and even engines by the caller.
+            assert watermarking is not None
+            self.apply_watermarking(sampling_params, watermarking)
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds
+            )
+            if not 0 <= sampling_params.routed_experts_prompt_start <= prompt_len:
+                raise VLLMValidationError(
+                    f"routed_experts_prompt_start must be between 0 and "
+                    f"the prompt length ({prompt_len}), inclusive.",
+                    parameter="routed_experts_prompt_start",
+                    value=sampling_params.routed_experts_prompt_start,
+                )
+            rows = sampling_params.prompt_logprob_token_ids
+            if rows is not None:
+                start = sampling_params.prompt_logprob_start or 0
+                num_rows = max(prompt_len - 1 - start, 0)
+                if len(rows) != num_rows:
+                    raise VLLMValidationError(
+                        f"prompt_logprob_token_ids has {len(rows)} rows, but the "
+                        f"prompt has {num_rows} scored rows "
+                        f"(prompt_len - 1 - prompt_logprob_start).",
+                        parameter="prompt_logprob_token_ids",
+                        value=len(rows),
+                    )
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(
@@ -731,8 +814,57 @@ class InputProcessor:
                 f"model length of {max_prompt_len}. {suggestion}"
             )
 
-    def stat_mm_cache(self) -> MultiModalCacheStats | None:
-        return self.input_preprocessor.stat_mm_cache()
+    def _validate_model_input(
+        self,
+        prompt_input: SingletonInput,
+        prompt_type: Literal["encoder", "decoder"],
+    ) -> None:
+        prompt_ids = (
+            None
+            if prompt_input["type"] == "embeds"
+            else prompt_input["prompt_token_ids"]
+        )
+        prompt_embeds = (
+            prompt_input["prompt_embeds"] if prompt_input["type"] == "embeds" else None
+        )
 
-    def clear_mm_cache(self) -> None:
-        self.input_preprocessor.clear_mm_cache()
+        prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
+        self._validate_prompt_len(prompt_len, prompt_type)
+
+        if prompt_input["type"] == "embeds":
+            is_token_ids = prompt_input.get("is_token_ids")
+            if is_token_ids is not None and len(is_token_ids) != prompt_len:
+                raise VLLMValidationError(
+                    "prompt_is_token_ids must have the same length as prompt_embeds "
+                    f"(expected {prompt_len}, got {len(is_token_ids)}).",
+                    parameter="prompt_is_token_ids",
+                )
+
+        if prompt_input["type"] == "multimodal":
+            decoder_mm_positions = prompt_input["mm_placeholders"]
+            for modality, mm_positions in decoder_mm_positions.items():
+                for mm_position in mm_positions:
+                    num_embeds = mm_position.get_num_embeds()
+                    if num_embeds > self.mm_encoder_cache_size:
+                        raise VLLMValidationError(
+                            f"The {prompt_type} prompt contains a(n) {modality} item "
+                            f"with {num_embeds} embedding tokens, which exceeds the "
+                            f"pre-allocated encoder cache size "
+                            f"{self.mm_encoder_cache_size}. Please reduce the input "
+                            f"size or increase the encoder cache size "
+                            f"by setting --limit-mm-per-prompt at startup."
+                        )
+
+        # Shared by generate, embedding and pooling requests.
+        if prompt_ids:
+            self.renderer.validate_token_ids(prompt_ids)
+
+    def _validate_model_inputs(
+        self,
+        encoder_input: SingletonInput | None,
+        decoder_input: SingletonInput,
+    ):
+        if encoder_input is not None:
+            self._validate_model_input(encoder_input, prompt_type="encoder")
+
+        self._validate_model_input(decoder_input, prompt_type="decoder")

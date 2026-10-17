@@ -12,7 +12,7 @@ affine==2.4.0
     # via rasterio
 aiohappyeyeballs==2.6.1
     # via aiohttp
-aiohttp==3.13.0
+aiohttp==3.14.3
     # via
     #   aiohttp-cors
     #   datasets
@@ -32,12 +32,12 @@ alembic==1.16.4
     # via mlflow
 annotated-types==0.7.0
     # via pydantic
-antlr4-python3-runtime==4.9.3
+anthropic==0.112.0
+    # via -r requirements/test/../common.txt
+anyio==4.14.2
     # via
-    #   hydra-core
-    #   omegaconf
-anyio==4.6.2.post1
-    # via
+    #   -r requirements/test/cuda.in
+    #   anthropic
     #   httpx
     #   starlette
 arctic-inference==0.1.1
@@ -59,19 +59,17 @@ attrs==24.2.0
 audioread==3.0.1
     # via librosa
 backoff==2.2.1
+    # via -r requirements/test/cuda.in
+black==26.5.1
     # via
-    #   -r requirements/test.in
-    #   schemathesis
-bitsandbytes==0.46.1
-    # via
-    #   -r requirements/test.in
-    #   lightning
-black==24.10.0
-    # via datamodel-code-generator
-blinker==1.9.0
-    # via flask
+    #   -r requirements/test/cuda.in
+    #   datamodel-code-generator
+blake3==1.0.9
+    # via -r requirements/test/../common.txt
 blobfile==3.0.0
-    # via -r requirements/test.in
+    # via
+    #   -r requirements/test/cuda.in
+    #   gpt-oss
 bm25s==0.2.13
     # via mteb
 boto3==1.35.57
@@ -106,7 +104,7 @@ chardet==5.2.0
     # via mbstrdecoder
 charset-normalizer==3.4.0
     # via requests
-chz==0.3.0
+chz==0.4.0
     # via gpt-oss
 click==8.1.7
     # via
@@ -146,14 +144,17 @@ coverage==7.10.6
     # via pytest-cov
 cramjam==2.9.0
     # via fastparquet
-cupy-cuda12x==13.6.0
-    # via ray
+cryptography==50.0.1
+    # via
+    #   -r requirements/test/cuda.in
+    #   azure-identity
+    #   azure-storage-blob
+    #   msal
+    #   pyjwt
 cycler==0.12.1
     # via matplotlib
-databricks-sdk==0.59.0
-    # via mlflow-skinny
-datamodel-code-generator==0.26.3
-    # via -r requirements/test.in
+datamodel-code-generator==0.79.0
+    # via -r requirements/test/cuda.in
 dataproperty==1.0.1
     # via
     #   pytablewriter
@@ -166,7 +167,13 @@ datasets==3.0.2
 decorator==5.1.1
     # via librosa
 decord==0.6.0
-    # via -r requirements/test.in
+    # via -r requirements/test/cuda.in
+defusedxml==0.7.1
+    # via nltk
+depyf==0.20.0
+    # via -r requirements/test/../common.txt
+detect-installer==0.1.0
+    # via fastapi-cloud-cli
 dill==0.3.8
     # via
     #   datasets
@@ -177,10 +184,8 @@ distlib==0.3.9
     # via virtualenv
 dnspython==2.7.0
     # via email-validator
-docker==7.1.0
-    # via
-    #   gpt-oss
-    #   mlflow
+docker==7.2.0
+    # via gpt-oss
 docopt==0.6.2
     # via num2words
 docstring-parser==0.17.0
@@ -209,27 +214,22 @@ fastapi==0.116.1
     #   mlflow-skinny
 fastparquet==2024.11.0
     # via genai-perf
-fastrlock==0.8.2
-    # via cupy-cuda12x
-fastsafetensors==0.1.10
-    # via -r requirements/test.in
-filelock==3.16.1
+fastsafetensors==0.3.3
+    # via -r requirements/test/cuda.in
+filelock==4.0.7
     # via
     #   blobfile
     #   datasets
     #   huggingface-hub
+    #   python-discovery
     #   ray
     #   torch
     #   transformers
     #   virtualenv
-fiona==1.10.1
-    # via torchgeo
-flask==3.1.1
-    # via mlflow
-fonttools==4.55.0
-    # via matplotlib
-fqdn==1.5.1
-    # via jsonschema
+fonttools==4.66.1
+    # via
+    #   -r requirements/test/cuda.in
+    #   matplotlib
 frozendict==2.4.6
     # via einx
 frozenlist==1.5.0
@@ -280,11 +280,12 @@ google-crc32c==1.7.1
 google-resumable-media==2.7.2
     # via google-cloud-storage
 googleapis-common-protos==1.70.0
-    # via google-api-core
-gpt-oss==0.0.8
-    # via -r requirements/test.in
-graphene==3.4.3
-    # via mlflow
+    # via
+    #   google-api-core
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+gpt-oss==0.0.9
+    # via -r requirements/test/cuda.in
 graphql-core==3.2.6
     # via
     #   graphene
@@ -302,14 +303,20 @@ h11==0.14.0
     # via
     #   httpcore
     #   uvicorn
-h5py==3.13.0
-    # via terratorch
-harfile==0.3.0
+h2==4.4.1
+    # via
+    #   -r requirements/test/cuda.in
+    #   httpx
+harfile==0.5.0
     # via schemathesis
 hf-xet==1.1.7
     # via huggingface-hub
 hiredis==3.0.0
     # via tensorizer
+hpack==4.2.0
+    # via
+    #   -r requirements/test/cuda.in
+    #   h2
 html2text==2025.4.15
     # via gpt-oss
 httpcore==1.0.6
@@ -318,7 +325,11 @@ httpx==0.27.2
     # via
     #   -r requirements/test.in
     #   schemathesis
-huggingface-hub==0.34.3
+httpx2==2.12.0
+    # via
+    #   -r requirements/test/cuda.in
+    #   mcp
+huggingface-hub==1.31.0
     # via
     #   accelerate
     #   datasets
@@ -367,8 +378,12 @@ inflect==5.6.2
     # via datamodel-code-generator
 iniconfig==2.0.0
     # via pytest
-isoduration==20.11.0
-    # via jsonschema
+instanttensor==0.2.2
+    # via -r requirements/test/cuda.in
+interegular==0.3.3
+    # via lm-format-enforcer
+isodate==0.7.2
+    # via azure-storage-blob
 isort==5.13.2
     # via datamodel-code-generator
 itsdangerous==2.2.0
@@ -376,8 +391,10 @@ itsdangerous==2.2.0
 jinja2==3.1.6
     # via
     #   datamodel-code-generator
-    #   flask
-    #   mlflow
+    #   fastapi
+    #   genai-perf
+    #   gpt-oss
+    #   lm-eval
     #   torch
 jiwer==3.0.5
     # via -r requirements/test.in
@@ -408,6 +425,12 @@ jsonschema-specifications==2024.10.1
     # via jsonschema
 junit-xml==1.9
     # via schemathesis
+jupyter-client==8.10.0
+    # via gpt-oss
+jupyter-core==5.9.1
+    # via jupyter-client
+kaldi-native-fbank==1.22.3
+    # via -r requirements/test/cuda.in
 kaleido==0.2.1
     # via genai-perf
 kiwisolver==1.4.7
@@ -441,17 +464,22 @@ lightning-utilities==0.14.3
     #   torchmetrics
 llvmlite==0.44.0
     # via numba
-lm-eval @ git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d
-    # via -r requirements/test.in
-lxml==5.3.0
+lm-eval==0.4.12
+    # via -r requirements/test/cuda.in
+lm-format-enforcer==0.11.3
+    # via -r requirements/test/../common.txt
+loguru==0.7.3
+    # via compressed-tensors
+lxml==6.1.3
     # via
+    #   -r requirements/test/cuda.in
     #   blobfile
     #   gpt-oss
     #   sacrebleu
-mako==1.3.10
-    # via alembic
-markdown==3.8.2
-    # via mlflow
+mako==1.4.3
+    # via
+    #   -r requirements/test/cuda.in
+    #   alembic
 markdown-it-py==3.0.0
     # via rich
 markupsafe==3.0.1
@@ -484,8 +512,15 @@ more-itertools==10.5.0
     # via lm-eval
 mpmath==1.3.0
     # via sympy
-msgpack==1.1.0
+msal==1.39.0
     # via
+    #   azure-identity
+    #   msal-extensions
+msal-extensions==1.3.1
+    # via azure-identity
+msgpack==1.2.3
+    # via
+    #   -r requirements/test/cuda.in
     #   librosa
     #   ray
 mteb==2.1.2
@@ -506,8 +541,12 @@ networkx==3.2.1
     # via
     #   scikit-image
     #   torch
-nltk==3.9.1
-    # via rouge-score
+ninja==1.13.0
+    # via -r requirements/test/../common.txt
+nltk==3.10.3
+    # via
+    #   -r requirements/test/cuda.in
+    #   rouge-score
 num2words==0.5.14
     # via -r requirements/test.in
 numba==0.61.2
@@ -525,7 +564,6 @@ numpy==1.26.4
     #   bitsandbytes
     #   bm25s
     #   contourpy
-    #   cupy-cuda12x
     #   datasets
     #   decord
     #   einx
@@ -533,8 +571,8 @@ numpy==1.26.4
     #   evaluate
     #   fastparquet
     #   genai-perf
-    #   geopandas
-    #   h5py
+    #   gpt-oss
+    #   imagehash
     #   imageio
     #   librosa
     #   lightly
@@ -572,8 +610,10 @@ numpy==1.26.4
     #   transformers
     #   tritonclient
     #   vocos
-    #   xarray
-nvidia-cublas-cu12==12.9.1.4
+    #   xgrammar
+open-clip-torch==2.32.0
+    # via -r requirements/test/cuda.in
+openai==2.44.0
     # via
     #   nvidia-cudnn-cu12
     #   nvidia-cusolver-cu12
@@ -647,11 +687,22 @@ opentelemetry-sdk==1.35.0
     #   ray
 opentelemetry-semantic-conventions==0.56b0
     # via opentelemetry-sdk
+opentelemetry-semantic-conventions-ai==0.4.13
+    # via -r requirements/test/../common.txt
+optuna==3.6.1
+    # via genai-perf
+orjson==3.12.0
+    # via
+    #   -r requirements/test/cuda.in
+    #   genai-perf
+oss-harmony==0.0.11
+    # via -r requirements/test/../common.txt
+outlines-core==0.2.14
+    # via -r requirements/test/../common.txt
 packaging==24.2
     # via
     #   accelerate
     #   black
-    #   datamodel-code-generator
     #   datasets
     #   evaluate
     #   fastparquet
@@ -680,29 +731,30 @@ packaging==24.2
     #   torchmetrics
     #   transformers
     #   typepy
-    #   xarray
+    #   virtualenv
 pandas==2.2.3
     # via
     #   datasets
     #   evaluate
     #   fastparquet
     #   genai-perf
-    #   geopandas
-    #   mlflow
+    #   gpt-oss
     #   statsmodels
-    #   torchgeo
-    #   xarray
-pathspec==0.12.1
+partial-json-parser==0.2.1.1.post7
+    # via -r requirements/test/../common.txt
+pathspec==1.1.1
     # via black
 pathvalidate==3.2.1
     # via pytablewriter
 patsy==1.0.1
     # via statsmodels
-peft==0.16.0
-    # via
-    #   -r requirements/test.in
-    #   lm-eval
-pillow==10.4.0
+peft==0.21.1
+    # via -r requirements/test/cuda.in
+perceptron==0.1.4
+    # via -r requirements/test/cuda.in
+perf-analyzer==0.1.0
+    # via genai-perf
+pillow==12.3.0
     # via
     #   genai-perf
     #   imageio
@@ -717,6 +769,7 @@ pillow==10.4.0
 platformdirs==4.3.6
     # via
     #   black
+    #   jupyter-core
     #   pooch
     #   virtualenv
 plotly==5.24.1
@@ -765,13 +818,14 @@ py==1.11.0
     # via pytest-forked
 py-spy==0.4.0
     # via ray
-pyarrow==18.0.0
+pyarrow==25.0.1
     # via
+    #   -r requirements/test/cuda.in
     #   datasets
     #   genai-perf
-    #   mlflow
-pyasn1==0.6.1
+pyasn1==0.6.4
     # via
+    #   -r requirements/test/cuda.in
     #   pyasn1-modules
     #   rsa
 pyasn1-modules==0.4.2
@@ -797,17 +851,30 @@ pydantic==2.12.0
     #   mistral-common
     #   mlflow-skinny
     #   mteb
-    #   openai-harmony
+    #   openai
+    #   oss-harmony
     #   pydantic-extra-types
     #   ray
 pydantic-core==2.41.1
     # via pydantic
 pydantic-extra-types==2.10.5
-    # via mistral-common
-pygments==2.18.0
-    # via rich
-pyogrio==0.11.0
-    # via geopandas
+    # via
+    #   fastapi
+    #   mistral-common
+pydantic-settings==2.14.2
+    # via
+    #   -r requirements/test/cuda.in
+    #   fastapi
+pygments==2.21.0
+    # via
+    #   -r requirements/test/cuda.in
+    #   pytest
+    #   rich
+pyjwt==2.15.1
+    # via
+    #   -r requirements/test/cuda.in
+    #   mcp
+    #   msal
 pyparsing==3.2.0
     # via
     #   matplotlib
@@ -860,17 +927,27 @@ python-dateutil==2.9.0.post0
     # via
     #   arrow
     #   botocore
-    #   graphene
-    #   lightly
+    #   jupyter-client
     #   matplotlib
     #   pandas
     #   typepy
+python-discovery==1.6.1
+    # via virtualenv
+python-dotenv==1.2.2
+    # via
+    #   pydantic-settings
+    #   uvicorn
+python-json-logger==4.1.0
+    # via -r requirements/test/../common.txt
+python-multipart==0.0.32
+    # via
+    #   -r requirements/test/cuda.in
+    #   fastapi
+    #   mcp
 python-rapidjson==1.20
     # via tritonclient
-pytorch-lightning==2.5.2
-    # via
-    #   lightly
-    #   lightning
+pytokens==0.4.1
+    # via black
 pytrec-eval-terrier==0.5.7
     # via mteb
 pytz==2024.2
@@ -897,6 +974,10 @@ pyyaml==6.0.2
     #   timm
     #   transformers
     #   vocos
+pyzmq==27.1.0
+    # via
+    #   -r requirements/test/../common.txt
+    #   jupyter-client
 rapidfuzz==3.12.1
     # via jiwer
 rasterio==1.4.3
@@ -919,7 +1000,7 @@ regex==2024.9.11
     #   sacrebleu
     #   tiktoken
     #   transformers
-requests==2.32.3
+requests==2.34.2
     # via
     #   buildkite-test-collector
     #   databricks-sdk
@@ -1015,7 +1096,13 @@ sentence-transformers==3.2.1
     # via
     #   -r requirements/test.in
     #   mteb
-setuptools==77.0.3
+sentencepiece==0.2.1
+    # via -r requirements/test/../common.txt
+sentry-sdk==2.63.0
+    # via fastapi-cloud-cli
+setproctitle==1.3.7
+    # via -r requirements/test/../common.txt
+setuptools==80.10.2
     # via
     #   lightning-utilities
     #   pytablewriter
@@ -1071,7 +1158,7 @@ starlette-testclient==0.4.1
     # via schemathesis
 statsmodels==0.14.4
     # via genai-perf
-structlog==25.4.0
+structlog==26.1.0
     # via gpt-oss
 sympy==1.13.3
     # via
@@ -1093,8 +1180,8 @@ tenacity==9.1.2
 tensorboardx==2.6.4
     # via lightning
 tensorizer==2.10.1
-    # via -r requirements/test.in
-termcolor==3.1.0
+    # via -r requirements/test/cuda.in
+termcolor==3.3.0
     # via gpt-oss
 terratorch @ git+https://github.com/IBM/terratorch.git@07184fcf91a1324f831ff521dd238d97fe350e3e
     # via -r requirements/test.in
@@ -1114,17 +1201,11 @@ timm==1.0.17
     #   -r requirements/test.in
     #   open-clip-torch
     #   segmentation-models-pytorch
-    #   terratorch
-    #   torchgeo
-tokenizers==0.22.0
+tokenizers==0.23.2
     # via
     #   -r requirements/test.in
     #   transformers
-tomli==2.2.1
-    # via schemathesis
-tomli-w==1.2.0
-    # via schemathesis
-torch==2.9.0+cu129
+torch==2.14.0+cpu
     # via
     #   -r requirements/test.in
     #   accelerate
@@ -1158,9 +1239,9 @@ torchaudio==2.9.0+cu129
     #   -r requirements/test.in
     #   encodec
     #   vocos
-torchgeo==0.7.0
-    # via terratorch
-torchmetrics==1.7.4
+torchcodec==0.14.0+cpu
+    # via -r requirements/test/cuda.in
+torchvision==0.29.0+cpu
     # via
     #   lightning
     #   pytorch-lightning
@@ -1175,11 +1256,13 @@ torchvision==0.24.0+cu129
     #   segmentation-models-pytorch
     #   terratorch
     #   timm
-    #   torchgeo
-tqdm==4.66.6
+tornado==6.5.10
+    # via jupyter-client
+tqdm==4.67.3
     # via
     #   datasets
     #   evaluate
+    #   gpt-oss
     #   huggingface-hub
     #   lightly
     #   lightning
@@ -1195,9 +1278,11 @@ tqdm==4.66.6
     #   sentence-transformers
     #   tqdm-multiprocess
     #   transformers
-tqdm-multiprocess==0.0.11
-    # via lm-eval
-transformers==4.57.3
+traitlets==5.16.1
+    # via
+    #   jupyter-client
+    #   jupyter-core
+transformers==5.19.0
     # via
     #   -r requirements/test.in
     #   genai-perf
@@ -1206,10 +1291,12 @@ transformers==4.57.3
     #   sentence-transformers
     #   transformers-stream-generator
 transformers-stream-generator==0.0.5
-    # via -r requirements/test.in
-triton==3.5.0
-    # via torch
-tritonclient==2.51.0
+    # via -r requirements/test/cuda.in
+triton==3.8.0
+    # via xgrammar
+tritonclient==2.64.0
+    # via -r requirements/test/cuda.in
+truststore==0.10.4
     # via
     #   -r requirements/test.in
     #   genai-perf
@@ -1226,6 +1313,8 @@ typeshed-client==2.8.2
     # via jsonargparse
 typing-extensions==4.15.0
     # via
+    #   -r requirements/test/../common.txt
+    #   aiohttp
     #   aiosignal
     #   albumentations
     #   alembic
@@ -1233,6 +1322,7 @@ typing-extensions==4.15.0
     #   fastapi
     #   graphene
     #   huggingface-hub
+    #   jupyter-client
     #   librosa
     #   lightning
     #   lightning-utilities
@@ -1257,10 +1347,9 @@ typing-inspection==0.4.2
     # via pydantic
 tzdata==2024.2
     # via pandas
-uri-template==1.3.0
-    # via jsonschema
-urllib3==2.2.3
+urllib3==2.8.0
     # via
+    #   -r requirements/test/cuda.in
     #   blobfile
     #   botocore
     #   docker
@@ -1273,25 +1362,27 @@ uvicorn==0.35.0
     #   gpt-oss
     #   mlflow-skinny
 vector-quantize-pytorch==1.21.2
-    # via -r requirements/test.in
-virtualenv==20.31.2
-    # via ray
+    # via -r requirements/test/cuda.in
+virtualenv==21.14.0
+    # via
+    #   -r requirements/test/cuda.in
+    #   ray
 vocos==0.1.0
     # via -r requirements/test.in
 wcwidth==0.2.13
     # via ftfy
-webcolors==24.11.1
-    # via jsonschema
-werkzeug==3.1.3
+websockets==16.0
+    # via uvicorn
+werkzeug==3.1.9
     # via
-    #   flask
+    #   -r requirements/test/cuda.in
     #   schemathesis
 word2number==1.1
     # via lm-eval
 wrapt==1.17.2
     # via smart-open
-xarray==2025.7.1
-    # via rioxarray
+xgrammar==0.2.8
+    # via -r requirements/test/../common.txt
 xxhash==3.5.0
     # via
     #   datasets

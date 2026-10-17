@@ -9,6 +9,7 @@
 #include "quant_conversions.cuh"
 
 #include "../../cub_helpers.h"
+#include "core/cuda_compat.h"
 
 namespace vllm {
 
@@ -311,10 +312,32 @@ __device__ void norm_and_quant(scalar_out_t* __restrict__ output,
     }
 
     q8x4_t<scalar_out_t> out;
+
+    // Group quant multiplies by the reciprocal of the scale (one div per
+    // group), matching per_token_group_quant_8bit. Per-token fp8 must keep
+    // exact division for FBGemm parity, so it is excluded here.
+    constexpr bool mul_by_recip = (group_size > 0) || is_scale_inverted;
+
+    float scale_val;
+
+    if constexpr (group_size > 0) {
+      int64_t const num_groups = hidden_size / group_size;
+      int64_t scale_idx = 0;
+      if constexpr (is_scale_transposed) {
+        int64_t const scale_rows = (gridDim.x + outer_scale_stride - 1) /
+                                   outer_scale_stride * outer_scale_stride;
+        scale_idx = (i * VEC_SIZE / group_size) * scale_rows + blockIdx.x;
+      } else {
+        scale_idx = blockIdx.x * num_groups + i * VEC_SIZE / group_size;
+      }
+      scale_val = 1.0f / scale[scale_idx];
+    } else {
+      scale_val = *scale;
+    }
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
-      out.val[j] = ScaledQuant<scalar_out_t, is_scale_inverted>::quant_fn(
-          static_cast<scalar_t>(x.val[j] * rms) * w.val[j], scale);
+      out.val[j] = ScaledQuant<scalar_out_t, mul_by_recip>::quant_fn(
+          static_cast<scalar_t>(x.val[j] * rms) * w.val[j], scale_val);
     }
     vec_output[i] = out;
   }

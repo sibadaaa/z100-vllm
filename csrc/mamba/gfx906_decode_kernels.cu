@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "../dispatch_utils.h"
+#include "../legacy_dispatch_utils.h"
 
 namespace {
 

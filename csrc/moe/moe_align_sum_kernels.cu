@@ -6,9 +6,11 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/Atomic.cuh>
 
-#include "../cuda_compat.h"
-#include "../dispatch_utils.h"
-#include "core/math.hpp"
+#include "core/cuda_compat.h"
+#include "core/utils.hpp"
+#include "dispatch_utils.h"
+#include "quantization/vectorization.cuh"
+#include "torch_utils.h"
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 

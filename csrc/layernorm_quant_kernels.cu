@@ -5,6 +5,13 @@
  * Currently, only static fp8 quantization is supported.
  */
 
+#include <numeric>
+
+#include "torch_utils.h"
+
+#include "cub_helpers.h"
+#include "core/utils.hpp"
+#include "quantization/w8a8/fp8/common.cuh"
 #include "type_convert.cuh"
 #include "quantization/w8a8/fp8/common.cuh"
 #include "dispatch_utils.h"

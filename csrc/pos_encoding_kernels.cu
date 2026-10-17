@@ -2,7 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "cuda_compat.h"
+#include "core/cuda_compat.h"
 #include "dispatch_utils.h"
 
 namespace vllm {

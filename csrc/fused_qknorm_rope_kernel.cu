@@ -21,7 +21,9 @@
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "cuda_compat.h"
+#include "async_util.cuh"
+#include "core/cuda_compat.h"
+#include "type_convert.cuh"
 #include "dispatch_utils.h"
 #include "type_convert.cuh"
 

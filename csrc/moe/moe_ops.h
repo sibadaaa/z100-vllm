@@ -16,12 +16,33 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           torch::Tensor experts_ids,
                           torch::Tensor num_tokens_post_pad);
 
-void batched_moe_align_block_size(int64_t max_tokens_per_batch,
-                                  int64_t block_size,
-                                  torch::Tensor const& expert_num_tokens,
-                                  torch::Tensor sorted_ids,
-                                  torch::Tensor expert_ids,
-                                  torch::Tensor num_tokens_post_pad);
+void moe_sum(torch::stable::Tensor& input, torch::stable::Tensor& output,
+             std::optional<torch::stable::Tensor> topk_ids,
+             std::optional<torch::stable::Tensor> expert_map);
+
+void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
+                          int64_t block_size,
+                          torch::stable::Tensor sorted_token_ids,
+                          torch::stable::Tensor experts_ids,
+                          torch::stable::Tensor num_tokens_post_pad,
+                          std::optional<torch::stable::Tensor> maybe_expert_map,
+                          std::optional<torch::stable::Tensor> scatter_idx);
+
+#ifdef USE_CUDA
+void fused_globalize_align_block_size(
+    torch::stable::Tensor topk_idx, torch::stable::Tensor psum,
+    int64_t rank_expert_offset, int64_t global_num_experts,
+    int64_t local_num_experts, int64_t block_size,
+    torch::stable::Tensor sorted_ids, torch::stable::Tensor expert_ids,
+    torch::stable::Tensor num_tokens_post_pad,
+    std::optional<torch::stable::Tensor> scatter_idx);
+#endif
+
+void batched_moe_align_block_size(
+    int64_t max_tokens_per_batch, int64_t block_size,
+    const torch::stable::Tensor& expert_num_tokens,
+    torch::stable::Tensor sorted_ids, torch::stable::Tensor expert_ids,
+    torch::stable::Tensor num_tokens_post_pad);
 
 void moe_lora_align_block_size(
     torch::Tensor topk_ids, torch::Tensor token_lora_mapping,

@@ -4,8 +4,12 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 
-#include "attention_dtypes.h"
-#include "attention_utils.cuh"
+#include "../torch_utils.h"
+#include "../dispatch_utils.h"
+#include <torch/headeronly/core/ScalarType.h>
+
+#include "core/vec_dtypes/vec_dtypes.h"
+#include "quantization/w8a8/fp8/common.cuh"
 
 namespace vllm {
 

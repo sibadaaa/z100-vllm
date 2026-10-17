@@ -3,16 +3,36 @@
 
 import pytest
 from transformers import PretrainedConfig
+from transformers import AutoConfig, PreTrainedConfig
 
 from vllm.config.speculative import SpeculativeConfig
 
 
-def _mtp_config(model_type: str) -> PretrainedConfig:
-    return PretrainedConfig(
-        model_type=model_type,
-        architectures=["SomeArch"],
-        mtp_num_hidden_layers=1,
-    )
+def _mtp_config(model_type: str) -> PreTrainedConfig:
+    """Create a top-level MTP configuration with mtp_num_hidden_layers."""
+    kwargs: dict[str, Any] = {
+        "model_type": model_type,
+        "architectures": ["SomeArch"],
+        "mtp_num_hidden_layers": 1,
+    }
+    return PreTrainedConfig(**kwargs)
+
+
+def _multimodal_wrapper_mtp_config(
+    model_type: str, mtp_layers: int = 1
+) -> PreTrainedConfig:
+    """Download a multimodal wrapper config via AutoConfig.from_pretrained
+    and configure mtp_num_hidden_layers in text_config.
+
+    Uses real-world Hugging Face Hub checkpoints:
+    - Dense (qwen3_5):     Qwen/Qwen3.8-27B
+    - MoE   (qwen3_5_moe): Qwen/Qwen3.6-35B-A3B
+    """
+    repo = _CHECKPOINTS[model_type]
+    config: PreTrainedConfig = AutoConfig.from_pretrained(repo)
+    text_config = config.get_text_config()
+    text_config.mtp_num_hidden_layers = mtp_layers
+    return config
 
 
 @pytest.mark.parametrize(
