@@ -599,7 +599,10 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
-  static constexpr int NUM_WARPS = THREADS / WARP_SIZE;
+  // constexpr, not static: a static local needs a global initializer and
+  // clang >= 24 rejects calling the __device__ constexpr get_warp_size() --
+  // which is what WARP_SIZE expands to on ROCm -- from one.
+  constexpr int NUM_WARPS = THREADS / WARP_SIZE;
   static constexpr int NUM_GROUPS = D / GROUP_SIZE;
   const int64_t row_bound =
       num_valid_tokens_ptr != nullptr
@@ -621,7 +624,8 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
 
   if constexpr (sizeof(scalar_t) == 2) {
     static constexpr int LD_ELTS = 16 / sizeof(scalar_t);
-    static constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;
+    // Not static, see the NUM_WARPS comment above.
+    constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;
     static constexpr int STAGE_ELTS = 2 * GROUP_SIZE;
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -749,7 +753,8 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
     const int d, const int num_groups, const float beta,
     const float linear_beta, const int64_t num_rows,
     const int32_t* __restrict__ num_valid_tokens_ptr, const int64_t topk) {
-  static constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;
+  // Not static, see the NUM_WARPS comment in the pipelined kernel above.
+  constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
