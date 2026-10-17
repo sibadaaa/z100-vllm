@@ -21,7 +21,12 @@ set -euo pipefail
 DTK_TREE=${DTK_TREE:-/home/lyh/z100-vllm}
 ROCM101_TREE=${ROCM101_TREE:-/mnt/game/port/gfx906-vllm-rocm101}
 DTK_SO_DIR=${DTK_SO_DIR:-/mnt/game/port/build-sync/temp}
-ROCM101_SO_DIR=${ROCM101_SO_DIR:-/mnt/game/port/build-rocm101/temp}
+# The validated ROCm 10.1 set is the *installed* copy (cmake --install rewrites
+# the runtime path deterministically; the build-tree artefacts have a different
+# rpath and a different md5).  Keep an immutable snapshot of the installed
+# set, which is what every L0-L4 result was produced with:
+#   md5 9302ece8/_C  ffc176af/_C_stable_libtorch  7b4185c6/_moe  a250420b/_rocm_C
+ROCM101_SO_DIR=${ROCM101_SO_DIR:-/mnt/game/port/gfx906-vllm-rocm101/installed-so}
 MODULES=(_C _C_stable_libtorch _moe_C_stable_libtorch _rocm_C)
 
 _identity() {

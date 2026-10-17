@@ -47,7 +47,7 @@
 | DTK 基线 .so | `_C d44117ae` / `_C_stable_libtorch e303b0b2`（F1 修复）/ `_moe 50af36b9` / `_rocm_C f205be8f` |
 | 运行容器 | `z100-vllm-rocm101-rt`（image `z100-rocm10.1:24.04-r642`） |
 | env 契约 | `tools/dcu/env-rocm101.sh`（Triton 修复后 `VLLM_GFX906_ATTN_EAGER_FALLBACK` 默认 **0**；含 F3/F4/F20 修正与 F24 卡型说明） |
-| 栈切换 | `tools/dcu/use_stack.sh status|dtk|rocm101` |
+| 栈切换 | `tools/dcu/use_stack.sh status|dtk|rocm101`（rocm101 源 = `installed-so/` 快照） |
 
 ## 3. 门禁矩阵
 
@@ -99,11 +99,13 @@ token parity：`l4/l4-rocm101.json` / `l4/l4-dtk.json`（compare `RESULT: CONFIR
 5. V1 model runner 仍非可用路径（F11 只补了入口）。
 6. 27B-FP8 TP4 生产配方（DTK FP8 模拟 kernel）尚未在新栈验证；新栈性能口径以 4B TP1/TP2 为准。
 
-## 7. 回滚通道
+## 7. 回滚通道（P5 演练已完成）
 
 - DTK 栈（`z100-regress` 容器 + `/home/lyh/z100-vllm/vllm/*.so`）未改动；F9–F12 修复后 DTK 4B/0.6B/27B TP4 均实测可启动，G9 finite PASS。
 - `tools/dcu/use_stack.sh status|dtk|rocm101` 在两棵独立树之间切换 `.so`，互不影响。
-- 回滚演练步骤与本轮验证一致：`use_stack.sh dtk` → `smoke`/`G9` 复跑（基线产物在 `/mnt/game/z100-baseline/`）。
+- **P5 回滚演练（2026-10-18）**：`rocm101` 切换 → 新栈 0.6B serve ready 22 s、输出正确；`dtk` 切换 → DTK 0.6B serve ready 16 s、同一 prompt 输出一致；最终身份与验收口径完全一致。记录：`docs/result/rollback-rehearsal.md`。
+- 演练中发现并修复：`use_stack.sh rocm101` 原指向 build-tree artefacts（md5 `3e50e4e8…`，与安装副本内容相同但 rpath 不同）；已验证 `install-rocm101.sh` 可确定性复现安装副本 `9302ece8/ffc176af/7b4185c6/a250420b`，并把 `ROCM101_SO_DIR` 默认改为不可变快照 `installed-so/`。
+- 回滚判据：`use_stack.sh status` 的 4 个 md5 与上表一致 + 一次 0.6B smoke 通过。
 
 ## 8. 复现脚本与证据路径
 
@@ -111,6 +113,8 @@ token parity：`l4/l4-rocm101.json` / `l4/l4-dtk.json`（compare `RESULT: CONFIR
 |---|---|
 | 新栈 env 契约 | `tools/dcu/env-rocm101.sh` |
 | 栈切换 | `tools/dcu/use_stack.sh` |
+| 新栈生产启动（P5 配方） | `tools/dcu/serve_rocm101.sh --model 0.6b|4b [--dtype fp16|bf16] [--tp N]` |
+| 回滚演练记录 | `docs/result/rollback-rehearsal.md` |
 | RCCL 重建/验收 | `tools/dcu/rccl-gfx906-build.sh`、`rccl_allreduce_smoke.py` |
 | G9 token 捕获/对比 | `tools/dcu/g9_token_capture.py` |
 | attention serving-call 捕获/重放 | `/mnt/game/z100-rocm101-validation/{capture_attn_args.py,replay_attn.py}` |
