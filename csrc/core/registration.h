@@ -11,6 +11,10 @@
 // A version of the TORCH_LIBRARY macro that expands the NAME, i.e. so NAME
 // could be a macro instead of a literal token.
 #define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
+// The z100 fork registers backend-specific kernels (Meta, CUDA/HIP) for ops
+// declared with TORCH_LIBRARY_EXPAND; upstream dropped this helper.
+#define TORCH_LIBRARY_IMPL_EXPAND(NAME, DEVICE, MODULE) \
+  TORCH_LIBRARY_IMPL(NAME, DEVICE, MODULE)
 
 // REGISTER_EXTENSION allows the shared library to be loaded and initialized
 // via python's import statement.

@@ -106,7 +106,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor? qzeros_or_none, bool inplace) -> Tensor");
   // conditionally compiled so impl registrations are in source file
 #endif
-}
 
 #ifndef USE_ROCM
   // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column

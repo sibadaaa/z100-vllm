@@ -1357,9 +1357,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/moe/moe_wna16.cu"
     "csrc/moe/grouped_topk_kernels.cu"
     "csrc/moe/fused_globalize_align_block_size.cu")
-elseif(VLLM_GPU_LANG STREQUAL "HIP")
-  # weight-only MoE GEMM serves the GGUF MoE path on gfx906
-  list(APPEND VLLM_MOE_EXT_SRC "csrc/moe/moe_wna16.cu")
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
