@@ -187,7 +187,15 @@ def _causal_conv1d_gfx906_fallback(
             prev_state = _gfx906_conv_window_read(rows[seq_idx], state_len)
             seq_x = x[seq_idx]
             full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
-            seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
+            # ROCm 10.1 ships no gfx906 CK grouped-conv solver, so MIOpen JITs
+        # group conv kernels at run time and intermittently fails to load them
+        # ("hipErrorInvalidKernelFile" surfacing on the next op).  This fallback
+        # is a correctness path, so use ATen's native conv (im2col+GEMM) and
+        # skip MIOpen entirely.
+        with torch.backends.cudnn.flags(enabled=False):
+            seq_out = F.conv1d(
+                full_x, weight_conv, bias=bias, groups=dim
+            ).squeeze(0)
             if activation in ["silu", "swish"]:
                 seq_out = F.silu(seq_out)
             out[seq_idx].copy_(seq_out)
@@ -242,7 +250,15 @@ def _causal_conv1d_gfx906_fallback(
         channels_first = x.dim() == 2 and x.shape[0] == dim
         seq_x = x[:, start:end] if channels_first else x[start:end].transpose(0, 1)
         full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
-        seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
+        # ROCm 10.1 ships no gfx906 CK grouped-conv solver, so MIOpen JITs
+        # group conv kernels at run time and intermittently fails to load them
+        # ("hipErrorInvalidKernelFile" surfacing on the next op).  This fallback
+        # is a correctness path, so use ATen's native conv (im2col+GEMM) and
+        # skip MIOpen entirely.
+        with torch.backends.cudnn.flags(enabled=False):
+            seq_out = F.conv1d(
+                full_x, weight_conv, bias=bias, groups=dim
+            ).squeeze(0)
         if activation in ["silu", "swish"]:
             seq_out = F.silu(seq_out)
         if valid is not None:

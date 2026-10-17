@@ -113,21 +113,27 @@ export PYTHONPATH="${VLLM_ROCM101_REPO}:${TRITON_ROCM101_ROOT}/install:${SP}/_ro
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TRITON_ROCM101_ROOT}/cache/jit}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/mnt/game/vllm-cache-rocm10}"
 
-# 6b. TEMPORARY validation fallback for the attention kernel miscompile.
-#     The Triton unified-attention kernels (both the v1 serving op and the
-#     legacy vllm/attention/ops op) produce NaN/wrong values on the ROCm 10.1
-#     triton build even though the same kernel source is correct on the DTK
-#     build and the in-tree eager reference matches transformers exactly.  The
-#     eager fallback in vllm/v1/attention/backends/triton_attn.py restores
-#     correctness for validation runs; it is MUCH slower and does not support
-#     quantized KV caches, so it must not be used for performance measurements.
-#     Unset it once the triton/LLVM codegen issue is fixed.
-export VLLM_GFX906_ATTN_EAGER_FALLBACK="${VLLM_GFX906_ATTN_EAGER_FALLBACK:-1}"
+# 6b. Attention eager-fallback escape hatch (off by default: F14 fixed).
+#     The NaN/garbage served by the Triton unified-attention kernels came from
+#     two gfx906/VEGA20 misclassifications in the ROCm 10.1 triton source:
+#     isCDNA() wrongly included VEGA20, and reduce() lost the VEGA DPP-broadcast
+#     case so gfx906 fell into the RDNA permlane16 path.  After rebuilding
+#     triton with overlay steps D+E the attention kernels' LLIR/AMDGCN match the
+#     DTK build and serving is numerically correct without this fallback (L3
+#     token parity confirmed, 12/12 prompts x 64 tokens identical).
+#     Keep the option available as a debugging escape hatch; it is much slower
+#     and does not support quantized KV caches, so never benchmark with it.
+export VLLM_GFX906_ATTN_EAGER_FALLBACK="${VLLM_GFX906_ATTN_EAGER_FALLBACK:-0}"
 
 # 7. Run-time defaults carried over from the DTK stack.
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export TOKENIZERS_PARALLELISM=false
 # (no PYTORCH_HIP_ALLOC_CONF here: expandable_segments hangs this stack, see §5)
+# Card SKU note (F24): cards 0/1 are Z100L, cards 2/3 are Z100.  With the
+# ROCm 10.1 runtime the Z100 cards mis-execute several Triton kernels (the same
+# HSACO is correct on the DTK runtime and on Z100L; dmesg shows hycu sq_intr
+# err_type 2 / vmfault on 0000:38:00.0).  Pin HIP_VISIBLE_DEVICES=0,1 for
+# validation and serving until the vendor/runtime issue is fixed.
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3}"
 
 # Do NOT unset the image-provided ROCBLAS_TENSILE_LIBPATH. ROCm 10.1 ships the
