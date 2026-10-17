@@ -16,6 +16,10 @@ import vllm.envs as envs
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    PAD_SLOT_ID,
+)
 
 
 _GFX906_MTP_CONV_DEBUG_REPORTED = False
@@ -1345,6 +1349,7 @@ def causal_conv1d_update(
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
+    pad_slot_id: int = PAD_SLOT_ID,
     null_block_id: int = NULL_BLOCK_ID,
     validate_data=False,
 ):

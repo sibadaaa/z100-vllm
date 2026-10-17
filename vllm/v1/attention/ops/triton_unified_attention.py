@@ -25,8 +25,6 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
-# Longest per-request query (e.g. 1 + num_speculative_tokens) run by split-K.
-MAX_3D_QUERY_LEN = 8
 
 # gfx906 decode scheduling knobs, migrated from the legacy attention op path.
 # On gfx906 the tuning applies unconditionally; the env var is only an
@@ -338,9 +336,7 @@ def kernel_unified_attention_2d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
-    USE_CAUSAL: tl.constexpr,  # bool
-    USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
-    per_seq_causal_ptr,  # [num_seqs] int32, or None
+    CAUSAL: tl.constexpr,  # bool
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
@@ -656,33 +652,9 @@ def kernel_unified_attention_2d(
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
-            dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
-                )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
-            else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: apply v_scale to P instead of V.
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
-        else:
-            # Keep softmax weights representable when the P @ V dot uses FP8
-            # tensor cores. Undo the power-of-two scale after the dot.
-            if V.dtype == tl.float8e4nv:
-                p_scale = 256.0
-            elif V.dtype.is_fp8():
-                p_scale = 128.0
-            else:
-                p_scale = 1.0
-            acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
+            V = tl.where(
+                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+            )
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
@@ -1115,18 +1087,12 @@ def reduce_segments(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
-    # Graph padding must be rejected before sequence lookup or scratch access.
-    if query_token_idx >= tl.load(query_start_len_ptr + num_seqs):
-        return
-
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
-    if seq_len <= 0:
-        return
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -1146,16 +1112,11 @@ def reduce_segments(
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    # Empty segments must not set the maximum. Unvisited segments retain
-    # the M=-inf,L=1 initial state.
-    valid_segment = segm_mask & (segm_expsum > 0) & (segm_max != float("-inf"))
-    segm_max = tl.where(valid_segment, segm_max, float("-inf"))
     overall_max = tl.max(segm_max)
 
     # load and rescale segment exp sums
-    segment_scale = tl.where(valid_segment, tl.exp(segm_max - overall_max), 0.0)
-    segm_expsum = segm_expsum * segment_scale
+    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
@@ -1171,7 +1132,7 @@ def reduce_segments(
         mask=segm_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    segm_output *= segment_scale[:, None]
+    segm_output *= tl.exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
@@ -1457,160 +1418,6 @@ def unified_attention(
                 else {}
             ),
         )
-        assert out.stride(1) == head_size, (
-            f"USE_TD_QO requires contiguous output heads "
-            f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
-        )
-
-    # Launch the 2D kernel if
-    # 1. No split-K threshold or scratch buffers, or the scratch has fewer
-    #    rows than query tokens, or
-    # 2. max_seqlen_q > 1 and either it exceeds MAX_3D_QUERY_LEN, masking is
-    #    non-causal, per-sequence causal, or mm-prefix, or the tuned
-    #    large-head path applies, or
-    # 3. The number of Q blocks exceeds seq_threshold_3D, or
-    # 4. Batch invariance is enabled
-    use_3d = not (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or (
-            max_seqlen_q > 1
-            and (
-                max_seqlen_q > MAX_3D_QUERY_LEN
-                or not use_causal
-                or use_per_seq_causal
-                or use_mm_prefix
-                or tuned_large_head
-            )
-        )
-        or num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q) > seq_threshold_3D
-        or is_batch_invariant
-    )
-    if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
-        logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
-        use_3d = False
-
-    # The kernel signature is the same for 2D and 3D — only the launch
-    # grid + a handful of constexpr toggles differ.  Per-token-head scale
-    # caches and their strides are passed as ``None`` when the
-    # ``USE_PER_TOKEN_HEAD_SCALES`` branch is dead so Triton can skip
-    # materialising those arguments and the associated registers.
-    if use_per_token_head_scales:
-        ks_strides = k_scale_cache.stride()
-        vs_strides = v_scale_cache.stride()
-        ks_blk, ks_slot, ks_head = ks_strides[0], ks_strides[1], ks_strides[2]
-        vs_blk, vs_slot, vs_head = vs_strides[0], vs_strides[1], vs_strides[2]
-        k_scale_ptr = k_scale_cache
-        v_scale_ptr = v_scale_cache
-    else:
-        ks_blk = ks_slot = ks_head = None
-        vs_blk = vs_slot = vs_head = None
-        k_scale_ptr = None
-        v_scale_ptr = None
-    # 3D needs real segm tensors; 2D never touches them.  Pass ``None`` in
-    # 2D mode so Triton can skip materialising these pointer arguments.
-    segm_output_ptr = softmax_segm_output if use_3d else None
-    segm_max_ptr = softmax_segm_max if use_3d else None
-    segm_expsum_ptr = softmax_segm_expsum if use_3d else None
-    num_segments = num_par_softmax_segments if use_3d else 1
-
-    grid: tuple[Any, ...]
-    if not use_3d:
-        grid = (total_num_q_blocks, num_kv_heads)
-        tile_size = TILE_SIZE_PREFILL
-    else:
-        grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
-        tile_size = TILE_SIZE_DECODE
-
-    launch_kwargs: dict[str, int] = {}
-    if launch_num_warps is not None:
-        launch_kwargs["num_warps"] = launch_num_warps
-    if launch_num_stages is not None:
-        launch_kwargs["num_stages"] = launch_num_stages
-
-    kernel_unified_attention[grid](
-        output_ptr=out,
-        segm_output_ptr=segm_output_ptr,
-        segm_max_ptr=segm_max_ptr,
-        segm_expsum_ptr=segm_expsum_ptr,
-        query_ptr=q,
-        key_cache_ptr=k,
-        value_cache_ptr=v,
-        sink_ptr=sinks,
-        block_tables_ptr=block_table,
-        seq_lens_ptr=seqused_k,
-        alibi_slopes_ptr=alibi_slopes,
-        qq_bias_ptr=qq_bias,
-        k_scale_cache_ptr=k_scale_ptr,
-        v_scale_cache_ptr=v_scale_ptr,
-        scale=softmax_scale,
-        q_scale=q_descale,
-        k_scale=k_descale,
-        v_scale=v_descale,
-        out_scale=1 / output_scale if output_scale is not None else 1.0,
-        softcap=softcap,
-        num_query_heads=num_query_heads,
-        num_queries_per_kv=num_queries_per_kv,
-        block_table_stride=block_table.stride(0),
-        query_stride_0=q.stride(0),
-        query_stride_1=q.stride(1),
-        output_stride_0=out.stride(0),
-        output_stride_1=out.stride(1),
-        qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-        BLOCK_SIZE=block_size,
-        TILE_SIZE=tile_size,
-        HEAD_SIZE=head_size,
-        HEAD_SIZE_PADDED=head_size_padded,
-        USE_ALIBI_SLOPES=use_alibi_slopes,
-        USE_ALIBI_SQRT=use_alibi_sqrt,
-        USE_QQ_BIAS=use_qq_bias,
-        USE_SOFTCAP=(softcap > 0),
-        USE_SINKS=(sinks is not None),
-        SLIDING_WINDOW=(1 + window_size[0]),
-        USE_CAUSAL=use_causal,
-        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
-        per_seq_causal_ptr=per_seq_causal_ptr,
-        USE_MM_PREFIX=use_mm_prefix,
-        MAX_MM_RANGES=max_mm_ranges,
-        mm_prefix_range_ptr=mm_prefix_range,
-        rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
-        R_SWA_WINDOW=rswa_window or 0,
-        USE_R_SWA=use_rswa,
-        stride_k_cache_0=k.stride(0),
-        stride_k_cache_1=k.stride(1),
-        stride_k_cache_2=k.stride(2),
-        stride_k_cache_3=k.stride(3),
-        stride_v_cache_0=v.stride(0),
-        stride_v_cache_1=v.stride(1),
-        stride_v_cache_2=v.stride(2),
-        stride_v_cache_3=v.stride(3),
-        stride_ks_blk=ks_blk,
-        stride_ks_slot=ks_slot,
-        stride_ks_head=ks_head,
-        stride_vs_blk=vs_blk,
-        stride_vs_slot=vs_slot,
-        stride_vs_head=vs_head,
-        query_start_len_ptr=cu_seqlens_q,
-        BLOCK_Q=BLOCK_Q,
-        num_seqs=num_seqs,
-        BLOCK_M=BLOCK_M,
-        NUM_SEGMENTS_PER_SEQ=num_segments,
-        USE_FP8=output_scale is not None,
-        IS_3D=use_3d,
-        KV_QUANT_MODE=kv_quant_mode,
-        Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
-        CHUNK_LOOKBACK=chunk_lookback,
-        CHUNK_SIZE=chunk_size,
-        USE_TD=use_td,
-        USE_TD_QO=use_td_qo,
-        MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
-        **launch_kwargs,
-    )
-
-    if use_3d:
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
