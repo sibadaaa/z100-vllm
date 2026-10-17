@@ -24,18 +24,22 @@ import vllm._C  # noqa: F401
 from vllm.platforms import current_platform
 
 
-def _dtk_gfx906() -> bool:
+def _gfx906_stack() -> bool:
+    """gfx906 on any ROCm stack (DTK or the self-built ROCm 10.1 stack).
+
+    The fork's gfx906 kernels are compiled for both stacks; the DTK-only gate
+    that predated the ROCm 10.1 adaptation silently skipped this coverage.
+    """
     if not torch.cuda.is_available() or not current_platform.is_rocm():
         return False
-    from vllm.platforms.hygon_dtk import is_hygon_dtk
     from vllm.platforms.rocm import on_gfx906
 
-    return is_hygon_dtk() and on_gfx906()
+    return on_gfx906()
 
 
 pytestmark = pytest.mark.skipif(
-    not _dtk_gfx906(),
-    reason="DTK + gfx906 only: elsewhere the vectorized fp16 path is correct",
+    not _gfx906_stack(),
+    reason="gfx906 only: fp16 packed-activation correctness guard",
 )
 
 # d % 8 == 0 selects use_vec for fp16, |gate| <= 5.9 is the range the DTK
