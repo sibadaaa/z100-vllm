@@ -655,7 +655,9 @@ def rocm_unquantized_gemm_impl(
         and n == 1
         and k <= 8192
         and k % 8 == 0
-    ):
+    )
+
+    if skinny_gemm_enabled:
         out = ops.LLMM1(weight, x_view, 4)
         return out.view(*x.shape[:-1], weight.shape[0])
 

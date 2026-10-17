@@ -350,7 +350,7 @@ class HFConfigParser(ConfigParserBase):
         trust_remote_code |= kwargs.get("trust_remote_code", False)
         kwargs = without_trust_remote_code(kwargs)
         try:
-            config_dict, _ = PretrainedConfig.get_config_dict(
+            config_dict, _ = PreTrainedConfig.get_config_dict(
                 model,
                 revision=revision,
                 code_revision=code_revision,
@@ -856,7 +856,7 @@ def maybe_override_with_speculators(
     """
     # Skip speculator detection for GGUF models. Their config is parsed from
     # GGUF metadata by the GGUF loader, and reading it via
-    # PretrainedConfig.get_config_dict would fail on the .gguf binary.
+    # PreTrainedConfig.get_config_dict would fail on the .gguf binary.
     # GGUF models can still use speculators with explicit
     # --speculative-config, mirroring the cloud storage exemption.
     if is_gguf(model):
@@ -920,7 +920,7 @@ def get_config(
     hf_overrides_kw: dict[str, Any] | None = None,
     hf_overrides_fn: Callable[[PreTrainedConfig], PreTrainedConfig] | None = None,
     **kwargs,
-) -> PretrainedConfig:
+) -> PreTrainedConfig:
     # Separate model folder from file path for GGUF models
     _is_gguf = is_gguf(model)
     _is_remote_gguf = is_remote_gguf(model)
