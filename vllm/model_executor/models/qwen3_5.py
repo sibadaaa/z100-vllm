@@ -745,8 +745,16 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        # Qwen3_5DecoderLayer deliberately skips Qwen3NextDecoderLayer.__init__
+        # (super() above targets nn.Module), so the attribute that layer would
+        # set has to be computed here.  Same semantics as interns2_mobius.
+        self.use_attn_reduce_scatter_for_moe = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
 
         if self.layer_type == "linear_attention":
             if vllm_config.model_config.quantization in {

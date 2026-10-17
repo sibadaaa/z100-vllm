@@ -385,6 +385,13 @@ class InprocClient(EngineCoreClient):
             log_stats,
             executor_fail_callback=executor_fail_callback,
         )
+        # The fork keeps AsyncLLM in-process on ROCm (see
+        # _use_v1_async_multiprocessing in async_llm.py) and therefore bypasses
+        # MPClient, which is the only client upstream initialises these on.
+        # StatLoggerManager reads engine_ranks_managed, the engine-death
+        # watchdog reads resources.engine_dead.
+        self.engine_ranks_managed = [0]
+        self.resources = SimpleNamespace(engine_dead=False)
         # Release the executor's workers when the client is collected, as
         # MPClient does; they hold GPU memory for the life of the process
         # otherwise. The callback must not reference self, or self would stay
