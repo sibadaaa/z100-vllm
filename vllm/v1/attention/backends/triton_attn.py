@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass, replace
 from typing import ClassVar
+import os
 
 import torch
 
@@ -668,6 +669,53 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        # TEMPORARY validation-only fallback: on the self-built ROCm 10.1 stack
+        # the Triton unified-attention kernels are miscompiled (prefill output
+        # contains NaN, decode output is wrong; the same kernel source built on
+        # the DTK toolchain is correct, and the in-tree eager reference path
+        # matches transformers exactly).  Set
+        # VLLM_GFX906_ATTN_EAGER_FALLBACK=1 to validate everything else on this
+        # stack; it is far slower and only supports non-quantized KV caches.
+        if (
+            os.getenv("VLLM_GFX906_ATTN_EAGER_FALLBACK", "0").lower()
+            in {"1", "true", "yes", "on"}
+            and current_platform.is_rocm()
+        ):
+            from vllm.attention.ops.triton_unified_attention import (
+                _unified_attention_decode_eager,
+                _unified_attention_eager,
+            )
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                if max_seqlen_q > 1:
+                    _unified_attention_eager(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        window_size=self.sliding_window,
+                    )
+                else:
+                    _unified_attention_decode_eager(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        window_size=self.sliding_window,
+                    )
+                return output
 
         unified_attention(
             q=query[:num_actual_tokens],

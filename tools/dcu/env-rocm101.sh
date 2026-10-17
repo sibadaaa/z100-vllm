@@ -104,6 +104,17 @@ export PYTHONPATH="${VLLM_ROCM101_REPO}:${TRITON_ROCM101_ROOT}/install:${SP}/_ro
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TRITON_ROCM101_ROOT}/cache/jit}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/mnt/game/vllm-cache-rocm10}"
 
+# 6b. TEMPORARY validation fallback for the attention kernel miscompile.
+#     The Triton unified-attention kernels (both the v1 serving op and the
+#     legacy vllm/attention/ops op) produce NaN/wrong values on the ROCm 10.1
+#     triton build even though the same kernel source is correct on the DTK
+#     build and the in-tree eager reference matches transformers exactly.  The
+#     eager fallback in vllm/v1/attention/backends/triton_attn.py restores
+#     correctness for validation runs; it is MUCH slower and does not support
+#     quantized KV caches, so it must not be used for performance measurements.
+#     Unset it once the triton/LLVM codegen issue is fixed.
+export VLLM_GFX906_ATTN_EAGER_FALLBACK="${VLLM_GFX906_ATTN_EAGER_FALLBACK:-1}"
+
 # 7. Run-time defaults carried over from the DTK stack.
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export TOKENIZERS_PARALLELISM=false
