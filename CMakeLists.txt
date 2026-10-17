@@ -167,19 +167,6 @@ define_extension_target(
   WITH_SOABI)
 
 #
-# fs_io extension (pure CXX; must stay above the non-CUDA device branch
-# so CPU builds define the target before the early return).
-# GIL-releasing filesystem helpers for FileSystemTierManager.
-#
-define_extension_target(
-  fs_io_C
-  DESTINATION vllm
-  LANGUAGE CXX
-  SOURCES csrc/fs_io.cpp
-  USE_SABI 3.11
-  WITH_SOABI)
-
-#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND

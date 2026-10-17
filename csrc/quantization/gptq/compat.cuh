@@ -59,6 +59,19 @@ struct vllm_gptq_has_native_half2_atomic_add<
   #define VLLM_GPTQ_HALF2_ATOMIC_ADD_EMULATED 0
 #endif
 
+// HIP 7.0+ (upstream ROCm 10.x) declares the native `half` overload as well, so
+// on that toolchain no emulation may be visible either; DTK's headers behave
+// like the modern ones. Older community ROCm still needs the `half` emulation.
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70000000
+  #define VLLM_GPTQ_HALF_ATOMIC_ADD_EMULATED 0
+#elif defined(__DTK_ARCH__)
+  #define VLLM_GPTQ_HALF_ATOMIC_ADD_EMULATED 0
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 700
+  #define VLLM_GPTQ_HALF_ATOMIC_ADD_EMULATED 1
+#else
+  #define VLLM_GPTQ_HALF_ATOMIC_ADD_EMULATED 0
+#endif
+
 namespace vllm {
 namespace gptq {
 // atomicAdd for half types, to support CC < 7.x
@@ -110,7 +123,7 @@ __device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
 
     #else
 
-      #if !defined(__DTK_ARCH__)
+      #if VLLM_GPTQ_HALF_ATOMIC_ADD_EMULATED
 __device__ __forceinline__ void atomicAdd(half* address, half val) {
   atomicAdd_half(address, val);
 }

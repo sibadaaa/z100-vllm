@@ -23,9 +23,11 @@ from torch.utils.hipify import cuda_to_hip_mappings as _cuda_macros
 # to the upstream tuple shape before hipify_python is imported, because it
 # snapshots the map while it is being imported. The isinstance guard makes this
 # a no-op for the already-correct 2.10 tuples.
-for _macro, _value in list(_cuda_macros.CUDA_MACROS_MAP.items()):
-    if isinstance(_value, str):
-        _cuda_macros.CUDA_MACROS_MAP[_macro] = (_value,)
+_macros_map = getattr(_cuda_macros, "CUDA_MACROS_MAP", None)
+if _macros_map is not None:
+    for _macro, _value in list(_macros_map.items()):
+        if isinstance(_value, str):
+            _macros_map[_macro] = (_value,)
 
 from torch.utils.hipify.hipify_python import get_hip_file_path, hipify
 
