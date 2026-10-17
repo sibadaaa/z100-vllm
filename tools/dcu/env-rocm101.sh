@@ -130,6 +130,11 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/mnt/game/vllm-cache-rocm10}"
 export VLLM_GFX906_ATTN_EAGER_FALLBACK="${VLLM_GFX906_ATTN_EAGER_FALLBACK:-0}"
 
 # 7. Run-time defaults carried over from the DTK stack.
+# Production model Qwen3.8-27B-FP8 needs the fork's emulated FP8 kernels:
+# with the default (0) the model runs but decodes at 0.3 t/s; with 1 it is
+# ~11.6 t/s on a 2xZ100L TP=2 pair.  0.6B/4B fp16/bf16 runs are unaffected.
+export VLLM_DCU_USE_FP8_EMU="${VLLM_DCU_USE_FP8_EMU:-1}"
+
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export TOKENIZERS_PARALLELISM=false
 # (no PYTORCH_HIP_ALLOC_CONF here: expandable_segments hangs this stack, see §5)

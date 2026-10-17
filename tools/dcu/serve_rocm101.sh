@@ -55,8 +55,17 @@ case "$MODEL" in
     MAXLEN=${MAXLEN:-4096}
     UTIL=${UTIL:-0.55}
     ;;
+  27b)
+    MODEL_DIR=/mnt/game/models/Qwen3.8-27B-FP8
+    SERVED=qwen3.8-27b
+    MAXLEN=${MAXLEN:-4096}
+    UTIL=${UTIL:-0.80}
+    # Block-scaled FP8 checkpoint: the fork's emulated FP8 kernels are required
+    # for usable throughput (0.3 t/s -> 11.6 t/s on a 2-card TP=2 pair).
+    ENVARGS_EXTRA=(-e VLLM_DCU_USE_FP8_EMU=1 -e VLLM_DCU_USE_BF16_GEMV=1)
+    ;;
   *)
-    echo "--model must be 0.6b or 4b" >&2; exit 2 ;;
+    echo "--model must be 0.6b, 4b or 27b" >&2; exit 2 ;;
 esac
 
 SERVE_EXTRA=()
@@ -65,6 +74,8 @@ SERVE_EXTRA=()
 
 ENVARGS=(-e "HIP_VISIBLE_DEVICES=$DEVICE")
 [ "$SKIP_WARMUP" = "1" ] && ENVARGS+=(-e "VLLM_SKIP_KERNEL_WARMUP=1")
+# shellcheck disable=SC2153
+for e in "${ENVARGS_EXTRA[@]:-}"; do ENVARGS+=("$e"); done
 
 echo "[serve_rocm101] model=$MODEL($SERVED) dtype=$DTYPE tp=$TP devices=$DEVICE port=$PORT"
 echo "[serve_rocm101] extensions: $(md5sum "$REPO"/vllm/*.so 2>/dev/null | awk '{printf "%s ", substr($1,1,8)}')"

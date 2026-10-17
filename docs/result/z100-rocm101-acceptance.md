@@ -60,7 +60,7 @@
 | **L2 kernel 数值** | ✅ PASS（子集判定） | 新栈 13 文件 340 passed / **69 failed ⊆ DTK 70**（66 causal_conv1d + 3 qwen3_5_gdn，均平台无关 expected-fail）；4 个原 DTK-only 文件改 stack-agnostic 后补跑 **169 passed / 1 failed**（该 1 项 DTK 也失败）；attention 单测修复后在本轮复验 **57/57 passed** |
 | **L3 G8/G9** | ✅ PASS（G9；G8 见注） | **0.6B**：新栈 fp16 无 fallback，`finite_check PASS`，与 DTK fp16 对照 3/3 prompt **12/12 ids 一致**（修复后英文输出与 DTK 完全相同 ` Paris. The capital of Italy is Rome`）。**4B**：`finite_check PASS`，与 `dtk-g9-tokens-4b-fp16.json` **CONFIRMED 3/3 prompts（12/12 ids）**，两次独立采集输出一致。**bf16**：0.6B/4B bf16 G9 均与 DTK bf16 基线 **CONFIRMED 3/3（12/12 ids）**、`finite_check PASS`。G8：DTK 侧 `UNRUNNABLE_AS_CLEAN_GATE`（环境 fla stub + 默认 FLA Triton 链编译崩溃），本轮以 GDN kernel 套件 + G9 作为 GDN 证据（与计划 §7 判读一致） |
 | **L4 精度/perf** | ✅ PASS（Z100L 卡） | **L4.1 parity**：4B TP1、12 prompts × 64 greedy tokens、top-5 logprobs，新栈 vs DTK **12/12 prompts、64/64 token ids CONFIRMED**。**L4.5 perf**（4B TP1，单流 64 tok，3 repeats，同配方两栈）：见 §4。 |
-| **L5 TP=4/稳定性** | ⚠️ 部分（TP1/TP2 PASS；TP4 受 F24 阻塞） | **TP=1**：单卡全流程 PASS（0.6B/4B serve + G9 + L4）。**TP=2（Z100L 卡 0/1）**：serve ready、请求正确 ` Paris.\nA. True`、perf TTFT **690.3 ms** / decode **20.20 t/s** / step **49.61 ms**（3 repeats），warmup 3.5 s（cache 热）。**TP=4**：worker-2 在模型初始化阶段死亡，dmesg 在 Z100 卡（BDF 38/3b）报 `sq_intr err_type 2` + vmfault → 受 F24 阻塞；即便 `VLLM_SKIP_KERNEL_WARMUP=1` + attention eager fallback，TP=4 仍在 worker 初始化/NCCL split 阶段出现 Z100 vmfault，说明不是某个内核的问题。RCCL 通信层本身已 4 卡 PASS（P0-R） |
+| **L5 TP=4/稳定性** | ⚠️ 部分（TP1/TP2 PASS；TP4 受 F24 阻塞） | **TP=1**：单卡全流程 PASS（0.6B/4B serve + G9 + L4）。**TP=2（Z100L 卡 0/1）**：serve ready、请求正确 ` Paris.\nA. True`、perf TTFT **690.3 ms** / decode **20.20 t/s** / step **49.61 ms**（3 repeats），warmup 3.5 s（cache 热）。**TP=4**：worker-2 在模型初始化阶段死亡，dmesg 在 Z100 卡（BDF 38/3b）报 `sq_intr err_type 2` + vmfault → 受 F24 阻塞；即便 `VLLM_SKIP_KERNEL_WARMUP=1` + attention eager fallback，TP=4 仍在 worker 初始化/NCCL split 阶段出现 Z100 vmfault，说明不是某个内核的问题。**27B-FP8 生产模型（TP=2，Z100L 双卡）**：就绪 106 s；输出正确 `' Paris.\nThe capital of Germany is'`、logprobs 全 finite；**TTFT 8101.6 ms / decode 11.55 t/s / step 86.1 ms**（需 `VLLM_DCU_USE_FP8_EMU=1`；未开时仅 0.30 t/s）。RCCL 通信层本身已 4 卡 PASS（P0-R） |
 
 ## 4. L4 结果（4B TP1，DCU0=Z100L，单流 64 tokens，3 repeats）
 
@@ -72,6 +72,14 @@
 
 原始数据：`/mnt/game/z100-rocm101-validation/l4/perf-rocm101.json` / `perf-dtk.json`；
 token parity：`l4/l4-rocm101.json` / `l4/l4-dtk.json`（compare `RESULT: CONFIRMED (12/12 prompts)`）。
+
+### L5 生产模型：Qwen3.8-27B-FP8，TP=2（Z100L 卡 0/1）
+
+- 启动：ready **106 s**（含首次 kernel warmup；FP8 emu kernel + GDN/attention 全链），`--max-model-len 4096`、util 0.80；
+- 正确性：greedy 输出 `' Paris.\nThe capital of Germany is'`，top-5 logprobs 80 个全部 finite；
+- 性能（单流 64 tok，2 repeats）：**TTFT 8101.6 ms、decode 11.55 t/s、step p50 86.14 ms**；
+- 关键开关：`VLLM_DCU_USE_FP8_EMU=1`（fork 模拟 FP8 kernel）。默认关闭时模型可跑但 decode 仅 **0.30 t/s**（慢 38×）；
+- TP=4（4 卡生产形态）受 **F24** 阻塞，修 F24 后按同一配方即可复测。
 
 ## 5. 执行期发现（F1–F27）
 
@@ -97,7 +105,7 @@ token parity：`l4/l4-rocm101.json` / `l4/l4-dtk.json`（compare `RESULT: CONFIR
 3. **F16 torchrun**：elastic rendezvous 在本 wheel 不可用（libuv）；vLLM 正常 `python -m vllm` 路径不受影响。
 4. **F13**：4 对潜在重复 CustomOp 注册未触发（`rms_norm`/`silu_and_mul`/`fused_rms_norm_gated`/`sparse_attn_indexer_kpool`），保留监控。
 5. V1 model runner 仍非可用路径（F11 只补了入口）。
-6. 27B-FP8 TP4 生产配方（DTK FP8 模拟 kernel）尚未在新栈验证；新栈性能口径以 4B TP1/TP2 为准。
+6. 27B-FP8 生产模型已在新栈 TP=2（Z100L）验证（输出正确、decode 11.55 t/s），但必须开 `VLLM_DCU_USE_FP8_EMU=1`（env 契约默认已开）；TP=4 生产形态待 F24 修复。
 
 ## 7. 回滚通道（P5 演练已完成）
 
@@ -125,7 +133,7 @@ token parity：`l4/l4-rocm101.json` / `l4/l4-dtk.json`（compare `RESULT: CONFIR
 
 ## 9. 下一步（按优先级）
 
-1. **F24**：拿到厂商/ROCm 侧对 Z100 SKU 的说明或修复；之后用卡 2/3 复跑 attention replay（脚本现成）与 TP=4。
-2. **TP=4**：待 F24 修复后重跑（现成命令：`HIP_VISIBLE_DEVICES=0,1,2,3` + TP=4），并补 4B TP 曲线（TP1/2/4）。
-3. 27B-FP8 TP4 生产配方在新栈的启用性评估（FP8 模拟 kernel 依赖 DTK 专属实现，需评估新栈替代路径）。
-4. bf16 生产启用演练（Q1 已恢复，建议先在 4B/0.6B 上跑一轮 perf + 质量电池）。
+1. **F24**：厂商/ROCm 侧修复后，用卡 2/3 复跑 attention replay（`replay_attn.py`）与 TP=4（含 27B-FP8 生产配方）。
+2. **TP=4 验证清单**（修 F24 后）：4B TP1/2/4 曲线 + 27B-FP8 TP4（配方见 `serve_rocm101.sh --model 27b --tp 4`）。
+3. 27B-FP8 TP2 **性能调优**：当前 FP8 emu 路径 11.55 t/s（TP2）；对比 DTK TP4 B0 23.92 t/s，需在 TP4 可用后评估是否达标，并检查 `VLLM_DCU_FP8_GEMV_MAX_M`/GEMV 等 fork 调优开关。
+4. bf16 生产启用演练（Q1 已恢复，建议 4B/0.6B 各跑一轮 perf + 质量电池）。
