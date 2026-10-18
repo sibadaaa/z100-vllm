@@ -506,3 +506,48 @@ TP=4 REPO=/mnt/game/f24-investigation/wa-repo \
   allreduce kernel VGPR；③ 27B-FP8 TP4 保持生产、4B TP4 待 RCCL kernel 修复；
   ④ 向厂商提：DP4X CWSR 保存/恢复 page fault、DP4X VGPR 阈值区间、DP2X 启动
   路径。
+
+## 13. 修复尝试（2026-10-18 傍晚）：RCCL allreduce kernel 移除/降 VGPR
+
+> 详细命令、日志与结论见 `/mnt/game/f24-investigation/08-fix-attempts-20261018.md`。
+
+目标是移除 guard 之后最后一个非 Triton 高 VGPR kernel —— RCCL allreduce
+`ncclDevKernel_Generic_4<5120>`（VGPR=248）。本日尝试了三条路线，**均未完成修复**：
+
+1. **换 vLLM custom allreduce（失败）**：gfx906 构建里 custom allreduce 的 C++
+   op 存在（`ops.meta_size()`=4864），但平台只对 gfx94/95 开启。加
+   `VLLM_GFX906_ENABLE_CUSTOM_ALL_REDUCE` 环境开关放行 gfx906 后，4B TP4 init 时
+   worker 在 HIP 运行时崩溃（dmesg: `traps: ... general protection fault in
+   libamdhip64.so.7`，765 次中断抑制，服务无法 ready），已回退补丁。
+2. **NCCL_PROTO/ALGO 变体（失败）**：用 Stage-C shim 审计
+   `NCCL_PROTO=Simple/LL128`、`NCCL_ALGO=Ring/Tree` 与默认，全部仍调度同一个
+   `ncclDevKernel_Generic_4<5120>`，numRegs 均为 **248**；env 手段无法改变 kernel。
+3. **重编 RCCL 降 VGPR（工具链不配合）**：建立定点重编流水线
+   （hipify `src/device/common.cu` → `rccl-device-compile --link` → `device.hipfb`
+   → host `common.o` → relink `librccl.so`，约 4–5 分钟/轮），运行时审计验证：
+   - `__launch_bounds__(NCCL_MAX_NTHREADS, 2)` → 仍 248（AMD 忽略 minBlocks）；
+   - `__attribute__((amdgpu_waves_per_eu(1, 2)))`（含单独使用）→ 仍 248；
+   - device link `-O2` / `-O1` → 仍 248；
+   - 已确认 .hip_fatbin 内容随构建变化、运行时加载路径就是被替换的
+     `/mnt/game/rccl-gfx906/lib/librccl.so.1.0`，因此不是"加载到旧库"的问题；
+     结论：该 RCCL 的 device-linker 管线不传播这些 VGPR 约束给 generic kernel。
+4. **Stage C（已完成，可部署）**：hip shim 新增
+   `hipFuncGetAttributes` VGPR 审计（`HIPLOG_VGPR_WARN` 默认 253、`=0` 全量、
+   `HIPLOG_VGPR_FAIL=1` fail-fast；ATTR 行带 kernel 名/numRegs），实测
+   Triton sentinel 256(guard off)/80(guard on)、RCCL **248**、MIOpen 128、
+   Tensile 32、ATen 8–36。生产建议以 `HIPLOG_VGPR_WARN=248` 做 early-warning。
+5. **运维发现**：custom-allreduce 崩溃循环/连续 XID 后 Z100 卡会"假死"（简单
+   torch op 挂起），可用厂商工具恢复：
+   `sudo hy-smi --hcureset -d 2 3`（rings 重启成功，4 卡恢复）。
+6. **回滚与当前状态**：实验期间安装库与其备份被覆盖，已用
+   `git checkout -- src/device/common.cu` 恢复 RCCL 源码原状并用定点流水线重编
+   安装（`/mnt/game/rccl-gfx906/lib/librccl.so.1.0`，备份在
+   `/mnt/game/f24-investigation/rccl-baseline/`），2/4 rank allreduce 正确；
+   未修复的 RCCL 248-VGPR 风险仍在（4 卡纯 allreduce 循环本轮又自然复现一次
+   XID:81→76 kill，无需 profiler attach）。
+7. **下一步建议**（未做）：① 查 `rccl-device-compile` 内部 dispatcher 编译
+   flags/IR 物化路径，或直接在 `prims_ll*/common.h` 加 `#pragma unroll 1`/减小
+   protocol buffer 以降寄存器压力；② `-O0` 诊断确认编译器能否产出 128-VGPR
+   kernel 再二分优化 pass；③ 向厂商要 DP4X-safe RCCL 或 VGPR 危险区间；
+   ④ 生产 interim：guard + audit watch（248）+ 自动重启/巡检，关键业务用
+   27B-FP8 TP4（已观测稳定）或 DTK 回退。
