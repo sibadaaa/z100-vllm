@@ -446,3 +446,63 @@ TP=4 REPO=/mnt/game/f24-investigation/wa-repo \
 - 未修改受验证的 `/mnt/game/port/gfx906-vllm-rocm101` 树，也未修改 `/src`（repo）；
   workaround 仅在影子副本中验证。
 - 建议只在评审后把 §7-4 的工程化改动落到 repo（另开 commit/PR），并同步文档。
+
+## 12. Kernel 级追踪：guard 之后最后未被覆盖的 kernel（2026-10-18 傍晚）
+
+> 完整证据与命令见 `/mnt/game/f24-investigation/07-kernel-trace-findings.md`。
+
+### 12.1 工具链已打通
+
+- **rocprofv3 1.4.1**（与运行时同一 rocm-systems commit `7da43026e4f2…`）在本栈
+  可用；attach 模式要求目标进程启动时设 `ROCP_TOOL_ATTACH=1`、执行 attach 的进程
+  有 CAP_SYS_PTRACE（用 `nsenter` 从宿主机进入容器 mount+PID namespace 即可）。
+  trace CSV 直接带 `Kernel_Name / VGPR_Count / LDS_Block_Size / Scratch_Size`。
+- 被 KMD 杀死的进程其 rocprof 输出会丢失，因此另用 LD_PRELOAD shim
+  (`/mnt/game/f24-investigation/hipshim/libhiplog.so`) 逐 launch 落盘；RCCL kernel
+  在 shim 中记为 `name=? grid=256,1,1 block=256,1,1 smem=0`（签名与 trace 对上）。
+
+### 12.2 健康 rank trace（rank0/Z100L，3×96 token，178,122 dispatch / 68 kernel）
+
+- 所有 **VGPR≥253** 的 kernel 都是 Triton：`kernel_unified_attention_2d/3d`
+  （VGPR=256），在 Z100 上均被 guard 强制 8 warps（同 run 的 debug：31/31
+  Triton kernel `overridden=True`、n_regs≤128、0 个漏网、0 watch 警告）。
+- **非 Triton kernel 的 VGPR 最大值 = 248**，即 RCCL allreduce
+  `ncclDevKernel_Generic_4(ncclDevKernelArgsStorage<5120ul>)`：
+  **VGPR=248、LDS=35280、scratch=1024、grid 256×1、block 256×1**，窗口内 19,008 次。
+  其余非 Triton kernel 全部很小（ATen ≤44、vLLM gfx906 自定义 kernel ≤40、
+  rocBLAS Tensile GEMM=32）。
+
+### 12.3 4B TP4 故障抓取（两次）
+
+- 故障均在 attach（wave 挂起/恢复）后触发（XID:81 → ~4 s 后 XID:76 + kill），
+  故障 rank 可能是 attach 目标的 peer（rank2 或 rank3）。
+- 故障 rank 在 XID:81 前最后 ~1.5 ms 的发射序列里，**最后出现的非 guard kernel
+  就是 RCCL allreduce（两次）**，其余为 guard 过的 Triton matmul/attention 和
+  低 VGPR 的 gemma/ATen kernel。
+
+### 12.4 决定性隔离：纯 allreduce 即复现
+
+- `lead-logs/ar_only_loop.py`：4 rank、`dist.all_reduce([1,2560] fp16)` 纯循环
+  （无 vLLM、无 Triton）+ rocprof attach → **Z100 卡上复现同样的 XID:81
+  （10–12 条 IH）→ XID:76 kill**；4 卡（2×Z100）6 次尝试中 3 次故障。
+- 同样循环在 **Z100L 双卡（DP2X）上 0 次故障**。
+- compute-only 循环（ATen matmul，VGPR≤44）+ attach 在 Z100 上也故障（11 条 XID）
+  → **DP4X 的 wave 保存/恢复（抢占/CWSR）本身是第二个独立故障模式**，
+  与 VGPR 高低无关；profiler attach 只是人工触发它。
+- 故障页表细节：GPU 以 TCP client 写 host VA `0x7f…`，PTE present=0（写无效页表，
+  即写越界/已释放 buffer），随后 739 次中断被抑制——与 class B 签名一致。
+
+### 12.5 结论
+
+- **guard 之后最后未被覆盖的 kernel = RCCL allreduce kernel
+  `ncclDevKernel_Generic_4<5120>`（VGPR=248 / LDS=35280）**；它是热路径上唯一
+  还处在 DP4X 高 VGPR 灰区（实测 204 通过、253 失败，204–253 未测）的非 Triton
+  kernel。Triton 侧已 100% 覆盖。
+- 另发现 DP4X **wave 抢占/恢复（CWSR）page fault** 是独立厂商 bug（Z100 故障、
+  Z100L 不故障、任意 VGPR 均可能中招），生产上应避免对 DP4X worker 挂
+  profiler/debugger。
+- 建议：① 用 `NCCL_PROTO=Simple/LL128`、`NCCL_ALGO=Ring/Tree` 等 A/B 选一个
+  VGPR 更低（或不在灰区）的 RCCL allreduce kernel；② 必要时重编 RCCL 降低
+  allreduce kernel VGPR；③ 27B-FP8 TP4 保持生产、4B TP4 待 RCCL kernel 修复；
+  ④ 向厂商提：DP4X CWSR 保存/恢复 page fault、DP4X VGPR 阈值区间、DP2X 启动
+  路径。
