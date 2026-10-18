@@ -138,11 +138,20 @@ export VLLM_DCU_USE_FP8_EMU="${VLLM_DCU_USE_FP8_EMU:-1}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export TOKENIZERS_PARALLELISM=false
 # (no PYTORCH_HIP_ALLOC_CONF here: expandable_segments hangs this stack, see §5)
-# Card SKU note (F24): cards 0/1 are Z100L, cards 2/3 are Z100.  With the
-# ROCm 10.1 runtime the Z100 cards mis-execute several Triton kernels (the same
-# HSACO is correct on the DTK runtime and on Z100L; dmesg shows hycu sq_intr
-# err_type 2 / vmfault on 0000:38:00.0).  Pin HIP_VISIBLE_DEVICES=0,1 for
-# validation and serving until the vendor/runtime issue is fixed.
+# Card SKU note (F24, updated 2026-10-18): cards 0/1 are Z100L (DP2X mode),
+# cards 2/3 are Z100 (DP4X mode).  Under this upstream-derived HIP runtime
+# (HIP 7.16; the vendor DTK runtime is DP4X-aware and is not affected) a Triton
+# kernel compiled at the gfx906 VGPR maximum (256 VGPR/thread) silently
+# mis-executes on the DP4X boards (partial store commit, no error, no dmesg).
+# vllm/platforms/hygon_dp4x.py installs a launch guard that forces >=8 warps on
+# DP4X boards so kernels stay below that envelope; it enables automatically
+# only on Hygon DCU hardware with HIP >= 7 (set VLLM_GFX906_DP4X_GUARD=0 to
+# disable, =1 to force on all devices).  Other knobs:
+# VLLM_GFX906_DP4X_MIN_WARPS (default 8), VLLM_GFX906_DP4X_WATCH=0 to silence
+# the "still VGPR=256" warning, VLLM_GFX906_DP4X_DEBUG=1 for per-kernel logs.
+# Intermittent DP4X page faults are still possible under heavy multi-rank load
+# (non-Triton kernels are outside this guard); see
+# docs/result/F24-investigation-20261018.md.
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3}"
 
 # Do NOT unset the image-provided ROCBLAS_TENSILE_LIBPATH. ROCm 10.1 ships the

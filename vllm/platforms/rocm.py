@@ -1559,3 +1559,18 @@ class RocmPlatform(Platform):
         except Exception as e:
             logger.warning("Failed to get NUMA nodes for GPUs: %s", e)
             return None
+
+
+# Hygon DCU DP4X workaround (F24): install the Triton launch guard before any
+# process can launch a kernel. On DP4X (Z100) boards under an upstream-derived
+# HIP runtime, kernels compiled at the gfx906 VGPR maximum silently
+# mis-execute; the guard forces enough warps to stay below that envelope. It is
+# a no-op on non-Hygon hosts and on the vendor DTK runtime, which is DP4X-aware.
+# See vllm/platforms/hygon_dp4x.py and
+# docs/result/F24-investigation-20261018.md.
+try:
+    from .hygon_dp4x import install_dp4x_triton_guard
+
+    install_dp4x_triton_guard()
+except Exception:  # pragma: no cover - the guard must never break platform init
+    logger.debug("Hygon DCU DP4X guard not installed", exc_info=True)
