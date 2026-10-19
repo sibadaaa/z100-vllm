@@ -9,6 +9,9 @@ import torch
 
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8,
+    per_token_group_quant_fp8_fast_ok,
+    per_token_group_quant_fp8_shape_ok,
     process_fp8_weight_block_strategy,
 )
 from vllm.model_executor.utils import replace_parameter
@@ -60,6 +63,10 @@ class Fp8BlockScaledMMLinearKernel(
     # Set to False in subclasses that accept BF16 input directly (e.g. FlashInfer)
     # and therefore do not need the input quantization step in apply_weights.
     apply_input_quant: ClassVar[bool] = True
+    # Set True only by kernels whose GEMM quantizes the fp16 activation itself
+    # (S23 O5).  Kept False on the base class so a subclass that does not
+    # override it keeps the quantize-then-GEMM path.
+    fuses_input_quant: ClassVar[bool] = False
 
     def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
         super().__init__(config)
@@ -71,6 +78,41 @@ class Fp8BlockScaledMMLinearKernel(
             num_token_padding=self.get_output_padding(),
             use_ue8m0=False,
         )
+        # Decided once: the quantizer configuration cannot change after init, so
+        # apply_weights pays only a bool load (S23 O2).  Subclasses that replace
+        # self.quant_fp8 (Cutlass/torch use column-major scales) fail the
+        # identity check in apply_weights and keep the normal path.
+        self._quant_fastpath = (
+            type(self.quant_fp8) is QuantFP8
+            and not self.quant_fp8.use_aiter
+            and self.quant_fp8.is_group_quant
+            and not self.quant_fp8.static
+            and per_token_group_quant_fp8_fast_ok(
+                self.quant_fp8.group_size,
+                column_major_scales=self.quant_fp8.column_major_scales,
+                tma_aligned_scales=self.quant_fp8.tma_aligned_scales,
+                use_ue8m0=self.quant_fp8.use_ue8m0,
+            )
+        )
+        self._quant_fastpath_src = self.quant_fp8
+        # S23 O5: decided once, same reason as the O2 flag above.  Requires the
+        # kernel to quantize internally AND a quantizer configuration that the
+        # fused kernel reproduces bit-for-bit (plain 128-group, row-major,
+        # plain-fp8, dynamic).
+        self._fuse_quant = (
+            self.fuses_input_quant
+            and type(self.quant_fp8) is QuantFP8
+            and not self.quant_fp8.use_aiter
+            and self.quant_fp8.is_group_quant
+            and not self.quant_fp8.static
+            and per_token_group_quant_fp8_shape_ok(
+                self.quant_fp8.group_size,
+                column_major_scales=self.quant_fp8.column_major_scales,
+                tma_aligned_scales=self.quant_fp8.tma_aligned_scales,
+                use_ue8m0=self.quant_fp8.use_ue8m0,
+            )
+        )
+        self._fuse_quant_src = self.quant_fp8
         self.use_triton = False
 
     @classmethod
@@ -115,10 +157,43 @@ class Fp8BlockScaledMMLinearKernel(
         input_2d = x.view(-1, x.shape[-1])
         output_shape = [*x.shape[:-1], weight.shape[0]]
 
+        fused = False
         if self.apply_input_quant:
-            q_input, input_scale = self.quant_fp8(
-                input_2d, input_scale, scale_up, use_triton=self.use_triton
-            )
+            # S23 O5: the fused kernel quantizes the activation itself, so the
+            # whole python-side quant stage disappears and the step issues one
+            # kernel instead of two.  Config-keyed (never M-keyed): the decode
+            # step is M=8 and must hit this path, and the kernel selects the
+            # stream/tile route internally.
+            if (
+                self._fuse_quant
+                and self._fuse_quant_src is self.quant_fp8
+                and input_scale is None
+                and scale_up is None
+                and not torch.compiler.is_compiling()
+            ):
+                output = self.apply_block_scaled_mm_quantized(
+                    input_2d, weight, weight_scale
+                )
+                fused = True
+            # S23 O2: with the whole 128-group configuration matching, the
+            # quantizer kernel is called directly.  The CustomOp chain
+            # (__call__ -> forward_hip -> forward_cuda -> fp8_utils) only
+            # re-derives this configuration per call: ~8 us of the ~43 us,
+            # 256 calls per decode step.  Compiling keeps the normal path.
+            elif (
+                self._quant_fastpath
+                and self._quant_fastpath_src is self.quant_fp8
+                and input_scale is None
+                and scale_up is None
+                and not torch.compiler.is_compiling()
+            ):
+                q_input, input_scale = per_token_group_quant_fp8(
+                    input_2d, self.quant_fp8.group_size
+                )
+            else:
+                q_input, input_scale = self.quant_fp8(
+                    input_2d, input_scale, scale_up, use_triton=self.use_triton
+                )
         else:
             q_input = input_2d
             # Provide a concrete placeholder so apply_block_scaled_mm args are
@@ -128,12 +203,13 @@ class Fp8BlockScaledMMLinearKernel(
                 input_scale if input_scale is not None else input_2d.new_empty(1)
             )
 
-        output = self.apply_block_scaled_mm(
-            A=q_input,
-            B=weight,
-            As=input_scale,
-            Bs=weight_scale,
-        )
+        if not fused:
+            output = self.apply_block_scaled_mm(
+                A=q_input,
+                B=weight,
+                As=input_scale,
+                Bs=weight_scale,
+            )
 
         if bias is not None:
             output = output + bias
@@ -148,6 +224,24 @@ class Fp8BlockScaledMMLinearKernel(
         Bs: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def apply_block_scaled_mm_quantized(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused-quant variant of :meth:`apply_block_scaled_mm` (S23 O5).
+
+        Only called when ``fuses_input_quant`` is True and the fused op exists;
+        a kernel that sets the flag must override this, and the default raises
+        so a mis-wired subclass fails loudly instead of silently skipping the
+        quantize.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} sets fuses_input_quant but does not "
+            "implement apply_block_scaled_mm_quantized."
+        )
 
 
 class Fp8BlockScaledDynamicMMLinearKernel(Fp8BlockScaledMMLinearKernel, ABC):

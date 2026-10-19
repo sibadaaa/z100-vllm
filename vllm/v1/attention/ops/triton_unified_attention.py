@@ -74,10 +74,14 @@ ENABLE_GFX906_ATTN_VERIFY_3D = os.getenv(
 
 # Split-KV segments for the gfx906 prefill 3D path. Prefill already fills the
 # GPU with q-block x kv-head CTAs; a small fixed split balances the causal
-# load skew between early and late query blocks. Interleaved sweeps over
+# load skew between early and late query blocks. Historical sweeps over
 # segments {2,4,8,16} at 4k-16k serving shapes put 2 and 4 within ~1% of
-# each other (8+ regress); 2 halves the fp32 segment workspace, which keeps
-# gpu_memory_utilization=0.95 runs within budget at the default chunk size.
+# each other (8+ regress). T4 (runs/hipopt-20261018/work/attn-prefill/)
+# re-swept the long-context shapes this path can reach once gated on
+# GFX906_PREFILL_3D_MIN_CTX: segments=4 is the shipped long-path default and
+# only applies when VLLM_GFX906_TRITON_ATTN_PREFILL_3D=1 is set explicitly.
+# VLLM_GFX906_ATTN_PREFILL_SEGMENTS=2 reproduces the historical S22 arm and
+# halves the fp32 segment workspace (relevant at gpu_memory_utilization=0.95).
 
 
 def _gfx906_env_int(name: str, default: int) -> int:
@@ -97,17 +101,19 @@ GFX906_PREFILL_BLOCK_M_OVERRIDE = _gfx906_env_int(
 GFX906_PREFILL_TILE_OVERRIDE = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_TILE", 0)
 GFX906_PREFILL_WARPS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_WARPS", 4)
 GFX906_PREFILL_STAGES = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_STAGES", 1)
-GFX906_PREFILL_SEGMENTS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_SEGMENTS", 2)
+GFX906_PREFILL_SEGMENTS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_SEGMENTS", 4)
 GFX906_PREFILL_3D_WARPS = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_3D_WARPS", 4)
 GFX906_PREFILL_3D_STAGES = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_3D_STAGES", 1)
 # Minimum KV context length for the prefill split-KV path. The S22 controlled
-# arms show the 3D path at the shipped two segments is a large win on long
-# prefills (p32k TTFT 178.6 -> 169.1 s, -5.3%) but a large loss on short ones
-# (c1 1429-token prefill 2612 -> 3376 ms per iteration), so production keeps
-# the win only above this context length. 0 keeps the historical behaviour
-# (3D whenever the switch is on).
+# arms show the 3D path is a large win on long prefills (p32k TTFT 178.6 ->
+# 169.1 s, -5.3%) but a large loss on short ones (c1 1429-token prefill
+# 2612 -> 3376 ms per iteration), so the new default keeps the win only above
+# 16K and leaves short contexts on the 2D path. This route is still opt-in:
+# nothing changes unless VLLM_GFX906_TRITON_ATTN_PREFILL_3D=1 is set. Setting
+# this knob to 0 explicitly restores the historical behaviour (3D whenever
+# the switch is on); raising it past 16384 narrows the gate further.
 GFX906_PREFILL_3D_MIN_CTX = _gfx906_env_int(
-    "VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX", 0
+    "VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX", 16384
 )
 
 # Lazily grown workspace for the prefill split-KV path. Unlike the decode
@@ -1441,14 +1447,22 @@ def unified_attention(
 
     # gfx906: run tuned-shape prefill through the split-KV (3D) kernel. The
     # path is restricted to plain causal attention so the swept configuration
-    # (BLOCK_M 32 / TILE 32 / 4 warps / 1 stage / 2 segments) is the only one
-    # exercised, and is disabled under CUDA-graph capture because the segment
-    # workspace cannot be allocated inside a capture.
+    # (BLOCK_M 32 / TILE 32 / 4 warps / 1 stage / segments=4 above 16K) is the
+    # only one exercised, and is disabled under CUDA-graph capture because the
+    # segment workspace cannot be allocated inside a capture. `max_seqlen_k` is
+    # the per-step end position (computed tokens + scheduled tokens), so with
+    # chunked prefill the first chunks below the 16K gate stay on the 2D path.
     use_prefill_3d = (
         ENABLE_GFX906_ATTN_PREFILL_3D
         and max_seqlen_k >= GFX906_PREFILL_3D_MIN_CTX
         and gfx906_sched
         and prefill_block_m is not None
+        # A verify-shaped forward (1 < max_seqlen_q <= GFX906_VERIFY_MAX_QUERY_LEN)
+        # belongs to the decode split-KV path when the backend allocated its
+        # segment buffers. If it did not (e.g. VLLM_GFX906_ATTN_VERIFY_3D=0),
+        # keep the historical 2D routing instead of silently reclassifying a
+        # verify pass as a long prefill once PREFILL_3D is switched on.
+        and not (1 < max_seqlen_q <= GFX906_VERIFY_MAX_QUERY_LEN)
         and sliding_window_val == 0
         and not use_mm_prefix
         and not use_qq_bias
@@ -1462,6 +1476,11 @@ def unified_attention(
 
     if use_prefill_3d:
         num_segments = GFX906_PREFILL_SEGMENTS
+        logger.info_once(
+            "gfx906 prefill split-KV(3D) enabled: first max_seqlen_k="
+            f"{max_seqlen_k} >= {GFX906_PREFILL_3D_MIN_CTX}, "
+            f"segments={num_segments}"
+        )
         segm_output, segm_max, segm_expsum = _prefill_segment_buffers(
             q.shape[0],
             num_query_heads,

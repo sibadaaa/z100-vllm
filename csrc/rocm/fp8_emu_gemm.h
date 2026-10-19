@@ -56,6 +56,40 @@ torch::Tensor fp8_emu_gemv_block(torch::Tensor a, torch::Tensor w,
                                  at::ScalarType out_dtype, int64_t nthreads,
                                  int64_t block_n, int64_t block_k);
 
+// S23 / O5: activation quantization fused into the block-scaled path.  `a` is
+// the *unquantized* activation (fp16/bf16), `w_s` the block-scale matrix.
+// block_k must be 128 (the quantizer group).  The per-token-group quantizer
+// runs inside the decode tile (one launch, `y_s` in LDS) or, for the
+// stream/large-M routes or K/block_k > 64, in one extra launch feeding the
+// existing kernel.  Returns `out` only; `_quant_x` also returns the
+// `(x_q, x_s)` witness for the bit-exact gate -- on the fused-tile route the
+// witness is emitted by the same GEMM launch, on the fallback routes by the
+// standalone quantizer the GEMM consumes.
+torch::Tensor fp8_emu_gemm_block_quant(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t cfg, int64_t block_n, int64_t block_k, double eps);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fp8_emu_gemm_block_quant_x(torch::Tensor a, torch::Tensor w, torch::Tensor w_s,
+                           torch::Tensor lut, std::optional<torch::Tensor> bias,
+                           at::ScalarType out_dtype, int64_t nthreads,
+                           int64_t cfg, int64_t block_n, int64_t block_k,
+                           double eps);
+
+torch::Tensor fp8_emu_gemm_block_quant_meta(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t cfg, int64_t block_n, int64_t block_k, double eps);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fp8_emu_gemm_block_quant_x_meta(torch::Tensor a, torch::Tensor w,
+                                torch::Tensor w_s, torch::Tensor lut,
+                                std::optional<torch::Tensor> bias,
+                                at::ScalarType out_dtype, int64_t nthreads,
+                                int64_t cfg, int64_t block_n, int64_t block_k,
+                                double eps);
+
 torch::Tensor fp8_emu_gemm_block(torch::Tensor a, torch::Tensor w,
                                  torch::Tensor a_s, torch::Tensor w_s,
                                  torch::Tensor lut,

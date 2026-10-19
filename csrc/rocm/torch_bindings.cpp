@@ -141,6 +141,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int block_n, int block_k) -> Tensor");
   rocm_ops.impl("fp8_emu_gemm_block", torch::kCUDA, &fp8_emu_gemm_block);
 
+  // S23 / O5: activation quantization fused into the block-scaled path.  `a` is
+  // the unquantized activation; `w_s` is the block-scale matrix.  Gated in
+  // python by VLLM_DCU_FP8_FUSE_QUANT (default off).
+  rocm_ops.def(
+      "fp8_emu_gemm_block_quant(Tensor a, Tensor w, Tensor w_s, Tensor lut, "
+      "Tensor? bias, ScalarType out_dtype, int nthreads, int cfg, "
+      "int block_n, int block_k, float eps) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemm_block_quant", torch::kCUDA,
+                &fp8_emu_gemm_block_quant);
+  rocm_ops.def(
+      "fp8_emu_gemm_block_quant_x(Tensor a, Tensor w, Tensor w_s, Tensor lut, "
+      "Tensor? bias, ScalarType out_dtype, int nthreads, int cfg, "
+      "int block_n, int block_k, float eps) -> (Tensor, Tensor, Tensor)");
+  rocm_ops.impl("fp8_emu_gemm_block_quant_x", torch::kCUDA,
+                &fp8_emu_gemm_block_quant_x);
+
   // Dense fp16/bf16 decode GEMV (M <= 8) for gfx906: the replacement for the
   // rocBLAS fallback on unquantized linear layers, used by
   // vllm/model_executor/layers/utils.py (rocm_unquantized_gemm_impl) behind
@@ -161,6 +177,10 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
   rocm_meta_ops.impl("fp8_emu_gemm", &fp8_emu_gemm_meta);
   rocm_meta_ops.impl("fp8_emu_gemv_block", &fp8_emu_gemv_block_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block", &fp8_emu_gemm_block_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm_block_quant",
+                     &fp8_emu_gemm_block_quant_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm_block_quant_x",
+                     &fp8_emu_gemm_block_quant_x_meta);
   rocm_meta_ops.impl("bf16_emu_gemv", &bf16_emu_gemv_meta);
 }
 

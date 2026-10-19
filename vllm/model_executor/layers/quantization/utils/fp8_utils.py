@@ -629,6 +629,90 @@ def _per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
+# Activation-quant fast path (S23 O2).  The fp8 dtype and its min/max never
+# change at runtime, yet resolving them plus the generic branch ladder costs
+# ~20 us of the ~43 us this call takes, 256 times per decode step.  The switch
+# is read once, so the shipped path pays a single bool load.
+_FAST_QUANT_ENABLED = envs.VLLM_DCU_FP8_QUANT_FASTPATH
+_FAST_QUANT_DTYPE = current_platform.fp8_dtype()
+_FAST_QUANT_MIN, _FAST_QUANT_MAX = get_fp8_min_max()
+
+
+def per_token_group_quant_fp8_shape_ok(
+    group_size: int,
+    dtype: torch.dtype | None = None,
+    column_major_scales: bool = False,
+    tma_aligned_scales: bool = False,
+    out_q: torch.Tensor | None = None,
+    use_ue8m0: bool = False,
+) -> bool:
+    """Whether a call is the plain 128-group, row-major, plain-fp8 quantize.
+
+    Switch-free: O2's fast path adds ``VLLM_DCU_FP8_QUANT_FASTPATH`` on top,
+    O5's fused GEMM adds ``VLLM_DCU_FP8_FUSE_QUANT``.  One predicate keeps the
+    three sites in step, so no caller can skip a wrapper for a configuration
+    the generic path would not treat identically.
+
+    Args:
+        group_size: Quantization group size along the last dimension.
+        dtype: Requested output dtype; None means the platform fp8 dtype.
+        column_major_scales: Whether scales were asked in column-major layout.
+        tma_aligned_scales: Whether scales were asked in the TMA-aligned layout.
+        out_q: Caller-supplied output buffer.
+        use_ue8m0: Whether scales are rounded to powers of two.
+
+    Returns:
+        True when only the plain ``per_token_group_fp8_quant`` kernel is needed.
+
+    """
+    return (
+        group_size == 128
+        and not column_major_scales
+        and not tma_aligned_scales
+        and out_q is None
+        and not use_ue8m0
+        and (dtype is None or dtype == _FAST_QUANT_DTYPE)
+    )
+
+
+def per_token_group_quant_fp8_fast_ok(
+    group_size: int,
+    dtype: torch.dtype | None = None,
+    column_major_scales: bool = False,
+    tma_aligned_scales: bool = False,
+    out_q: torch.Tensor | None = None,
+    use_ue8m0: bool = False,
+) -> bool:
+    """Whether the per-token-group quantizer may take the O2 short path.
+
+    Args:
+        group_size: Quantization group size along the last dimension.
+        dtype: Requested output dtype; None means the platform fp8 dtype.
+        column_major_scales: Whether scales were asked in column-major layout.
+        tma_aligned_scales: Whether scales were asked in the TMA-aligned layout.
+        out_q: Caller-supplied output buffer.
+        use_ue8m0: Whether scales are rounded to powers of two.
+
+    Returns:
+        True when the switch is on, the platform carries the
+        ``_C.per_token_group_fp8_quant`` op, and the configuration is the
+        plain one.
+
+    """
+    return (
+        _FAST_QUANT_ENABLED
+        and current_platform.is_cuda_alike()
+        and per_token_group_quant_fp8_shape_ok(
+            group_size,
+            dtype,
+            column_major_scales,
+            tma_aligned_scales,
+            out_q,
+            use_ue8m0,
+        )
+    )
+
+
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -663,6 +747,39 @@ def per_token_group_quant_fp8(
     if use_ue8m0 is None:
         use_ue8m0 = is_deep_gemm_e8m0_used()
     dtype = current_platform.fp8_dtype() if dtype is None else dtype
+    # Same kernel, same arguments, same new-buffers-per-call rule as below; only
+    # the per-call platform/branch resolution is skipped.  Both output tensors
+    # are freshly allocated, never cached or shared with another layer.
+    if (
+        per_token_group_quant_fp8_fast_ok(
+            group_size,
+            dtype,
+            column_major_scales,
+            tma_aligned_scales,
+            out_q,
+            use_ue8m0,
+        )
+        and x.is_contiguous()
+        and x.shape[-1] % group_size == 0
+        and not torch.compiler.is_compiling()
+    ):
+        x_q = x.new_empty(x.shape, dtype=_FAST_QUANT_DTYPE)
+        x_s = x.new_empty(
+            x.shape[:-1] + (x.shape[-1] // group_size,), dtype=torch.float32
+        )
+        torch.ops._C.per_token_group_fp8_quant(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            _FAST_QUANT_MIN,
+            _FAST_QUANT_MAX,
+            False,
+            False,
+            False,
+        )
+        return x_q, x_s
     assert x.shape[-1] % group_size == 0, (
         f"the last dimension of `x` {x.shape[-1]} must be divisible "
         f"by `group_size` {group_size}"

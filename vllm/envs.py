@@ -207,6 +207,24 @@ if TYPE_CHECKING:
     # faster there on small-N shapes.  Default 8 keeps the pre-S18 policy.
     VLLM_DCU_FP8_GEMV_MAX_M: int = 8
     VLLM_DCU_INT8_GEMV_MAX_M: int = 8
+    # Bypass the ``torch.ops.vllm.fp8_emu_mm*`` custom_op wrappers and call the
+    # raw ``torch.ops._rocm_C`` kernel directly while eager.  The custom_op
+    # exists only to give Dynamo a shape contract (S11k); under
+    # ``--enforce-eager`` that contract buys nothing but costs a schema check,
+    # a dispatcher hop and an extra Python frame per call (S23: 43-83 us vs
+    # 12-23 us for the raw op, 256 calls/step).  Off by default: compile mode
+    # must keep the custom_op, and this is the A/B + rollback switch.
+    VLLM_DCU_FP8_EMU_FASTPATH: bool = False
+    # Same idea for the per-token-group activation quantizer
+    # (``fp8_utils.per_token_group_quant_fp8``): its ROCm fast path calls
+    # ``torch.ops._C.per_token_group_fp8_quant`` straight away instead of going
+    # through ``QuantFP8.forward_hip -> forward_cuda`` (S23: 43-51 us vs 8 us
+    # host time, 256 calls/step).  Off by default (A/B + rollback switch).
+    VLLM_DCU_FP8_QUANT_FASTPATH: bool = False
+    # Fold the activation quantization into the fp8 emulation GEMM so a step
+    # issues one kernel instead of two (S23: 256 of each per step).  Off by
+    # default; the unfused path stays reachable for A/B and rollback.
+    VLLM_DCU_FP8_FUSE_QUANT: bool = False
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1512,6 +1530,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCU_INT8_GEMV_MAX_M": lambda: int(
         os.getenv("VLLM_DCU_INT8_GEMV_MAX_M", "8")
+    ),
+    # gfx906 fp8 emulation call-path shortcuts (see the annotations above).
+    # Default OFF so both the compile-safe custom_op path and the unfused
+    # quantizer stay the shipped behaviour; "1" opts in for A/B.
+    "VLLM_DCU_FP8_EMU_FASTPATH": lambda: (
+        os.getenv("VLLM_DCU_FP8_EMU_FASTPATH", "False").lower() in ("true", "1")
+    ),
+    "VLLM_DCU_FP8_QUANT_FASTPATH": lambda: (
+        os.getenv("VLLM_DCU_FP8_QUANT_FASTPATH", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_DCU_FP8_FUSE_QUANT": lambda: (
+        os.getenv("VLLM_DCU_FP8_FUSE_QUANT", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

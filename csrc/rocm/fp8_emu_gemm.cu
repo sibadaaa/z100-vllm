@@ -54,6 +54,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_runtime.h>
 
+#include <c10/util/Float8_e4m3fn.h>
+
 #include <cstdint>
 #include <cstdlib>
 
@@ -64,6 +66,7 @@ namespace {
 
 using vllm::gfx906_emu::dot2;
 using vllm::gfx906_emu::fp8_lut_stage;
+using vllm::gfx906_emu::fp8_lut_u16;
 using vllm::gfx906_emu::fp8x4_to_f16x2x2;
 
 constexpr int kMsMax = 8;    // GEMV covers M <= 8 (decode)
@@ -269,13 +272,16 @@ __device__ __forceinline__ void fp8_gemm_load(const uint8_t* __restrict__ A,
   }
 }
 
-// Registers -> LDS (slice S), widening fp8 to fp16 pairs on the way.
-template <int BM, int BN, int TM, int TN, int S>
+// Registers -> one LDS stage, widening fp8 to fp16 pairs on the way.  The
+// stage is passed as a pointer (not as a compile-time subscript) so the
+// multi-stage pipeline below can rotate `chunk % stages` at run time without
+// unrolling by the least common multiple of the register and stage counts.
+template <int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void fp8_gemm_store(int tid,
                                                const uint32_t* __restrict__ src,
                                                const __half* __restrict__ lut,
-                                               uint32_t (&As)[2][BM * kFKp],
-                                               uint32_t (&Bs)[2][BN * kFKp]) {
+                                               uint32_t* __restrict__ As,
+                                               uint32_t* __restrict__ Bs) {
   using C = FConf<BM, BN, TM, TN>;
 #pragma unroll
   for (int u = 0; u < C::A4; ++u) {
@@ -285,8 +291,8 @@ __device__ __forceinline__ void fp8_gemm_store(int tid,
     const int jd = idx & (kFKw4 - 1);
     uint32_t lo, hi;
     fp8x4_to_f16x2x2(lut, src[u], lo, hi);
-    As[S][r * kFKp + 2 * jd] = lo;
-    As[S][r * kFKp + 2 * jd + 1] = hi;
+    As[r * kFKp + 2 * jd] = lo;
+    As[r * kFKp + 2 * jd + 1] = hi;
   }
 #pragma unroll
   for (int u = 0; u < C::B4; ++u) {
@@ -296,19 +302,17 @@ __device__ __forceinline__ void fp8_gemm_store(int tid,
     const int jd = idx & (kFKw4 - 1);
     uint32_t lo, hi;
     fp8x4_to_f16x2x2(lut, src[C::A4 + u], lo, hi);
-    Bs[S][r * kFKp + 2 * jd] = lo;
-    Bs[S][r * kFKp + 2 * jd + 1] = hi;
+    Bs[r * kFKp + 2 * jd] = lo;
+    Bs[r * kFKp + 2 * jd + 1] = hi;
   }
 }
 
-// LDS slice S -> TM x TN fp32 accumulators (one dot2 = 2 fp16 MACs).
-template <int BM, int BN, int TM, int TN, int S>
+// One LDS stage -> TM x TN fp32 accumulators (one dot2 = 2 fp16 MACs).
+template <int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void fp8_gemm_compute(
-    int tx, int ty, const uint32_t (&As)[2][BM * kFKp],
-    const uint32_t (&Bs)[2][BN * kFKp], float (&acc)[TM][TN]) {
+    int tx, int ty, const uint32_t* __restrict__ as,
+    const uint32_t* __restrict__ bs, float (&acc)[TM][TN]) {
   using C = FConf<BM, BN, TM, TN>;
-  const uint32_t* __restrict__ as = As[S];
-  const uint32_t* __restrict__ bs = Bs[S];
 #pragma unroll
   for (int u = 0; u < kFKw; ++u) {
     uint32_t a[TM], b[TN];
@@ -370,22 +374,22 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   // slice consumed by the previous compute is free to reuse.
   int kb = 0;
   for (; kb + 1 < NK; kb += 2) {
-    fp8_gemm_store<BM, BN, TM, TN, 0>(tid, f0, sl, As, Bs);
+    fp8_gemm_store<BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
     __syncthreads();
     fp8_gemm_load<BM, BN, TM, TN>(A, W, m0, n0, M, N, K, K4,
                                   (kb + 1) * kFBk, tid, f1);
-    fp8_gemm_compute<BM, BN, TM, TN, 0>(tx, ty, As, Bs, acc);
+    fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[0], Bs[0], acc);
 
-    fp8_gemm_store<BM, BN, TM, TN, 1>(tid, f1, sl, As, Bs);
+    fp8_gemm_store<BM, BN, TM, TN>(tid, f1, sl, As[1], Bs[1]);
     __syncthreads();
     fp8_gemm_load<BM, BN, TM, TN>(A, W, m0, n0, M, N, K, K4,
                                   (kb + 2) * kFBk, tid, f0);
-    fp8_gemm_compute<BM, BN, TM, TN, 1>(tx, ty, As, Bs, acc);
+    fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[1], Bs[1], acc);
   }
   if (kb < NK) {  // odd NK: the leftover slice is number 0 (kb is even here)
-    fp8_gemm_store<BM, BN, TM, TN, 0>(tid, f0, sl, As, Bs);
+    fp8_gemm_store<BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
     __syncthreads();
-    fp8_gemm_compute<BM, BN, TM, TN, 0>(tx, ty, As, Bs, acc);
+    fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[0], Bs[0], acc);
   }
 
   // Epilogue: (acc * a_s) * w_s, cast, then bias -- same order as
@@ -766,6 +770,27 @@ void launch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows, int nt,
       cpb);
 }
 
+// S23 / O4: highest M that may still take the streaming decode kernel.
+// Unset (or <= 0) means "no limit", i.e. today's dispatch untouched; a value V
+// means "skip the stream path when M >= V", so `run_block`'s tile branch takes
+// the call (with VLLM_DCU_FP8_DECODE_CFG picking the O3 tile).  Parsed once per
+// process, same pattern as the knobs above, so an A/B needs no rebuild.
+//
+// Why a gate at all: on 5120:1536 (K = 1536) at M = 8 the stream kernel
+// measures 92.1 us (86 GB/s) against 63.6 us (124 GB/s) for an O3 wide-BK tile,
+// because the A slice -- and its LDS read amplification -- grows with M while
+// the tiled GEMM is M-flat.  At M = 4 the same shape is 49.7 us on the stream
+// path against ~63 us tiled, so the crossover sits between M = 4 and 8.
+int stream_max_m() {
+  static const int lim = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_STREAM_MAX_M");
+    if (e == nullptr) return 0;
+    const int v = std::atoi(e);
+    return v > 0 ? v : 0;
+  }();
+  return lim;
+}
+
 // Streaming path available *and* its geometry chosen.  Returns 0 = none,
 // 1 = variant 1, 2 = variant 2.
 //
@@ -778,6 +803,9 @@ int stream_block_select(int M, int N, int K, int64_t w_stride, int nkb,
                         int block_n, int block_k, int want, int& rows,
                         int& nt) {
   if (want == 0 || M < 1 || M > kMsMax) return 0;
+  // S23 / O4: the M gate (see stream_max_m).  0 = no limit = today's dispatch.
+  const int stream_m_lim = stream_max_m();
+  if (stream_m_lim != 0 && M >= stream_m_lim) return 0;
   if (K < 64 || (K % kStreamChunk) != 0) return 0;
   if ((w_stride % kStreamChunk) != 0) return 0;
   if (block_k < kStreamChunk || (block_k % kStreamChunk) != 0) return 0;
@@ -821,6 +849,7 @@ int stream_block_mode() {
   }();
   return mode;
 }
+
 
 // Depth of the W software pipeline; 3 keeps 3 KiB per warp in flight, which is
 // what covers the ~600-cycle DRAM latency at 512 threads/block.  A/B knob, no
@@ -1148,30 +1177,30 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN), MINB)
 
   int c = 0;  // K chunk index (kFBk elements each)
   for (; c + 1 < NK; c += 2) {
-    fp8_gemm_store<BM, BN, TM, TN, 0>(tid, f0, sl, As, Bs);
+    fp8_gemm_store<BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
     __syncthreads();
     fp8_gemm_load_block<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
                                         (c + 1) * kFBk, tid, f1);
-    fp8_gemm_compute<BM, BN, TM, TN, 0>(tx, ty, As, Bs, blk);
+    fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[0], Bs[0], blk);
     if (((c + 1) % cpb) == 0)
       fp8_gemm_fold_block_scale<BM, BN, TM, TN>(tx, ty, m0, n0, M, N, c / cpb,
                                                 nkb, block_n, a_s, w_s, blk,
                                                 acc);
 
-    fp8_gemm_store<BM, BN, TM, TN, 1>(tid, f1, sl, As, Bs);
+    fp8_gemm_store<BM, BN, TM, TN>(tid, f1, sl, As[1], Bs[1]);
     __syncthreads();
     fp8_gemm_load_block<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
                                         (c + 2) * kFBk, tid, f0);
-    fp8_gemm_compute<BM, BN, TM, TN, 1>(tx, ty, As, Bs, blk);
+    fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[1], Bs[1], blk);
     if (((c + 2) % cpb) == 0)
       fp8_gemm_fold_block_scale<BM, BN, TM, TN>(tx, ty, m0, n0, M, N,
                                                 (c + 1) / cpb, nkb, block_n,
                                                 a_s, w_s, blk, acc);
   }
   if (c < NK) {  // odd NK: the leftover slice is number 0 (c is even here)
-    fp8_gemm_store<BM, BN, TM, TN, 0>(tid, f0, sl, As, Bs);
+    fp8_gemm_store<BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
     __syncthreads();
-    fp8_gemm_compute<BM, BN, TM, TN, 0>(tx, ty, As, Bs, blk);
+    fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[0], Bs[0], blk);
     if (((c + 1) % cpb) == 0)
       fp8_gemm_fold_block_scale<BM, BN, TM, TN>(tx, ty, m0, n0, M, N, c / cpb,
                                                 nkb, block_n, a_s, w_s, blk,
@@ -1205,6 +1234,235 @@ void launch_gemm_block(int M, int N, int K, int64_t w_stride, int nkb, int cpb,
       <<<grid, block, 0, stream>>>(A, W, w_stride, a_s, w_s, nkb, cpb,
                                    block_n, lut, bias, C, M, N, K);
 }
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// same, but with a wider K chunk (BK elements per stage)
+// ---------------------------------------------------------------------------
+// S20 left exactly one discriminator open between "per-chunk staging
+// serialisation" and everything else: `kFBk = 64`, i.e. half as many staging
+// rounds for the same staged bytes (.s20/S20_kernel_NOTES.md §5.6, §6.2-6: the
+// cfg 16 kernel issues its instructions at only 38% of peak, and the two
+// candidate causes -- LDS bank conflicts and the staging rounds -- cannot be
+// separated without this variant).  A wider BK keeps the per-byte staging cost
+// identical (same widening, same stores, same LDS reads per element) and halves
+// the barrier count, the loop overhead and the number of exposed round trips.
+//
+// Kept self-contained instead of templating kFBk through the shared helpers:
+// the prefill tiles (cfgs 1..10) must keep compiling to byte-identical code, and
+// `kFBk` also drives the scale-fold cadence (`cpb = block_k / kFBk`), so sharing
+// it would put every prefill cfg on the diff for no gain.
+template <int BK, int BM, int BN, int TM, int TN>
+struct KConf {
+  static constexpr int Kw4 = BK / 4;   // fp8 dwords per row per chunk
+  static constexpr int Kw = BK / 2;    // fp16 dwords per row per chunk
+  static constexpr int Kp = Kw + 1;    // padded LDS row stride
+  static constexpr int LogKw4 = (BK == 32) ? 3 : ((BK == 64) ? 4 : 5);
+  static constexpr int MG = BM / TM;
+  static constexpr int NG = BN / TN;
+  static constexpr int NT = MG * NG;
+  static constexpr int A4 = (BM * Kw4 + NT - 1) / NT;
+  static constexpr int B4 = (BN * Kw4 + NT - 1) / NT;
+};
+
+template <int BK, int BM, int BN, int TM, int TN>
+__device__ __forceinline__ void fp8_gemm_load_wide(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ W,
+    int64_t w_stride, int m0, int n0, int M, int N, int K, int K4, int k0,
+    int tid, uint32_t* __restrict__ dst) {
+  using C = KConf<BK, BM, BN, TM, TN>;
+  const uint32_t* __restrict__ ap =
+      reinterpret_cast<const uint32_t*>(A + (int64_t)m0 * K + k0);
+  const uint32_t* __restrict__ wp =
+      reinterpret_cast<const uint32_t*>(W + (int64_t)n0 * w_stride + k0);
+  const int w4 = (int)(w_stride >> 2);
+  const bool kfull = (k0 + BK) <= K;
+#pragma unroll
+  for (int u = 0; u < C::A4; ++u) {
+    const int idx = tid + u * C::NT;
+    const int r = idx >> C::LogKw4;
+    const int jd = idx & (C::Kw4 - 1);
+    uint32_t v = 0;
+    if (idx < BM * C::Kw4 && m0 + r < M && (kfull || (k0 + (jd + 1) * 4) <= K))
+      v = ap[(int64_t)r * K4 + jd];
+    dst[u] = v;
+  }
+#pragma unroll
+  for (int u = 0; u < C::B4; ++u) {
+    const int idx = tid + u * C::NT;
+    const int r = idx >> C::LogKw4;
+    const int jd = idx & (C::Kw4 - 1);
+    uint32_t v = 0;
+    if (idx < BN * C::Kw4 && n0 + r < N && (kfull || (k0 + (jd + 1) * 4) <= K))
+      v = wp[(int64_t)r * w4 + jd];
+    dst[C::A4 + u] = v;
+  }
+}
+
+template <int BK, int BM, int BN, int TM, int TN>
+__device__ __forceinline__ void fp8_gemm_store_wide(
+    int tid, const uint32_t* __restrict__ src, const __half* __restrict__ lut,
+    uint32_t* __restrict__ As, uint32_t* __restrict__ Bs) {
+  using C = KConf<BK, BM, BN, TM, TN>;
+#pragma unroll
+  for (int u = 0; u < C::A4; ++u) {
+    const int idx = tid + u * C::NT;
+    if (idx >= BM * C::Kw4) continue;
+    const int r = idx >> C::LogKw4;
+    const int jd = idx & (C::Kw4 - 1);
+    uint32_t lo, hi;
+    fp8x4_to_f16x2x2(lut, src[u], lo, hi);
+    As[r * C::Kp + 2 * jd] = lo;
+    As[r * C::Kp + 2 * jd + 1] = hi;
+  }
+#pragma unroll
+  for (int u = 0; u < C::B4; ++u) {
+    const int idx = tid + u * C::NT;
+    if (idx >= BN * C::Kw4) continue;
+    const int r = idx >> C::LogKw4;
+    const int jd = idx & (C::Kw4 - 1);
+    uint32_t lo, hi;
+    fp8x4_to_f16x2x2(lut, src[C::A4 + u], lo, hi);
+    Bs[r * C::Kp + 2 * jd] = lo;
+    Bs[r * C::Kp + 2 * jd + 1] = hi;
+  }
+}
+
+template <int BK, int BM, int BN, int TM, int TN>
+__device__ __forceinline__ void fp8_gemm_compute_wide(
+    int tx, int ty, const uint32_t* __restrict__ as,
+    const uint32_t* __restrict__ bs, float (&acc)[TM][TN]) {
+  using C = KConf<BK, BM, BN, TM, TN>;
+#pragma unroll
+  for (int u = 0; u < C::Kw; ++u) {
+    uint32_t a[TM], b[TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) a[i] = as[(ty + C::MG * i) * C::Kp + u];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) b[j] = bs[(tx + C::NG * j) * C::Kp + u];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        acc[i][j] = dot2(a[i], b[j], acc[i][j]);
+      }
+    }
+  }
+}
+
+
+// Wide K chunk with the ORIGINAL two-stage double buffer (2 x BK elements of
+// LDS instead of RST+1 stages).  This is the configuration that keeps cfg 16's
+// occupancy while still halving the staging rounds: at BK = 64 the LDS footprint
+// is 2 x (BM + BN) * (BK/2 + 1) * 4 = 19 KiB, i.e. still 3 blocks/CU, whereas
+// the pipelined BK = 64 variant needs 4 stages = 38 KiB and drops to 1 block/CU
+// -- which is exactly what costs it 64% at N = 8704 (measured, see
+// .s23/w2/O3/sweep/sweep_wide_dev3.log).
+template <int BK, int BM, int BN, int TM, int TN, typename T>
+__global__ void __launch_bounds__((BM / TM) * (BN / TN))
+    fp8_emu_gemm_block_wide2_kernel(const uint8_t* __restrict__ A,
+                                    const uint8_t* __restrict__ W,
+                                    const int64_t w_stride,
+                                    const float* __restrict__ a_s,
+                                    const float* __restrict__ w_s,
+                                    const int nkb, const int cpb,
+                                    const int block_n,
+                                    const __half* __restrict__ lut,
+                                    const T* __restrict__ bias,
+                                    T* __restrict__ C, int M, int N, int K) {
+  using C_ = KConf<BK, BM, BN, TM, TN>;
+  constexpr int NT = C_::NT;
+  constexpr int FRAGS = C_::A4 + C_::B4;
+  static_assert(C_::MG * TM == BM && C_::NG * TN == BN, "tile/thread mismatch");
+
+  __shared__ uint32_t As[2][BM * C_::Kp];
+  __shared__ uint32_t Bs[2][BN * C_::Kp];
+  __shared__ __half sl[256];
+
+  const int tid = threadIdx.x;
+  const int tx = tid % C_::NG;
+  const int ty = tid / C_::NG;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int K4 = K >> 2;
+  const int NK = (K + BK - 1) / BK;
+
+  fp8_lut_stage(sl, lut, NT);
+  __syncthreads();
+
+  float acc[TM][TN];
+  float blk[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      acc[i][j] = 0.0f;
+      blk[i][j] = 0.0f;
+    }
+  }
+
+  uint32_t f0[FRAGS], f1[FRAGS];
+  fp8_gemm_load_wide<BK, BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
+                                         0, tid, f0);
+  int c = 0;
+  for (; c + 1 < NK; c += 2) {
+    fp8_gemm_store_wide<BK, BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
+    __syncthreads();
+    fp8_gemm_load_wide<BK, BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
+                                           (c + 1) * BK, tid, f1);
+    fp8_gemm_compute_wide<BK, BM, BN, TM, TN>(tx, ty, As[0], Bs[0], blk);
+    if (((c + 1) % cpb) == 0)
+      fp8_gemm_fold_block_scale<BM, BN, TM, TN>(tx, ty, m0, n0, M, N, c / cpb,
+                                                nkb, block_n, a_s, w_s, blk,
+                                                acc);
+    fp8_gemm_store_wide<BK, BM, BN, TM, TN>(tid, f1, sl, As[1], Bs[1]);
+    __syncthreads();
+    fp8_gemm_load_wide<BK, BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
+                                           (c + 2) * BK, tid, f0);
+    fp8_gemm_compute_wide<BK, BM, BN, TM, TN>(tx, ty, As[1], Bs[1], blk);
+    if (((c + 2) % cpb) == 0)
+      fp8_gemm_fold_block_scale<BM, BN, TM, TN>(tx, ty, m0, n0, M, N,
+                                                (c + 1) / cpb, nkb, block_n,
+                                                a_s, w_s, blk, acc);
+  }
+  if (c < NK) {
+    fp8_gemm_store_wide<BK, BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
+    __syncthreads();
+    fp8_gemm_compute_wide<BK, BM, BN, TM, TN>(tx, ty, As[0], Bs[0], blk);
+    if (((c + 1) % cpb) == 0)
+      fp8_gemm_fold_block_scale<BM, BN, TM, TN>(tx, ty, m0, n0, M, N, c / cpb,
+                                                nkb, block_n, a_s, w_s, blk,
+                                                acc);
+  }
+
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+    const int row = m0 + ty + C_::MG * i;
+    if (row >= M) continue;
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int col = n0 + tx + C_::NG * j;
+      if (col >= N) continue;
+      T o = static_cast<T>(acc[i][j]);
+      if (bias != nullptr) o += static_cast<T>(bias[col]);
+      C[(int64_t)row * N + col] = o;
+    }
+  }
+}
+
+template <int BK, int BM, int BN, int TM, int TN, typename T>
+void launch_gemm_block_wide2(int M, int N, int K, int64_t w_stride, int nkb,
+                             int cpb, int block_n, const uint8_t* A,
+                             const uint8_t* W, const float* a_s,
+                             const float* w_s, const __half* lut, const T* bias,
+                             T* C, hipStream_t stream) {
+  dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+  dim3 block((BM / TM) * (BN / TN));
+  fp8_emu_gemm_block_wide2_kernel<BK, BM, BN, TM, TN, T>
+      <<<grid, block, 0, stream>>>(A, W, w_stride, a_s, w_s, nkb, cpb, block_n,
+                                   lut, bias, C, M, N, K);
+}
+
 
 void check_common(const torch::Tensor& a, const torch::Tensor& w,
                   const torch::Tensor& a_s, const torch::Tensor& w_s,
@@ -1432,6 +1690,20 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
                                                cpb, block_n, A, W, a_s,    \
                                                w_s, lut, bias, C, stream); \
     break
+// Multi-stage K pipeline (S23 / O3).  Numerically identical to the same tile
+// in the 2-stage kernel above -- only the buffering depth differs -- so a cfg
+// pair (16, N) is a clean A/B.
+#define VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(CFG, BK, BM, BN, TM, TN)            \
+  case CFG:                                                                 \
+    launch_gemm_block_wide2<BK, BM, BN, TM, TN, T>(                         \
+        M, N, K, w_stride, nkb, cpb / (BK / kFBk), block_n, A, W, a_s, w_s, \
+        lut, bias, C, stream);                                             \
+    break
+  // cfgs 32..35 stage BK = 64/128 elements per round; the scale fold at
+  // `(c + 1) % cpb` only lands on a block_k boundary when block_k is a multiple
+  // of BK, i.e. when the chunk count cpb is.
+  if ((cfg == 32 || cfg == 35) && (cpb % (64 / kFBk)) != 0) cfg = 16;
+  if ((cfg == 33 || cfg == 34) && (cpb % (128 / kFBk)) != 0) cfg = 16;
   switch (cfg) {
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(1, 32, 64, 4, 4);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(2, 64, 64, 4, 4);
@@ -1474,6 +1746,16 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(17, 8, 32, 1, 2);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(18, 8, 64, 1, 1);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(19, 8, 128, 1, 2);
+    // 32..35: cfg 16's tile with a wider K chunk on the original two-stage
+    // buffer (see the kernel comment). 
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(32, 64, 8, 64, 1, 2);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(33, 128, 8, 64, 1, 2);
+    // 34/35: BN = 32 so that a wide K chunk still fits three blocks per CU
+    // (LDS 2 x (BM + BN) x (BK/2 + 1) x 4 = 20.8 / 10.6 KiB).  BN = 32 also
+    // doubles the grid, which is the only way to put more than 12 blocks on a
+    // 60-CU device at N = 768.
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(34, 128, 8, 32, 1, 2);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(35, 64, 8, 32, 1, 2);
     case 4:
     default:
       launch_gemm_block<128, 128, 8, 8, T>(M, N, K, w_stride, nkb, cpb,
@@ -1483,6 +1765,7 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
   }
 #undef VLLM_FP8_EMU_GEMM_BLOCK_CASE
 #undef VLLM_FP8_EMU_GEMM_BLOCK_CASE_MB
+#undef VLLM_FP8_EMU_GEMM_BLOCK_CASE_X
 }
 
 // Decode (M = 5..8) tiled-GEMM configuration.  `VLLM_DCU_FP8_DECODE_CFG` is an
@@ -1497,6 +1780,7 @@ int decode_gemm_cfg(int N) {
   if (e[0] == 'a' || e[0] == 'A') return wide;  // "auto"
   const int v = std::atoi(e);
   if (v >= 11 && v <= 19) return v;
+  if (v >= 32 && v <= 35) return v;
   if (v == 0) return (N >= 6144) ? 10 : 5;
   return wide;
 }
@@ -1617,6 +1901,263 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
 #undef VLLM_FP8_EMU_BLOCK_DISPATCH
 }
 
+
+// ---------------------------------------------------------------------------
+// S23 / O5: activation quantization fused into the block-scaled decode GEMM
+// ---------------------------------------------------------------------------
+// Motivation: a decode step of the 27B model issues 256 activation-quant
+// launches + 256 fp8-emu GEMM launches.  Fusing removes the quant launch and
+// the A round trip through HBM (~2.15 ms/step of GPU quant time plus 256
+// launches), and it is cheap here because A is only M*K bytes (40 KiB at M=8
+// and K=5120).
+//
+// Bit-exactness contract.  The quantizer below reproduces
+// `csrc/quantization/w8a8/fp8/per_token_group_quant.cu:189-300`
+// (per_token_group_quant_8bit_register_kernel, GROUP_SIZE 128) step for step:
+//   1. absmax seeded with `eps`, `fmaxf(m, fabsf(v))` over the group's 128
+//      elements.  The maximum is exact and order independent, so a different
+//      element-to-lane partition (32 lanes x 4 elements here, 8 lanes x 16
+//      there) yields the same value.
+//   2. `y_s = m / 448.0f` (a real division, not a reciprocal multiply).
+//   3. `inv_y = 1.0f / y_s` (a second real division); `scaled = v * inv_y`.
+//   4. `q = fminf(fmaxf(scaled, -448.0f), 448.0f)` then the e4m3 cast through
+//      `c10::Float8_e4m3fn`, i.e. the very same header conversion the reference
+//      kernel uses, so rounding/saturation cannot drift.
+//   5. `x_s` = `y_s` per 128-element group, fp32.
+// The resulting fp8 code is then widened through the same 256-entry LDS LUT as
+// the unfused path (lossless), so the dot2 stream and the `(acc*a_s)*w_s`
+// epilogue order are untouched.
+constexpr float kQFp8Max = 448.0f;   // e4m3 `max_8bit`
+constexpr float kQFp8Min = -448.0f;
+constexpr int kQGroup = 128;         // production block_k / quant group
+constexpr int kQMaxNkb = 64;         // static sA budget: K <= 8192 at block_k 128
+
+// One warp per (row, group): 32 lanes x 4 elements.  Standalone quantizer, used
+// by the stream fallback (which must feed the existing stream kernel two real
+// buffers) and by the `_quant_x` witness variant.
+template <typename TA>
+__global__ void fp8_emu_quant_a_kernel(const TA* __restrict__ a,
+                                       uint8_t* __restrict__ xq,
+                                       float* __restrict__ xs, int64_t ngroups,
+                                       float eps) {
+  const int64_t g = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (g >= ngroups) return;
+  const int lane = threadIdx.x & 31;
+  const int64_t base = g * kQGroup + lane * 4;
+  float v[4];
+  const TA* p = a + base;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = static_cast<float>(p[i]);
+  float m = eps;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) m = fmaxf(m, fabsf(v[i]));
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off, 32));
+  const float y_s = m / kQFp8Max;
+  const float inv_y = 1.0f / y_s;
+  if (lane == 0) xs[g] = y_s;
+  uint8_t* q = xq + base;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float sc = fminf(fmaxf(v[i] * inv_y, kQFp8Min), kQFp8Max);
+    c10::Float8_e4m3fn qb(sc);
+    q[i] = *reinterpret_cast<const uint8_t*>(&qb);
+  }
+}
+
+// Fused tile: the two-stage wide-chunk skeleton of
+// `fp8_emu_gemm_block_wide2_kernel` with BK == block_k == 128, so one K chunk is
+// exactly one quant group and the per-group scale is produced where it is
+// consumed.  Geometry is fixed (BM=8, BN=64, TM=1, TN=2, NT=256) because the
+// A quantizer needs one contiguous 32-lane group per row: with NT=256 and
+// A-fragment count 1, thread `tid` owns row `tid >> 5`, position `tid & 31`.
+// `a_s` (y_s) lives in LDS ([BM][nkb] fp32 = 1.28 KiB), so the hot path
+// allocates `out` and nothing else.
+constexpr int kQbk = kQGroup;
+constexpr int kQkw4 = kQbk / 4;    // 32 fp8 dwords per row per chunk
+constexpr int kQkp = kQbk / 2 + 1; // 65: padded fp16 LDS row stride
+
+template <int BM, int BN, int TM, int TN, typename T, typename TA>
+__global__ void __launch_bounds__((BM / TM) * (BN / TN))
+    fp8_emu_gemm_block_q_kernel(const TA* __restrict__ A,
+                                const uint8_t* __restrict__ W,
+                                const int64_t w_stride,
+                                const float* __restrict__ w_s, const int nkb,
+                                const int block_n, const __half* __restrict__ lut,
+                                const T* __restrict__ bias, T* __restrict__ C,
+                                int M, int N, int K, float eps,
+                                uint8_t* __restrict__ xq_w,
+                                float* __restrict__ xs_w) {
+  using C_ = FConf<BM, BN, TM, TN>;
+  constexpr int NT = C_::NT;
+  constexpr int B4 = (BN * kQkw4 + NT - 1) / NT;
+  static_assert(C_::MG * TM == BM && C_::NG * TN == BN, "tile/thread mismatch");
+  static_assert(NT == BM * 32, "A quantizer needs one 32-lane group per row");
+  static_assert(BM * kQkw4 == NT, "A fragment count must be 1");
+
+  __shared__ uint32_t As[2][BM * kQkp];
+  __shared__ uint32_t Bs[2][BN * kQkp];
+  __shared__ float sA[BM][kQMaxNkb];
+  __shared__ __half sl[256];
+
+  const int tid = threadIdx.x;
+  const int tx = tid % C_::NG;
+  const int ty = tid / C_::NG;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int K4 = K >> 2;
+  const int w4 = (int)(w_stride >> 2);
+  const int NK = (K + kQbk - 1) / kQbk;
+  const int ar = tid >> 5;    // A row owned by this thread
+  const int ajd = tid & 31;   // 4-element position inside the group
+
+  fp8_lut_stage(sl, lut, NT);
+  __syncthreads();
+
+  float acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+#pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+  }
+
+  const int row_a = m0 + ar;
+  const bool arow = row_a < M;
+
+  // Stage chunk `c`: quantize the A group (one per row), widen through the LUT,
+  // and store the B slice exactly as the unfused two-stage kernel does.
+  auto stage = [&](int c, int slot, const uint8_t* __restrict__ Wsrc,
+                   int k0) {
+    // ---- A: 4 elements per lane, 32 lanes per row-group ----
+    float v[4];
+    const int64_t abase = (int64_t)row_a * K + k0 + ajd * 4;
+    if (arow) {
+      const TA* p = A + abase;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = static_cast<float>(p[i]);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = 0.0f;
+    }
+    float mx = eps;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) mx = fmaxf(mx, fabsf(v[i]));
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off, 32));
+    const float y_s = mx / kQFp8Max;
+    const float inv_y = 1.0f / y_s;
+    if (ajd == 0) sA[ar][c] = y_s;
+    uint32_t lo, hi;
+    {
+      uint8_t q[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float sc = fminf(fmaxf(v[i] * inv_y, kQFp8Min), kQFp8Max);
+        c10::Float8_e4m3fn qb(sc);
+        q[i] = *reinterpret_cast<const uint8_t*>(&qb);
+      }
+      lo = (uint32_t)fp8_lut_u16(sl, q[0]) |
+           ((uint32_t)fp8_lut_u16(sl, q[1]) << 16);
+      hi = (uint32_t)fp8_lut_u16(sl, q[2]) |
+           ((uint32_t)fp8_lut_u16(sl, q[3]) << 16);
+      // The witness is redundant across grid.x (every N block quantizes the
+      // same A groups), so only grid column 0 writes it.
+      if (xq_w != nullptr && arow && blockIdx.x == 0) {
+        uint8_t* dst = xq_w + abase;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) dst[i] = q[i];
+      }
+    }
+    if (xs_w != nullptr && arow && ajd == 0 && blockIdx.x == 0)
+      xs_w[(int64_t)row_a * nkb + c] = y_s;
+    As[slot][ar * kQkp + 2 * ajd] = lo;
+    As[slot][ar * kQkp + 2 * ajd + 1] = hi;
+
+    // ---- B: same staging as fp8_gemm_load_wide + fp8_gemm_store_wide ----
+#pragma unroll
+    for (int u = 0; u < B4; ++u) {
+      const int idx = tid + u * NT;
+      const int r = idx >> 5;
+      const int jd = idx & 31;
+      const bool ok = idx < BN * kQkw4 && n0 + r < N && (k0 + kQbk) <= K;
+      const uint32_t vv =
+          ok ? reinterpret_cast<const uint32_t*>(Wsrc + (int64_t)(n0 + r) * w_stride +
+                                                k0)[jd]
+             : 0u;
+      uint32_t wlo, whi;
+      fp8x4_to_f16x2x2(sl, vv, wlo, whi);
+      if (idx < BN * kQkw4) {
+        Bs[slot][r * kQkp + 2 * jd] = wlo;
+        Bs[slot][r * kQkp + 2 * jd + 1] = whi;
+      }
+    }
+  };
+
+  // compute_wide ACCUMULATES into blk, so it must start at zero: an
+  // uninitialized blk adds register garbage for the first group and makes the
+  // whole tile nondeterministic (measured: inf on 768:5120, then a finite
+  // value that matched the BK=128 reference on the next run).
+  float blk[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+#pragma unroll
+    for (int j = 0; j < TN; ++j) blk[i][j] = 0.0f;
+  }
+  auto consume = [&](int c, int slot) {
+    fp8_gemm_compute_wide<kQbk, BM, BN, TM, TN>(tx, ty, As[slot], Bs[slot], blk);
+    // Fold this group's scales; cpb == 1 because BK == block_k, so every chunk
+    // is exactly one scale block.  `acc += blk * sa * w_s` -- the same order as
+    // fp8_gemm_fold_block_scale, just with the 128-element group instead of a
+    // block_k window.
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+      const int row = ty + C_::MG * i;
+      if (m0 + row >= M) continue;
+      const float sa = sA[row][c];
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        const int col = n0 + tx + C_::NG * j;
+        if (col >= N) continue;
+        acc[i][j] += blk[i][j] * sa * w_s[(int64_t)(col / block_n) * nkb + c];
+        blk[i][j] = 0.0f;
+      }
+    }
+  };
+
+  // Two-stage pipeline, identical to the unfused kernel modulo the fused A
+  // staging (barrier after stage, consume then next stage).
+  int c = 0;
+  for (; c + 1 < NK; c += 2) {
+    stage(c, 0, W, c * kQbk);
+    __syncthreads();
+    consume(c, 0);
+    stage(c + 1, 1, W, (c + 1) * kQbk);
+    __syncthreads();
+    consume(c + 1, 1);
+  }
+  if (c < NK) {
+    stage(c, 0, W, c * kQbk);
+    __syncthreads();
+    consume(c, 0);
+  }
+
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+    const int row = m0 + ty + C_::MG * i;
+    if (row >= M) continue;
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int col = n0 + tx + C_::NG * j;
+      if (col >= N) continue;
+      T o = static_cast<T>(acc[i][j]);
+      if (bias != nullptr) o += static_cast<T>(bias[col]);
+      C[(int64_t)row * N + col] = o;
+    }
+  }
+}
+
 }  // namespace
 
 torch::Tensor fp8_emu_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor a_s,
@@ -1708,7 +2249,7 @@ torch::Tensor fp8_emu_gemm_block(torch::Tensor a, torch::Tensor w,
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "fp8_emu_block: K must be a positive multiple of 4, got ", K);
   TORCH_CHECK(M >= 1, "fp8_emu_block: M must be >= 1");
-  TORCH_CHECK(cfg >= 0 && cfg <= 19, "fp8_emu_block: cfg must be 0..19, got ",
+  TORCH_CHECK(cfg >= 0 && cfg <= 35, "fp8_emu_block: cfg must be 0..35, got ",
               cfg);
 
   const c10::cuda::CUDAGuard guard(a.device());
@@ -1764,3 +2305,250 @@ torch::Tensor fp8_emu_gemm_block_meta(torch::Tensor a, torch::Tensor w,
                                       int64_t block_n, int64_t block_k) {
   return a.new_empty({a.size(0), w.size(0)}, a_s.options().dtype(out_dtype));
 }
+
+// ---------------------------------------------------------------------------
+// S23 / O5 host side: fused activation quant + block-scaled GEMM
+// ---------------------------------------------------------------------------
+namespace {
+
+// `cfg` for the fused entry.  Python passes `_prefill_cfg(M, N)`, which is 0
+// unless VLLM_DCU_FP8_PREFILL_CFG is set; 0 on the decode range resolves to
+// VLLM_DCU_FP8_DECODE_CFG so the fallback routes track the unfused dispatch.
+// The primary fused tile has a fixed geometry (BM=8, BN=64) and ignores this
+// value -- only the stream/GEMM fallbacks consult it, so
+// VLLM_DCU_FP8_DECODE_CFG does not retile the fused hot path.
+int fused_decode_cfg(int M, int N, int64_t cfg) {
+  if (cfg != 0) return (int)cfg;
+  return (M <= kMsMax) ? decode_gemm_cfg(N) : 0;
+}
+
+// Standalone quantizer launch (stream fallback and the prefill range).
+template <typename TA>
+void launch_quant_a(const TA* a, uint8_t* xq, float* xs, int64_t ngroups,
+                    float eps, hipStream_t stream) {
+  const int threads = 128;  // 4 warps = 4 groups per block
+  const unsigned blocks = (unsigned)((ngroups + 3) / 4);
+  fp8_emu_quant_a_kernel<TA><<<blocks, threads, 0, stream>>>(a, xq, xs, ngroups,
+                                                             eps);
+}
+
+template <typename T, typename TA>
+void dispatch_block_quant(int M, int N, int K, int64_t w_stride,
+                          const torch::Tensor& w_s_t, int nkb, int block_n,
+                          int block_k, int cfg, int s_mode, int s_rows,
+                          int s_nt, float eps, const TA* A, const uint8_t* W,
+                          const float* w_s, const __half* lut, const T* bias,
+                          T* C, torch::Tensor* xq_w, torch::Tensor* xs_w,
+                          hipStream_t stream) {
+  const bool use_stream = s_mode != 0;
+  // The fused tile keeps the per-group scales in static LDS
+  // (`sA[BM][kQMaxNkb]`), so it only applies when K/block_k fits that budget;
+  // larger K (or a stream route, or block_k != 128) takes the standalone
+  // quantizer route below.
+  const bool fused_tile = !use_stream && M <= kMsMax && block_k == kQGroup &&
+                          nkb <= kQMaxNkb;
+
+  if (fused_tile) {
+    // Single launch; `out` is the only allocation unless `_quant_x` asked for
+    // the witness, which the kernel itself emits from grid column 0 -- the
+    // exact quantization the GEMM consumed.
+    at::Tensor xq, xs;
+    uint8_t* xq_p = nullptr;
+    float* xs_p = nullptr;
+    if (xq_w != nullptr) {
+      *xq_w = at::empty({(int64_t)M, (int64_t)K},
+                        w_s_t.options().dtype(at::kByte));
+      *xs_w = at::empty({(int64_t)M, nkb}, w_s_t.options());
+      xq_p = reinterpret_cast<uint8_t*>(xq_w->data_ptr());
+      xs_p = reinterpret_cast<float*>(xs_w->data_ptr());
+    }
+    constexpr int BM = 8, BN = 64, TM = 1, TN = 2;
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    dim3 block((BM / TM) * (BN / TN));
+    fp8_emu_gemm_block_q_kernel<BM, BN, TM, TN, T, TA>
+        <<<grid, block, 0, stream>>>(A, W, w_stride, w_s, nkb, block_n, lut,
+                                     bias, C, M, N, K, eps, xq_p, xs_p);
+    return;
+  }
+
+  // Fallback (stream decode, prefill range, or K/block_k > kQMaxNkb): one
+  // quantizer launch into freshly allocated buffers (never reused across
+  // layers, which would alias under CUDA graphs / concurrent requests), then
+  // the existing unfused kernels.
+  at::Tensor xq, xs;
+  uint8_t* xq_p = nullptr;
+  float* xs_p = nullptr;
+  const int64_t ngroups = (int64_t)M * nkb;
+  if (xq_w != nullptr) {
+    *xq_w = at::empty({(int64_t)M, (int64_t)K},
+                      w_s_t.options().dtype(at::kByte));
+    *xs_w = at::empty({(int64_t)M, nkb}, w_s_t.options());
+    xq_p = reinterpret_cast<uint8_t*>(xq_w->data_ptr());
+    xs_p = reinterpret_cast<float*>(xs_w->data_ptr());
+  } else {
+    xq = at::empty({(int64_t)M, (int64_t)K}, w_s_t.options().dtype(at::kByte));
+    xs = at::empty({(int64_t)M, nkb}, w_s_t.options());
+    xq_p = reinterpret_cast<uint8_t*>(xq.data_ptr());
+    xs_p = reinterpret_cast<float*>(xs.data_ptr());
+  }
+  launch_quant_a<TA>(A, xq_p, xs_p, ngroups, eps, stream);
+
+  const uint8_t* aq = xq_p;
+  const float* aq_s = xs_p;
+  if (use_stream) {
+    if (s_mode == 2) {
+      dispatch_gemv_stream2<T>(M, N, K, w_stride, s_rows, s_nt, nkb,
+                               block_n, (int)(block_k / kStreamChunk), aq, W,
+                               aq_s, w_s, lut, bias, C, stream);
+    } else {
+      dispatch_gemv_stream<T>(M, N, K, w_stride, s_rows, s_nt, nkb, block_n,
+                              (int)(block_k / kStreamChunk),
+                              stream_prefetch(), aq, W, aq_s, w_s, lut, bias, C,
+                              stream);
+    }
+    return;
+  }
+  // Prefill range (M > kMsMax) or GEMM fallback on the decode range (large
+  // K/block_k): quant launch + the existing tiled dispatch.
+  dispatch_gemm_block_cfg<T>(cfg, M, N, K, w_stride, nkb, (int)(block_k / kFBk),
+                             block_n, aq, W, aq_s, w_s, lut, bias, C, stream);
+}
+
+void run_block_quant(const torch::Tensor& a, const torch::Tensor& w,
+                     const torch::Tensor& w_s, const torch::Tensor& lut,
+                     const std::optional<torch::Tensor>& bias,
+                     torch::Tensor& out, int64_t cfg,
+                     int64_t block_n, int64_t block_k, double eps,
+                     torch::Tensor* xq_w, torch::Tensor* xs_w) {
+  TORCH_CHECK(a.is_cuda() && w.is_cuda() && w_s.is_cuda() && lut.is_cuda(),
+              "fp8_emu_block_quant: all tensors must be on the GPU");
+  TORCH_CHECK(a.element_size() == 2,
+              "fp8_emu_block_quant: `a` is the *unquantized* activation and must "
+              "be 16-bit (fp16/bf16), got element_size ", a.element_size());
+  TORCH_CHECK(w.element_size() == 1 && w.scalar_type() == at::kFloat8_e4m3fn,
+              "fp8_emu_block_quant: `w` must be fp8 e4m3");
+  TORCH_CHECK(a.is_contiguous() && w.stride(1) == 1 && w.stride(0) > 0 &&
+                  lut.is_contiguous() && w_s.is_contiguous(),
+              "fp8_emu_block_quant: a/lut/w_s contiguous, w K-contiguous");
+  TORCH_CHECK(lut.scalar_type() == at::kHalf && lut.numel() == 256,
+              "fp8_emu_block_quant: lut must be a 256-element fp16 tensor");
+  TORCH_CHECK(w_s.scalar_type() == at::kFloat && w_s.dim() == 2,
+              "fp8_emu_block_quant: w_s must be a 2-D fp32 block-scale matrix");
+  const int M = (int)a.size(0), N = (int)w.size(0), K = (int)a.size(1);
+  TORCH_CHECK((int)w.size(1) == K, "fp8_emu_block_quant: K mismatch");
+  TORCH_CHECK(block_k > 0 && K % block_k == 0,
+              "fp8_emu_block_quant: block_k must divide K");
+  const int nkb = (int)(K / block_k);
+  const int64_t w_stride = w.stride(0);
+  TORCH_CHECK((w_stride % 4) == 0,
+              "fp8_emu_block_quant: w row stride must be a multiple of 4");
+  TORCH_CHECK(w_s.size(0) == (N + block_n - 1) / block_n &&
+                  w_s.size(1) == nkb,
+              "fp8_emu_block_quant: w_s must be [cdiv(N,block_n), cdiv(K,block_k)]");
+  // The whole fused entry quantizes in fixed 128-element groups, so a
+  // different block_k cannot be served correctly (mismatched scale layout or,
+  // for block_k > 128, an out-of-bounds scale write).
+  TORCH_CHECK(block_k == kQGroup,
+              "fp8_emu_block_quant: block_k must be ", kQGroup, ", got ",
+              block_k);
+  const void* bias_ptr = nullptr;
+  if (bias.has_value() && bias->defined()) {
+    TORCH_CHECK(bias->is_cuda() && bias->is_contiguous() &&
+                    bias->numel() == w.size(0) &&
+                    bias->scalar_type() == out.scalar_type(),
+                "fp8_emu_block_quant: bad bias");
+    bias_ptr = bias->data_ptr();
+  }
+
+  const __half* lut_p = reinterpret_cast<const __half*>(lut.data_ptr());
+  const uint8_t* W = reinterpret_cast<const uint8_t*>(w.data_ptr());
+  const float* w_s_p = reinterpret_cast<const float*>(w_s.data_ptr());
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int c = fused_decode_cfg(M, N, cfg);
+
+  int s_rows = 0, s_nt = 0;
+  const int s_mode =
+      stream_block_select(M, N, K, w_stride, nkb, (int)block_n, (int)block_k,
+                          stream_block_mode(), s_rows, s_nt);
+
+#define VLLM_FP8_EMU_BLOCK_QUANT(T, AT)                                      \
+  do {                                                                       \
+    if (a.scalar_type() == at::kHalf) {                                       \
+      dispatch_block_quant<T, at::Half>(                                     \
+          M, N, K, w_stride, w_s, nkb, (int)block_n, (int)block_k, c,         \
+          s_mode, s_rows, s_nt, (float)eps,                                  \
+          reinterpret_cast<const at::Half*>(a.data_ptr()), W, w_s_p, lut_p,   \
+          reinterpret_cast<const AT*>(bias_ptr),                             \
+          reinterpret_cast<AT*>(out.data_ptr()), xq_w, xs_w, stream);        \
+    } else {                                                                 \
+      dispatch_block_quant<T, at::BFloat16>(                                 \
+          M, N, K, w_stride, w_s, nkb, (int)block_n, (int)block_k, c,         \
+          s_mode, s_rows, s_nt, (float)eps,                                  \
+          reinterpret_cast<const at::BFloat16*>(a.data_ptr()), W, w_s_p,      \
+          lut_p, reinterpret_cast<const AT*>(bias_ptr),                      \
+          reinterpret_cast<AT*>(out.data_ptr()), xq_w, xs_w, stream);        \
+    }                                                                        \
+  } while (0)
+  switch (out.scalar_type()) {
+    case at::kBFloat16:
+      VLLM_FP8_EMU_BLOCK_QUANT(at::BFloat16, at::BFloat16);
+      break;
+    case at::kHalf:
+      VLLM_FP8_EMU_BLOCK_QUANT(at::Half, at::Half);
+      break;
+    default:
+      VLLM_FP8_EMU_BLOCK_QUANT(float, float);
+      break;
+  }
+#undef VLLM_FP8_EMU_BLOCK_QUANT
+}
+
+}  // namespace
+
+torch::Tensor fp8_emu_gemm_block_quant(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t /*nthreads*/, int64_t cfg, int64_t block_n, int64_t block_k,
+    double eps) {
+  const c10::cuda::CUDAGuard guard(a.device());
+  auto out = at::empty({a.size(0), w.size(0)}, w_s.options().dtype(out_dtype));
+  run_block_quant(a, w, w_s, lut, bias, out, cfg, block_n, block_k, eps,
+                  nullptr, nullptr);
+  return out;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fp8_emu_gemm_block_quant_x(torch::Tensor a, torch::Tensor w, torch::Tensor w_s,
+                           torch::Tensor lut, std::optional<torch::Tensor> bias,
+                           at::ScalarType out_dtype, int64_t /*nthreads*/,
+                           int64_t cfg, int64_t block_n, int64_t block_k,
+                           double eps) {
+  const c10::cuda::CUDAGuard guard(a.device());
+  auto out = at::empty({a.size(0), w.size(0)}, w_s.options().dtype(out_dtype));
+  torch::Tensor xq, xs;
+  run_block_quant(a, w, w_s, lut, bias, out, cfg, block_n, block_k, eps,
+                  &xq, &xs);
+  return std::make_tuple(out, xq, xs);
+}
+
+torch::Tensor fp8_emu_gemm_block_quant_meta(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t /*nthreads*/, int64_t cfg, int64_t block_n, int64_t block_k,
+    double eps) {
+  return a.new_empty({a.size(0), w.size(0)}, w_s.options().dtype(out_dtype));
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fp8_emu_gemm_block_quant_x_meta(torch::Tensor a, torch::Tensor w,
+                                torch::Tensor w_s, torch::Tensor lut,
+                                std::optional<torch::Tensor> bias,
+                                at::ScalarType out_dtype, int64_t /*nthreads*/,
+                                int64_t cfg, int64_t block_n, int64_t block_k,
+                                double eps) {
+  return std::make_tuple(
+      a.new_empty({a.size(0), w.size(0)}, w_s.options().dtype(out_dtype)),
+      a.new_empty({a.size(0), a.size(1)}, w_s.options().dtype(at::kByte)),
+      a.new_empty({a.size(0), a.size(1) / block_k}, w_s.options()));
+}
+
