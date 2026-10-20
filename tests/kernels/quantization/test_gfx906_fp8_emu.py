@@ -1129,9 +1129,17 @@ def test_apply_weights_w8a16_full_path(w8a16_ops, default_vllm_config, monkeypat
     kernel = K(cfg)
 
     # W8A8 arm: the base class quantizes, the kernel runs the shipped path.
+    # The reference must use the *library* quantizer: the test-local
+    # _quantize_block helper uses a dividing scale where
+    # per_token_group_quant_fp8 multiplies by its reciprocal, which flips a
+    # handful of fp8 codes and would make this comparison a false negative.
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
     kernel.apply_input_quant = True
     out_w8a8 = kernel.apply_weights(layer, x)
-    qa, a_s = _quantize_block(x, fp8_dtype, rows_per_group=1)
+    qa, a_s = per_token_group_quant_fp8(x, BLOCK_K)
     ref_w8a8 = _reference_block(qa, a_s, w_q, w_s)
     assert _rel_err(out_w8a8, ref_w8a8) < 1e-3
 

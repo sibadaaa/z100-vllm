@@ -643,7 +643,11 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
     const int M, const int N, const int K, const int64_t w_stride,
     const int rows, const int nkb, const int block_n, const int cpb,
     const int a16) {
-  extern __shared__ uint32_t dyn[];
+  // `sA` is accessed as uint4 by the MAC reader and (W8A16) written as
+  // uint4, so the dynamic LDS base must be 16 B aligned; the declaration
+  // alone only guarantees 4 B (the 512 B static LUT currently puts it at a
+  // 16 B boundary by layout accident -- make it explicit).
+  extern __shared__ __align__(16) uint32_t dyn[];
   __half* sA = reinterpret_cast<__half*>(dyn);                     // [M][K]
   float* sscale = reinterpret_cast<float*>(sA + (int64_t)M * K);   // [M][nkb]
   __shared__ __half sl[256];
@@ -935,7 +939,11 @@ __global__ void fp8_emu_gemv_stream2_block_kernel(
     T* __restrict__ out, const int M, const int N, const int K,
     const int64_t w_stride, const int rows, const int nkb, const int block_n,
     const int cpb, const int a16) {
-  extern __shared__ uint32_t dyn[];
+  // `sA` is accessed as uint4 by the MAC reader and (W8A16) written as
+  // uint4, so the dynamic LDS base must be 16 B aligned; the declaration
+  // alone only guarantees 4 B (the 512 B static LUT currently puts it at a
+  // 16 B boundary by layout accident -- make it explicit).
+  extern __shared__ __align__(16) uint32_t dyn[];
   __half* sA = reinterpret_cast<__half*>(dyn);                     // [M][K]
   float* sscale = reinterpret_cast<float*>(sA + (int64_t)M * K);   // [M][nkb]
   __shared__ __half sl[256];
@@ -1282,6 +1290,8 @@ void launch_gemm_block(int M, int N, int K, int64_t w_stride, int nkb, int cpb,
 // it would put every prefill cfg on the diff for no gain.
 template <int BK, int BM, int BN, int TM, int TN>
 struct KConf {
+  static_assert(BK == 32 || BK == 64 || BK == 128,
+                "KConf: LogKw4 is only defined for BK = 32/64/128");
   static constexpr int Kw4 = BK / 4;   // fp8 dwords per row per chunk
   static constexpr int Kw = BK / 2;    // fp16 dwords per row per chunk
   static constexpr int Kp = Kw + 1;    // padded LDS row stride
@@ -1510,6 +1520,8 @@ void launch_gemm_block_wide2(int M, int N, int K, int64_t w_stride, int nkb,
 // TN = 8): those would spill their register fragments.
 template <int BK, int BM, int BN, int TM, int TN>
 struct A16Conf {
+  static_assert(BK == 32 || BK == 64 || BK == 128,
+                "A16Conf: LogKw/LogKw4 are only defined for BK = 32/64/128");
   static constexpr int Kw4 = BK / 4;  // fp8 dwords per row per chunk (W side)
   static constexpr int Kw = BK / 2;   // fp16 pairs per row per chunk (A side)
   static constexpr int Kp = Kw + 1;   // padded LDS row stride
@@ -1717,6 +1729,9 @@ void launch_gemm_block_w8a16(int M, int N, int K, int64_t w_stride, int nkb,
 // An incoming W8A8 cfg number is mapped onto the closest member so the existing
 // `VLLM_DCU_FP8_PREFILL_CFG` / `VLLM_DCU_FP8_DECODE_CFG` A/B knobs stay usable.
 int w8a16_cfg(int M, int N, int64_t block_k, int cfg) {
+  // 20..31 are not W8A16 tiles: treat them as the auto rule instead of silently
+  // falling through `default` (the entry accepts cfg 0..40 for A/B).
+  if (cfg >= 20 && cfg <= 31) cfg = 0;
   switch (cfg) {
     case 32:
     case 33:
@@ -1742,7 +1757,10 @@ int w8a16_cfg(int M, int N, int64_t block_k, int cfg) {
     case 17:
     case 18:
     case 19:
-      cfg = 5;
+      // These W8A8 numbers are decode tiles.  Only map them to the exact-M
+      // W8A16 tile when the call really is a decode call; a prefill call
+      // (M > kMsMax) must not run an BM = 8 tile with M/8 row blocks.
+      cfg = (M <= kMsMax) ? 5 : ((N >= 6144) ? 2 : 1);
       break;
     case 1:
     case 2:
@@ -2289,6 +2307,13 @@ void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
                        int64_t block_k, int64_t& w_stride, int& nkb) {
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && w_s.is_cuda() && lut.is_cuda(),
               "fp8_emu_block_w8a16: all tensors must be on the GPU");
+  // The kernels index every operand on one device; several torch ops on
+  // different devices would otherwise race instead of failing here.
+  TORCH_CHECK(a.device() == w.device() && a.device() == w_s.device() &&
+                  a.device() == lut.device() &&
+                  (!bias.has_value() || !bias->defined() ||
+                   bias->device() == a.device()),
+              "fp8_emu_block_w8a16: all tensors must be on the same device");
   TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
               "fp8_emu_block_w8a16: a and w must be 2-D, got ",
               a.dim(), " and ", w.dim());
@@ -2334,6 +2359,12 @@ void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
   TORCH_CHECK((w_stride % 8) == 0,
               "fp8_emu_block_w8a16: w row stride must be a multiple of 8, got ",
               w_stride);
+  TORCH_CHECK(w_stride >= K,
+              "fp8_emu_block_w8a16: w row stride must cover K (stride(0)=",
+              w_stride, " K=", K, ")");
+  // W is read as uint32 dwords by both the GEMV and the tile kernels.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(w.data_ptr()) % 4 == 0,
+              "fp8_emu_block_w8a16: `w` data_ptr must be 4-byte aligned");
   const int64_t nblk = (N + block_n - 1) / block_n;
   TORCH_CHECK(w_s.dim() == 2 && w_s.size(0) == nblk && w_s.size(1) == nkb,
               "fp8_emu_block_w8a16: w_s must be [cdiv(N, block_n), "
@@ -2394,15 +2425,19 @@ void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
   const bool gemv_use_gemm = gemv && !use_stream && M > 4;
   const int c = w8a16_cfg(M, N, block_k, cfg);
 
+// The W8A16 arm has no activation scale.  The kernels never read `a_s` when
+// `a16` (or the HAS_A_S template argument) is off, but pass a device-valid
+// pointer -- the weight scale -- instead of nullptr so that stays independent
+// of how the compiler if-converts the uniform branch.
 #define VLLM_FP8_EMU_BLOCK_W8A16(T, AT)                                      \
   do {                                                                       \
     if (gemv && !gemv_use_gemm) {                                            \
       if (use_stream) {                                                      \
         if (s_mode == 2) {                                                   \
           dispatch_gemv_stream2<T>(M, N, K, w_stride, s_rows, s_nt, nkb,     \
-                                   (int)block_n,                             \
-                                   (int)(block_k / kStreamChunk), true, A,   \
-                                   W, nullptr, w_s_p, lut_p,                 \
+                                   (int)block_n,                            \
+                                   (int)(block_k / kStreamChunk), true, A,  \
+                                   W, w_s_p, w_s_p, lut_p,                  \
                                    reinterpret_cast<const AT*>(bias_ptr),    \
                                    reinterpret_cast<AT*>(out.data_ptr()),    \
                                    stream);                                  \
@@ -2410,7 +2445,7 @@ void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
           dispatch_gemv_stream<T>(M, N, K, w_stride, s_rows, s_nt, nkb,      \
                                   (int)block_n,                              \
                                   (int)(block_k / kStreamChunk), true,       \
-                                  stream_prefetch(), A, W, nullptr, w_s_p,   \
+                                  stream_prefetch(), A, W, w_s_p, w_s_p,     \
                                   lut_p,                                     \
                                   reinterpret_cast<const AT*>(bias_ptr),     \
                                   reinterpret_cast<AT*>(out.data_ptr()),     \
@@ -2419,7 +2454,7 @@ void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
       } else {                                                               \
         dispatch_gemv_block<T>(M, N, K, nthreads, w_stride, nkb,             \
                                (int)block_n, /*has_a_s=*/false, A, W, a_h2,  \
-                               nullptr, w_s_p, lut_p,                        \
+                               w_s_p, w_s_p, lut_p,                          \
                                reinterpret_cast<const AT*>(bias_ptr),        \
                                reinterpret_cast<AT*>(out.data_ptr()),        \
                                stream);                                      \
@@ -3105,6 +3140,11 @@ torch::Tensor fp8_emu_gemm_block_w8a16(torch::Tensor a, torch::Tensor w,
                                        at::ScalarType out_dtype,
                                        int64_t nthreads, int64_t cfg,
                                        int64_t block_n, int64_t block_k) {
+  // Check the rank before indexing: a 1-D `a` would otherwise raise an ATen
+  // IndexError from a.size(1) and a 3-D `w` would allocate `out` first.
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu_block_w8a16: a and w must be 2-D, got ", a.dim(),
+              " and ", w.dim());
   const int64_t M = a.size(0), K = a.size(1);
   TORCH_CHECK(K % 8 == 0 && K >= 8,
               "fp8_emu_block_w8a16: K must be a positive multiple of 8, got ", K);

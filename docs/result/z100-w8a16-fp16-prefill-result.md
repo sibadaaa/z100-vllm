@@ -198,7 +198,44 @@ Qwen3.5 家族在 fp8 下把 checkpoint 的 `in_proj_qkv` + `in_proj_z` 融合�
 2. `_ROLE_MIN_M` 的 128/16 交点主要在 11B/TP2 形状上扫得；建议在 27B TP4 的
    `gate_up_proj=4352:5120`、`qkv_proj=2048:5120` 上补扫，并按"vs W8A16 tile"（而非
    vs W8A8）重定 16 阶梯（`out_proj/o_proj` 在 M=16 时 route/tile=1.13）。
-3. C++ 硬化项（无落地 bug，需下一次串行 staging build 验证）：动态 LDS 的
-   `__align__(16)`、stream kernel 的 `a_s=nullptr` 改为传合法指针、dequant helper 的
-   guard/stream 顺序、入口 2-D 检查前置、`check_block_w8a16` 的设备一致性/`w%4`、
-   `A16Conf` 的 BK `static_assert`、`w8a16_cfg` 对 W8A8 cfg 11..19 的 M 相关映射。
+3. ~~C++ 硬化项~~：已在 §6.4 的构建窗口完成并晋级（新 `.so` md5 `ff04f1b9…`）。
+
+### 6.4 C++ 硬化批次（2026-10-20 卡空窗口，已构建/晋级/验证）
+
+**改动**（`csrc/rocm/fp8_emu_gemm.cu`、`csrc/rocm/fp8_dequant.cuh`；均无行为变化）：
+
+1. 动态 LDS 显式 `extern __shared__ __align__(16) uint32_t dyn[]`（stream / stream2
+   两个 kernel）：`sA` 的 `uint4` 读写此前靠 static LUT 512 B 的布局巧合对齐。
+2. W8A16 臂不再传 `a_s=nullptr`，改传设备有效的 `w_s` 指针；`a16`/`HAS_A_S` 关闭时
+   kernel 仍不读它，但不再依赖编译器不对 null 做投机加载。
+3. dequant helper 把 `CUDAGuard` 移到 `getCurrentCUDAStream()` 之前；kernel 放进匿名
+   namespace（header 单 TU 守卫）；host 侧增加 `out != wq` 别名检查。
+4. W8A16 入口先校验 `a/w` 为 2-D 再取 `size()`；`check_block_w8a16` 增加跨张量设备
+   一致性、`w.data_ptr()%4`、`stride(0)>=K` 检查。
+5. `KConf`/`A16Conf` 增加 `BK ∈ {32,64,128}` `static_assert`（否则 LogKw 掩码会静默错）。
+6. `w8a16_cfg`：cfg 20..31 显式归 auto；W8A8 cfg 11..19 仅在 `M<=kMsMax` 映射到
+   exact-M tile，prefill 调用映射到 cfg 2/1（不再出现 BM=8 的 prefill 悬崖）。
+
+**构建**（§7 串行、staging、不动运行中的服务）：
+
+| 项 | 值 |
+|---|---|
+| 构建树 | `cp -a` → `/mnt/game/port/build-w8a16-p0`，`ninja _rocm_C`（仅重编 `fp8_emu_gemm.hip.o` + 重链） |
+| 新增告警 | **0**（`.s23/logs/w8a16-p1-build.log`） |
+| 新产物 | `/mnt/game/port/build-w8a16-p0/_rocm_C.abi3.so` md5 **`ff04f1b9540765367eb4a25184cac0de`** |
+| 晋级 | 覆盖 `/mnt/game/port/build-sync/temp/_rocm_C.abi3.so`（现役）；旧版 `475d7eba…` 备份于 `/mnt/game/perf1/_rocm_C.475d7eba0468fddab576597a084099d2.so` |
+| 服务 | 未重启、未改动；构建/测试期间保持 active，health 200（新 `.so` 与 Python 修复在下次重启生效） |
+
+**门禁**：
+
+| 门禁 | 结果 |
+|---|---|
+| `pytest tests/kernels/quantization/test_gfx906_fp8_emu.py`（容器内，`HIP_VISIBLE_DEVICES=3`，GPU flock） | **187 passed / 0 failed**（`.s23/logs/w8a16-p1b-pytest.log`） |
+| 机器码 | `.s23/probes/isa_gate.py` 新 `.so`：**RESULT PASS**；`v_dot2_f32_f16` 92742（与旧版逐计数相同）、`v_mfma`/`v_cmac`=0；code object 仅 +48 B |
+| 逐 bit A/B（新 `ff04f1b9` vs 旧 `475d7eba`） | `.s23/probes/w8a16_bitwise_ab.py`：W8A8 stream GEMV(m=1/4/8)、W8A8 tile(m=512)、W8A16 stream/tile(m=1/4/8/512)、dequant **9/9 `torch.equal`**（`.s23/w8a16_p1/ab_new.pt` vs `ab_old.pt`） |
+| 回滚 | `cp /mnt/game/perf1/_rocm_C.475d7eba….so /mnt/game/port/build-sync/temp/_rocm_C.abi3.so` + 重启 unit |
+
+注：期间新增的 `test_apply_weights_w8a16_full_path` 首跑暴露测试自身的参照错误——W8A8
+臂用了测试内 `_quantize_block`（除法求 scale）而 base 走 `per_token_group_quant_fp8`
+（倒数乘法），16/8192 个激活码翻转导致 0.69% 假失败；改用库量化器做参照后通过。
+内核/宿主代码无问题。

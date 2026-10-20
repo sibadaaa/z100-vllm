@@ -68,6 +68,10 @@
 // and `w_stride % 8 == 0` are all enforced on the host side below, so the
 // grid-stride loop needs no tail guard and both the uint2 load and the uint4
 // store are aligned.
+//
+// Anonymous namespace: this is a header, so a second includer must not turn the
+// kernel into a duplicate symbol at link time.
+namespace {
 __global__ void fp8_dequant_to_fp16_kernel(
     __half* __restrict__ out, const uint8_t* __restrict__ wq,
     const float* __restrict__ ws, const __half* __restrict__ lut, int N,
@@ -112,6 +116,7 @@ __global__ void fp8_dequant_to_fp16_kernel(
     *reinterpret_cast<uint4*>(out + (int64_t)n * K + k0) = pack;
   }
 }
+}  // namespace
 
 namespace vllm {
 namespace gfx906_emu {
@@ -141,6 +146,8 @@ inline void dequant_fp8_block_to_fp16(at::Tensor& out, const at::Tensor& wq,
   TORCH_CHECK(ws.scalar_type() == at::kFloat && ws.dim() == 2 &&
                   ws.is_contiguous(),
               "fp8_dequant: ws must be a contiguous 2-D float32 tensor");
+  TORCH_CHECK(out.data_ptr() != wq.data_ptr(),
+              "fp8_dequant: out must not alias wq");
 
   const int64_t N = wq.size(0);
   const int64_t K = wq.size(1);
@@ -187,8 +194,11 @@ inline void dequant_fp8_block_to_fp16(at::Tensor& out, const at::Tensor& wq,
   constexpr size_t kSmemBytes = 256 * sizeof(__half);
   const int blocks = (int)std::min<int64_t>((n_words + kThreads - 1) / kThreads,
                                             kMaxBlocks);
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  // Guard first: the stream is per current device, so fetching it before the
+  // guard would pick the wrong device's stream for a helper called without a
+  // caller-side guard.
   const c10::cuda::CUDAGuard guard(out.device());
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   fp8_dequant_to_fp16_kernel<<<blocks, kThreads, kSmemBytes, stream>>>(
       reinterpret_cast<__half*>(out.data_ptr()),
