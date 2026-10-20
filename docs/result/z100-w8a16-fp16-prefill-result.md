@@ -115,7 +115,19 @@ RN-EVEN。两侧各距精确值 0.5 ulp、彼此 ≤1 ulp——都是合法最�
 
 ## 5. 已知限制 / 后续
 
-- ✅ `_ROLE_MIN_M` 已按 P1 实测回填（§4.2）；`VLLM_DCU_FP16_PREFILL_MIN_M` 仍可覆盖。
+- **P1 后生产重启发现的缺陷（已修，commit 756096310）**：施工图 §4.4.2 示例的
+  `apply_input_quant = _W8A16 and ops_available(...)` 极性反了——开关关闭时该钩子应为
+  True（base class 量化 → W8A8），False 会让 base 把原始 fp16 交给 W8A16 分支，baseline
+  `.so` 下首次 forward 即 AttributeError 崩溃循环。单测没抓住的原因：pytest 从不覆盖
+  「switch off + apply_weights 全链路」。修复后新增
+  `.s24/probes/w8a16_apply_polarity.py` 集成探针：off 臂逐位复现 W8A8（cos=1.00000000）、
+  `W8A16=1` 臂逐位复现 W8A16（cos=1.00000000）；route 测试断言已改为正确极性。
+- **服务恢复状态**：生产已带新树 + 新 `.so`（`475d7eba…`）以 transient unit 重建并健康
+  （health 200，固定 prompt smoke 输出正常、logprobs finite）；serve 脚本不设 W8A16/
+  FP16_PREFILL ⇒ 默认关，行为与基线逐 bit 一致。回滚：`cp
+  /mnt/game/perf1/_rocm_C.d209af9585….so /mnt/game/port/build-sync/temp/_rocm_C.abi3.so`
+  + 重启 unit。
+- `_ROLE_MIN_M` 已按 P1 实测回填（§4.2）；`VLLM_DCU_FP16_PREFILL_MIN_M` 仍可覆盖。
 - `torch.mm`（实际 rocBLAS，本机无 hipBLASLt gfx906 库）fp16 精度满足 g3/g4 门禁；
   `allow_fp16_reduced_precision_reduction` 无需关闭。
 - W8A16 tile A 侧 staging 目前按 `uint32`（2 fp16/线程·次）；tile 相对现状 W8A8 在大 M
@@ -123,6 +135,3 @@ RN-EVEN。两侧各距精确值 0.5 ulp、彼此 ≤1 ulp——都是合法最�
   `_ROLE_MIN_M`，其次评估 staging `uint4` 化。
 - **e2e（greedy parity / DFlash2 accept / 32k+64k soak）未跑**，需独立服务窗口
   （W8A16=1 臂 + W8A8 臂各起一次）；晋级 commit（默认值 → `auto`）以 e2e 全绿为前提。
-- 生产服务恢复：已带新 `.so`（md5 `475d7eba…`）重启，开关默认关 ⇒ 行为与基线逐 bit
-  一致；回滚 = `cp /mnt/game/perf1/_rocm_C.d209af9585aaf0049394ced4a3c3211b.so` 回
-  `/mnt/game/port/build-sync/temp/`。
