@@ -44,15 +44,18 @@ if _MODE not in ("0", "1", "auto"):
     )
     _MODE = "0"
 
-# Per-role token threshold: None means "use _DEFAULT_MIN_M".  Placeholder until
-# P1 measures the crossover; keeping the table the only tuning knob lets every
-# promotion/rollback be a one-line change.
+# Per-role token threshold: the M below which the W8A16 tile kernel serves the
+# call instead of the fp16 materialization.  Filled from the P1 crossover sweep
+# (.s24/probes/w8a16_min_m_sweep.py, gfx906 @ 2026-10-20): the threshold is
+# where dequant + rocBLAS becomes strictly faster than the shipped W8A8 layer
+# (the tile sits between the two).  Wide-N shapes pay a larger fixed dequant
+# cost, so gate_up crosses later; deep-K down_proj wins from the floor.
 _ROLE_MIN_M: dict[str, int | None] = {
-    "gate_up_proj": None,
-    "down_proj": None,
-    "qkv_proj": None,
-    "o_proj": None,
-    "out_proj": None,
+    "gate_up_proj": 128,
+    "down_proj": 16,
+    "qkv_proj": 128,
+    "o_proj": 16,
+    "out_proj": 16,
 }
 _DEFAULT_MIN_M = 4096
 _ENV_MIN_M = envs.VLLM_DCU_FP16_PREFILL_MIN_M

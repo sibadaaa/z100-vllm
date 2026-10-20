@@ -663,7 +663,9 @@ def test_block_w8a16_bias_and_bf16_out(fp8_ops):
 
     bf16 = _w8a16(a, w_q, w_s, fp8_ops(fp8_dtype), out_dtype=torch.bfloat16)
     assert bf16.dtype == torch.bfloat16
-    assert _rel_err(bf16, ref) < 1e-2
+    # The bf16 arm carries no bias, so it compares against the unbiased
+    # reference (the tolerance covers the final bf16 cast, ~2^-8 relative).
+    assert _rel_err(bf16, _reference_block_w8a16(a, w_q, w_s)) < 1e-2
 
 
 def test_block_w8a16_accepts_padded_weight_row_stride(fp8_ops):
@@ -704,8 +706,9 @@ def test_block_w8a16_rejects_bad_activations_and_scales(fp8_ops):
         _w8a16(a_q, w_q, w_s, lut)
 
     a = torch.randn(16, k, device="cuda", dtype=torch.float16)
+    # Truncate the K dimension of w_s: nblk=1 here, so [:1] would be a no-op.
     with pytest.raises(RuntimeError, match="w_s must be"):
-        _w8a16(a, w_q, w_s[:1], lut)
+        _w8a16(a, w_q, w_s[:, :1].contiguous(), lut)
 
     with pytest.raises(RuntimeError, match="multiple of 8"):
         _w8a16(a[:, :250].contiguous(), w_q[:, :250].contiguous(), w_s, lut)
@@ -740,7 +743,15 @@ def _dequant(w_q, w_s, lut):
 
 
 def test_dequant_kernel_matches_reference(fp8_ops):
-    """Bit-exact: fp32 multiply then one fp16 rounding, no fp16-domain product."""
+    """fp32 multiply then one fp16 rounding, no fp16-domain product.
+
+    §6.2 gate: bit-equal OR <= 1 ulp.  The residual deviation is exact
+    midpoint ties: `__float2half` on this toolchain lowers to a
+    magic-multiply conversion that double-rounds ties (torch's cast is
+    round-to-nearest-even), so out and ref may sit on opposite sides of an
+    exact tie -- at most 1 fp16 ulp apart, each a valid nearest value
+    (measured ~0.01% of elements, |out-ref| = exactly 1 ulp every time).
+    """
     torch.manual_seed(0)
     for fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         n, k = 384, 1024
@@ -749,7 +760,14 @@ def test_dequant_kernel_matches_reference(fp8_ops):
         out = _dequant(w_q, w_s, fp8_ops(fp8_dtype))
         ref = _dequantized_weight(w_q, w_s).to(torch.float16)
         assert out.dtype == torch.float16 and out.shape == w_q.shape
-        assert torch.equal(out, ref), (out.to(torch.float32) - ref).abs().max()
+        dist = (
+            out.view(torch.int16).to(torch.int32)
+            - ref.view(torch.int16).to(torch.int32)
+        ).abs()
+        assert (dist <= 1).all(), (
+            f"off by >1 ulp at {(dist > 1).sum().item()} elements "
+            f"(max {dist.max().item()})"
+        )
 
 
 def test_dequant_accepts_padded_weight_row_stride(fp8_ops):
@@ -867,8 +885,9 @@ def test_prefill_route_declines_small_m_and_bad_dtypes(fp8_ops, monkeypatch):
     kernel = _StubKernel()
     layer = _StubLayer(w_q, w_s)
 
-    # Below the min-M table: the W8A16 tile kernel handles it.
-    small = torch.randn(64, k, device="cuda", dtype=torch.float16)
+    # Below the min-M floor (the measured table bottoms out at 16): the W8A16
+    # tile kernel handles it.
+    small = torch.randn(8, k, device="cuda", dtype=torch.float16)
     assert pre.try_prefill(kernel, layer, small, None) is None
 
     # The W8A8 route (activation quantized in python) must never be intercepted.
@@ -918,7 +937,15 @@ def test_prefill_route_snapshot(monkeypatch):
 
     roles = ["gate_up_proj", "down_proj", "qkv_proj", "o_proj", "out_proj"]
     table = {role: pre._min_m(role, None) for role in roles}
-    assert table == {role: 4096 for role in roles}
+    # The P1-measured crossover table (w8a16_min_m_sweep.py): wide-N gate_up
+    # and untested-geometry qkv cross at 128, the rest at the 16 floor.
+    assert table == {
+        "gate_up_proj": 128,
+        "down_proj": 16,
+        "qkv_proj": 128,
+        "o_proj": 16,
+        "out_proj": 16,
+    }
     # Unknown role falls back to the default rather than routing everything.
     assert pre._min_m("lm_head", None) == 4096
 
@@ -928,9 +955,9 @@ def test_prefill_route_snapshot(monkeypatch):
     ]
     assert decisions == [
         (8, False),
-        (16, False),
-        (1024, False),
-        (4095, False),
+        (16, True),
+        (1024, True),
+        (4095, True),
         (4096, True),
         (8192, True),
     ]
