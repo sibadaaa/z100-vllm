@@ -225,6 +225,15 @@ if TYPE_CHECKING:
     # issues one kernel instead of two (S23: 256 of each per step).  Off by
     # default; the unfused path stays reachable for A/B and rollback.
     VLLM_DCU_FP8_FUSE_QUANT: bool = False
+    # S24 L3.2 dynamic-k: truncate the speculative verify length to 3/1 rows
+    # beyond these computed-token thresholds unless the per-request acceptance
+    # EMA still rates the drafter (see
+    # vllm/v1/core/sched/scheduler.py, docs/design/z100-s24-l3-dynamic-k-design.md).
+    # LO=0 disables the feature; the launcher sets 16384/65536/0.1 (promoted
+    # 2026-10-20, ABAB window w2/L32/dynk5).
+    VLLM_S24_DYNK_LO: int = 0
+    VLLM_S24_DYNK_HI: int = 0
+    VLLM_S24_DYNK_EMA: float = 0.1
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1543,6 +1552,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCU_FP8_FUSE_QUANT": lambda: (
         os.getenv("VLLM_DCU_FP8_FUSE_QUANT", "False").lower() in ("true", "1")
+    ),
+    "VLLM_S24_DYNK_LO": lambda: int(os.getenv("VLLM_S24_DYNK_LO", "0") or 0),
+    "VLLM_S24_DYNK_HI": lambda: int(os.getenv("VLLM_S24_DYNK_HI", "0") or 0),
+    "VLLM_S24_DYNK_EMA": lambda: float(
+        os.getenv("VLLM_S24_DYNK_EMA", "0.1") or 0.1
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

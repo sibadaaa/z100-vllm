@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -287,6 +288,39 @@ class Scheduler(SchedulerInterface):
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        # S24 L3.2 dynamic-k: truncate the speculative verify length by
+        # context length with a per-request acceptance EMA (design:
+        # docs/design/z100-s24-l3-dynamic-k-design.md).  Truncating k never
+        # changes the greedy output -- the verify result is the target
+        # model's own argmax prefix and the draft only decides how many
+        # positions are verified per step -- it only trades steps for
+        # per-step KV-scan cost.  Unset VLLM_S24_DYNK_LO keeps the shipped
+        # verify-everything behaviour.
+        self.dynk_lo = envs.VLLM_S24_DYNK_LO
+        self.dynk_hi = envs.VLLM_S24_DYNK_HI
+        self.dynk_ema_beta = envs.VLLM_S24_DYNK_EMA
+        # Acceptance length that still counts as "drafting well" (of k=7).
+        self.dynk_ema_good = 5.0
+        self.dynk_mid_k = 3
+        self.dynk_min_k = 1
+        self.dynk_ema: dict[str, float] = {}
+        self.dynk_enabled = bool(
+            self.num_spec_tokens > 0
+            and self.dynk_lo > 0
+            and self.dynk_hi > self.dynk_lo
+        )
+        if self.dynk_enabled:
+            logger.info(
+                "S24 dynamic-k enabled: verify k is truncated to %d/%d for "
+                "contexts beyond %d/%d tokens unless the per-request "
+                "acceptance EMA >= %.1f (beta %.2f)",
+                self.dynk_mid_k,
+                self.dynk_min_k,
+                self.dynk_lo,
+                self.dynk_hi,
+                self.dynk_ema_good,
+                self.dynk_ema_beta,
+            )
         # DSV41 SWA bounded replay: groups that declare a replay window are rebuilt
         # after a prefix hit by recomputing its trailing tokens. One window
         # for all such groups, so the rewind matches every group's allocation.
@@ -760,6 +794,30 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # S24 L3.2: pure verify steps schedule 1 + k rows (the previous
+            # step's sampled bonus token, whose KV is still uncomputed, plus
+            # the k pending drafts -- runner num_sampled == draft + 1 relies
+            # on this).  Truncate such steps to 1 + k'.  Recompute tails and
+            # budget-clipped steps are left untouched; the scheduled
+            # spec-token slice in this loop already follows the clamped
+            # count, and the runner builds its per-request verify metadata
+            # from the same counts.
+            if (
+                self.dynk_enabled
+                and request.spec_token_ids
+                and num_new_tokens == len(request.spec_token_ids) + 1
+            ):
+                k_dyn = self._dynk_spec_len(request)
+                if k_dyn + 1 < num_new_tokens:
+                    logger.info_once(
+                        "S24 dynamic-k: verify truncated to k'=%d (ctx=%d, "
+                        "accept EMA %.2f, full k=%d)",
+                        k_dyn,
+                        request.num_computed_tokens,
+                        self.dynk_ema.get(request.request_id, -1.0),
+                        self.num_spec_tokens,
+                    )
+                    num_new_tokens = k_dyn + 1
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -2177,6 +2235,9 @@ class Scheduler(SchedulerInterface):
                 # cache transfer in KV connector), the aborted request will not
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
+                if self.dynk_enabled:
+                    # Don't leak per-request acceptance EMA state.
+                    self.dynk_ema.pop(req_id, None)
                 continue
 
             # Drop-mode stale output (same-step resume) is discarded entirely.
@@ -2197,6 +2258,16 @@ class Scheduler(SchedulerInterface):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                if self.dynk_enabled:
+                    # S24 L3.2: acceptance EMA drives the per-request verify
+                    # length (k') on later steps; the first sample seeds it.
+                    prev = self.dynk_ema.get(req_id)
+                    self.dynk_ema[req_id] = (
+                        float(num_accepted)
+                        if prev is None
+                        else (1.0 - self.dynk_ema_beta) * prev
+                        + self.dynk_ema_beta * num_accepted
+                    )
                 num_rejected = num_draft_tokens - num_accepted
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
@@ -2630,6 +2701,37 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free_encoder_input(request, input_id)
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
+
+    def _dynk_spec_len(self, request: Request) -> int:
+        """S24 L3.2: speculative verify length (k') for one decode step.
+
+        Full ``self.num_spec_tokens`` until the request has an acceptance
+        EMA sample; beyond ``dynk_lo`` computed tokens a weak drafter
+        (EMA < ``dynk_ema_good``) gets ``dynk_mid_k`` verified positions,
+        and beyond ``dynk_hi`` it gets ``dynk_min_k``.  The verify output
+        is the target model's own argmax prefix, so truncating k never
+        changes the emitted tokens -- it only adds steps when acceptance
+        was actually high.
+
+        Args:
+            request: the decode request about to be scheduled.
+
+        Returns:
+            The number of draft positions to verify this step.
+
+        """
+        if not self.dynk_enabled:
+            return self.num_spec_tokens
+        ema = self.dynk_ema.get(request.request_id)
+        if ema is None:
+            return self.num_spec_tokens
+        ctx = request.num_computed_tokens
+        if ctx <= self.dynk_lo:
+            return self.num_spec_tokens
+        weak = ema < self.dynk_ema_good
+        if ctx > self.dynk_hi:
+            return self.dynk_min_k if weak else self.dynk_mid_k
+        return self.dynk_mid_k if weak else self.num_spec_tokens
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(

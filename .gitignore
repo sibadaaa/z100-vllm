@@ -309,7 +309,8 @@ test_*.py
 .bench/
 .s20/
 .s21/
-
+.s*/
+tools/dcu
 !.buildkite/scripts/lib/
 
 # Generated gRPC protobuf files (compiled at build time from vllm_engine.proto)

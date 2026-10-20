@@ -1704,6 +1704,16 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
   // of BK, i.e. when the chunk count cpb is.
   if ((cfg == 32 || cfg == 35) && (cpb % (64 / kFBk)) != 0) cfg = 16;
   if ((cfg == 33 || cfg == 34) && (cpb % (128 / kFBk)) != 0) cfg = 16;
+  // cfgs 36..39 (S24 L1) carry the same constraint into prefill; there the
+  // fallback is the same BM/BN/TM/TN tile on the kFBk = 32 kernel, not the
+  // decode tile, so a non-multiple block_k degrades to today's behaviour.
+  // cfg 40 is the family's last untested design point: same 128-thread
+  // geometry as the wide2 decode tiles with BM doubled to 16 (LDS ~13 KiB ->
+  // 4-5 blocks/CU, between the decode tiles' 6 and 36-39's 1-2).
+  if ((cfg == 36 || cfg == 37 || cfg == 39 || cfg == 40) &&
+      (cpb % (64 / kFBk)) != 0)
+    cfg = 5;
+  if (cfg == 38 && (cpb % (128 / kFBk)) != 0) cfg = 4;
   switch (cfg) {
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(1, 32, 64, 4, 4);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE(2, 64, 64, 4, 4);
@@ -1756,6 +1766,22 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
     // 60-CU device at N = 768.
     VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(34, 128, 8, 32, 1, 2);
     VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(35, 64, 8, 32, 1, 2);
+    // 36..39 (S24 L1): the wide2 kernel family extended to prefill shapes.
+    // S24 measured the prefill GEMM at 8.0-8.8 TF/s = 41-43% of the dot2 peak
+    // with the cfg 0 default tile (docs/design/z100-longctx-vram-optimization-
+    // plan.md §1.2), and the M-scan (mscan-dcu3.log) puts cfg 3 ahead of every
+    // legacy tile at M >= 1024.  These stage BK = 64/128 elements per round to
+    // halve the staging rounds, which is the same lever the S23 decode tiles
+    // cashed (+15-24%).  Accumulation order is unchanged (k ascending, dot2
+    // pairs, fold on the 128-element block boundary), so every prefill cfg is
+    // bitwise identical to cfg 0.  LDS/CU: 36 = 25.3 KiB, 37 = 33.8, 38 = 33.3,
+    // 39 = 50.7 (gfx906 has 64 KiB per CU).
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(36, 64, 32, 64, 2, 4);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(37, 64, 64, 64, 4, 4);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(38, 128, 32, 32, 2, 2);
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(39, 64, 64, 128, 4, 8);
+    // 40 (S24 L1 residual): BM16/BN32 @ BK64.
+    VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(40, 64, 16, 32, 2, 2);
     case 4:
     default:
       launch_gemm_block<128, 128, 8, 8, T>(M, N, K, w_stride, nkb, cpb,
@@ -1953,7 +1979,7 @@ __global__ void fp8_emu_quant_a_kernel(const TA* __restrict__ a,
   for (int i = 0; i < 4; ++i) m = fmaxf(m, fabsf(v[i]));
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off, 32));
+    m = fmaxf(m, __shfl_xor_sync((unsigned long long)0xffffffffu, m, off, 32));
   const float y_s = m / kQFp8Max;
   const float inv_y = 1.0f / y_s;
   if (lane == 0) xs[g] = y_s;
@@ -2045,7 +2071,7 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
     for (int i = 0; i < 4; ++i) mx = fmaxf(mx, fabsf(v[i]));
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off, 32));
+    mx = fmaxf(mx, __shfl_xor_sync((unsigned long long)0xffffffffu, mx, off, 32));
     const float y_s = mx / kQFp8Max;
     const float inv_y = 1.0f / y_s;
     if (ajd == 0) sA[ar][c] = y_s;
@@ -2249,7 +2275,7 @@ torch::Tensor fp8_emu_gemm_block(torch::Tensor a, torch::Tensor w,
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "fp8_emu_block: K must be a positive multiple of 4, got ", K);
   TORCH_CHECK(M >= 1, "fp8_emu_block: M must be >= 1");
-  TORCH_CHECK(cfg >= 0 && cfg <= 35, "fp8_emu_block: cfg must be 0..35, got ",
+  TORCH_CHECK(cfg >= 0 && cfg <= 40, "fp8_emu_block: cfg must be 0..40, got ",
               cfg);
 
   const c10::cuda::CUDAGuard guard(a.device());

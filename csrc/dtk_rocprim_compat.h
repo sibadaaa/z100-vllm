@@ -45,6 +45,14 @@
 
 #include <hip/hip_runtime.h>
 
+// Newer DTK/clang resource dirs re-arm `cuda_wrappers/new` once `__device__`
+// is defined (hip_runtime.h includes <new> again), which then already provides
+// the device placement-new/delete overloads below; defining them twice is a
+// redefinition error.  The wrapper's guard macro is only left defined when it
+// actually supplied the overloads in this TU, so older toolchains where the
+// wrapper stays disarmed still take the definitions here.
+#if !defined(__CLANG_CUDA_WRAPPERS_NEW)
+
 __device__ [[gnu::noinline]] void* operator new(std::size_t,
                                                 void* __p) noexcept {
   return __p;
@@ -56,6 +64,8 @@ __device__ [[gnu::noinline]] void* operator new[](std::size_t,
   return __p;
 }
 __device__ [[gnu::noinline]] void operator delete[](void*, void*) noexcept {}
+
+#endif  // !defined(__CLANG_CUDA_WRAPPERS_NEW)
 
 #endif  // defined(__HIP__) || defined(__HIPCC__)
 

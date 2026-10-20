@@ -116,6 +116,18 @@ GFX906_PREFILL_3D_MIN_CTX = _gfx906_env_int(
     "VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX", 16384
 )
 
+# S24 L3.1 decode/verify scheduling overrides (0 = module heuristic).  The
+# kernel-level scan (.s24/probes/l31_verify_scan.py, 180 rows, service down)
+# measured the shipped heuristics at 15-16 GB/s logical KV bandwidth on the
+# verify shape (M=8, head 256/GQA6); BLOCK_M=16 (2 query tokens per q-block,
+# halving KV re-reads) is -45~-52% at every context, and warps=2 is -29~-68%
+# for M=1.  E2E gate before promoting: 32k ITL -10% with 512/8k no-regression.
+GFX906_DECODE_BLOCK_M_OVERRIDE = _gfx906_env_int(
+    "VLLM_GFX906_ATTN_DECODE_BLOCK_M", 0
+)
+GFX906_DECODE_WARPS = _gfx906_env_int("VLLM_GFX906_ATTN_DECODE_WARPS", 0)
+GFX906_DECODE_SEGMENTS = _gfx906_env_int("VLLM_GFX906_ATTN_DECODE_SEGMENTS", 0)
+
 # Lazily grown workspace for the prefill split-KV path. Unlike the decode
 # segment buffers (sized for the decode batch threshold and provided by the
 # backend), prefill needs one row per scheduled token, so the workspace is
@@ -192,6 +204,8 @@ def gfx906_decode_segments_capacity() -> int:
 def _decode_num_warps(head_size: int, max_seqlen_k: int) -> int:
     # Wide-head decodes keep 4 warps busy once the KV scan is long enough;
     # short contexts run faster with 2 warps on gfx906.
+    if GFX906_DECODE_WARPS:
+        return GFX906_DECODE_WARPS
     if head_size > 128 and max_seqlen_k >= 1536:
         return 4
     return 2
@@ -200,6 +214,8 @@ def _decode_num_warps(head_size: int, max_seqlen_k: int) -> int:
 def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
     # GQA6 with 256-dim heads: one query token spans exactly 6 rows, so an
     # 8-row block covers a single token without padding a second one.
+    if GFX906_DECODE_BLOCK_M_OVERRIDE:
+        return GFX906_DECODE_BLOCK_M_OVERRIDE
     if head_size == 256 and num_queries_per_kv == 6:
         return 8
     return None
@@ -256,6 +272,8 @@ def _decode_num_segments(
     # Keep short-context decode at 16 segments, but increase split-KV
     # parallelism on gfx906 once the KV scan is large enough to amortize
     # the extra reduction work.
+    if GFX906_DECODE_SEGMENTS:
+        return GFX906_DECODE_SEGMENTS
     if max_seqlen_k < 2048:
         return 16
 
