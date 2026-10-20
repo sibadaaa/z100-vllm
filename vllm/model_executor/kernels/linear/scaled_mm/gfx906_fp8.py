@@ -40,6 +40,7 @@ Design notes:
   (default off, i.e. the wrapper always runs).
 """
 
+import contextlib
 import functools
 import os
 
@@ -57,6 +58,15 @@ from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
 )
 
+# Register the ROCm extension before the import-time capability checks below:
+# the `torch.ops._rocm_C` namespace is lazy, so without this the decisions this
+# module bakes in (which custom ops to register, whether W8A16 is engaged)
+# would depend on whether some earlier import happened to touch the extension.
+# Same pattern as vllm/platforms/rocm.py; a build tree without the extension
+# just keeps the previous (op-missing) behaviour.
+with contextlib.suppress(ImportError):
+    import vllm._rocm_C  # noqa: F401
+
 logger = init_logger(__name__)
 
 # M <= _GEMV_MAX_M goes to the GEMV kernel (must match kMsMax in the .cu).
@@ -65,7 +75,12 @@ logger = init_logger(__name__)
 # is M-flat (M=1..4 all ~0.94x of the M=1 GEMV) -- so speculative-decoding
 # verify (M = 1 + num_spec_tokens) wants the GEMM path.  Default keeps the old
 # policy; set VLLM_DCU_FP8_GEMV_MAX_M=1 to route every M >= 2 to the GEMM.
-_GEMV_MAX_M = envs.VLLM_DCU_FP8_GEMV_MAX_M
+# Clamped to the compiled GEMV range (kMsMax in fp8_emu_gemm.cu): an env value
+# above it used to hand M = 9..N to `fp8_emu_gemv_block`, whose entry rejects
+# M > kMsMax, and it made this python branch disagree with the W8A16 GEMV
+# threshold inside the kernel (which clamps the same variable).
+_GEMV_MS_MAX = 8
+_GEMV_MAX_M = min(max(envs.VLLM_DCU_FP8_GEMV_MAX_M, 0), _GEMV_MS_MAX)
 # GEMV threads per block: tuned value from the INT8 sdot4 project (power of two).
 _GEMV_THREADS = 64
 # Activation absmax floor passed to the fused quant+GEMM entry.  Must equal
@@ -89,11 +104,15 @@ _QUANT_EPS = 1e-10
 # that tile for every prefill GEMM (all of them are already compiled into the
 # installed .so, so no rebuild is needed to A/B).
 _PREFILL_CFG_ENV = "VLLM_DCU_FP8_PREFILL_CFG"
+# Snapshot at import: an A/B arm sets the variable before launch, and the hot
+# path must not pay a getenv per call (the W8A16 route used to read it on every
+# layer of every step, including decode where the value is unused).
+_PREFILL_CFG_RAW = os.environ.get(_PREFILL_CFG_ENV, "0").strip().lower()
 
 
 def _prefill_cfg(M: int, N: int) -> int:
     """Prefill GEMM tile for an ``[M, K] x [N, K]`` call (``cfg`` 0..19)."""
-    raw = os.environ.get(_PREFILL_CFG_ENV, "0").strip().lower()
+    raw = _PREFILL_CFG_RAW
     if raw in ("", "0"):
         return 0
     if raw == "auto":
@@ -189,9 +208,15 @@ def _device_lut(fp8_dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 # activation arrives as fp16 and is never quantized, so the A-side LUT widening
 # and the per-token quantization launch disappear while the weight stays fp8 in
 # HBM.  "0" (default) keeps the W8A8 path bit-for-bit identical; "1" forces the
-# route and fails loudly if the built op is missing; "auto" takes it whenever
+# route and raises at load if the built op is missing; "auto" takes it whenever
 # the op is present.  Read once at import, never per call (P1).
 _W8A16_MODE = str(envs.VLLM_DCU_FP8_W8A16).strip().lower()
+if _W8A16_MODE not in ("0", "1", "auto"):
+    logger.warning_once(
+        "gfx906 W8A16: unknown VLLM_DCU_FP8_W8A16=%r; treating it as 0.",
+        _W8A16_MODE,
+    )
+    _W8A16_MODE = "0"
 _W8A16 = _W8A16_MODE in ("1", "auto")
 
 # Cheap pre-filter for the prefill-materialization hook in ``apply_weights``:
@@ -607,6 +632,25 @@ if hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16"):
     _register_fp8_emu_mm_block_w8a16()
 
 
+# Whether this build can serve W8A16.  Computed *after* the custom_op
+# registration above (the capability check looks at both for the raw entry
+# point and the `vllm::` wrapper), and kept as one constant so the class
+# attribute, the per-instance activation-dtype check and is_supported() cannot
+# disagree.
+_W8A16_ENGAGED = _W8A16 and ops_available_block_w8a16()
+
+
+def _w8a16_applies(input_dtype: torch.dtype) -> bool:
+    """Whether a layer with this activation dtype takes the W8A16 route.
+
+    gfx906 has no bf16 datapath, so only fp16 activations may skip the
+    activation quantization; any other dtype keeps the shipped W8A8 route (and
+    the explicit ``=1`` mode refuses the layer instead of silently changing
+    tokens).
+    """
+    return _W8A16_ENGAGED and input_dtype == torch.float16
+
+
 class Gfx906Fp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     """FP8 W8A8 scaled MM emulated with fp16 dot products (gfx906 only)."""
 
@@ -718,7 +762,28 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
     # the artifact lacking the op) must stay True -- the W8A8 path, verbatim.
     # Found by the production restart after P1: the inverted polarity made the
     # switch-off path skip quantization and crash on the missing W8A16 op.
-    apply_input_quant = not (_W8A16 and ops_available_block_w8a16())
+    # The build-level answer is narrowed per layer in ``__init__`` (fp16 only).
+    apply_input_quant = not _W8A16_ENGAGED
+
+    def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
+        super().__init__(config)
+        # The activation dtype is per layer, the switch/op presence is per
+        # build.  A bf16 (or fp32) layer under =auto keeps the shipped W8A8
+        # route instead of dying in the first forward; =1 is a hard error.
+        if _W8A16_ENGAGED and not _w8a16_applies(config.input_dtype):
+            if _W8A16_MODE == "1":
+                raise RuntimeError(
+                    "VLLM_DCU_FP8_W8A16=1 requires float16 activations, got "
+                    f"{config.input_dtype}: gfx906 has no bf16 W8A16 datapath. "
+                    "Use VLLM_DCU_FP8_W8A16=auto to keep the W8A8 route for "
+                    "this layer."
+                )
+            logger.warning_once(
+                "gfx906 W8A16: %s activations are not supported by the W8A16 "
+                "kernel; keeping the W8A8 route for this layer.",
+                config.input_dtype,
+            )
+            self.apply_input_quant = True
 
     @classmethod
     def is_supported(
@@ -737,12 +802,16 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             return False, "torch.ops._rocm_C.fp8_emu_*_block is not registered."
         if not hasattr(torch.ops.vllm, "fp8_emu_mm_block"):
             return False, "torch.ops.vllm.fp8_emu_mm_block is not registered."
-        # An explicit VLLM_DCU_FP8_W8A16=1 must not silently degrade to W8A8:
-        # that would change tokens without anyone noticing.  "auto" may degrade.
-        if _W8A16_MODE == "1" and not ops_available_block_w8a16():
-            return False, (
-                "VLLM_DCU_FP8_W8A16=1 but the W8A16 entry point is missing from "
-                "the loaded extension; rebuild _rocm_C or use =auto/=0."
+        # An explicit VLLM_DCU_FP8_W8A16=1 must not silently degrade: an
+        # is_supported()==False only falls through to the next kernel (the
+        # software Triton block kernel, ~36x slower on gfx906) and would also
+        # lose the gfx906 W8A8 path, so this is a hard error instead.
+        if _W8A16_MODE == "1" and not _W8A16_ENGAGED:
+            raise RuntimeError(
+                "VLLM_DCU_FP8_W8A16=1 but the loaded _rocm_C has no W8A16 "
+                "entry point (fp8_emu_gemm_block_w8a16 / "
+                "vllm::fp8_emu_mm_block_w8a16).  Rebuild the extension, or set "
+                "VLLM_DCU_FP8_W8A16=auto/=0 to allow the fallback."
             )
         return True, None
 
@@ -840,16 +909,24 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
 
         """
         lut = _device_lut(w.dtype, A.device)
+        # The decode arm always passes cfg 0 (the kernel's auto rule picks the
+        # exact-M tile); only the M > GEMV arm looks at the prefill knob, so a
+        # decode call must not even evaluate it (no env read on the hot path).
+        cfg = (
+            _prefill_cfg(A.shape[0], w.shape[0])
+            if A.shape[0] > _GEMV_MAX_M
+            else 0
+        )
         # Compiling must stay on the custom_op: it is what keeps Dynamo from
         # pinning the token dimension (S11k).
         if _EMU_FASTPATH and not torch.compiler.is_compiling():
             return _fp8_emu_mm_block_w8a16_impl(
                 A, w, w_s, lut, None, self.config.out_dtype, _GEMV_THREADS,
-                _prefill_cfg(A.shape[0], w.shape[0]), block_n, block_k,
+                cfg, block_n, block_k,
             )
         return torch.ops.vllm.fp8_emu_mm_block_w8a16(
             A, w, w_s, lut, None, self.config.out_dtype, _GEMV_THREADS,
-            _prefill_cfg(A.shape[0], w.shape[0]), block_n, block_k,
+            cfg, block_n, block_k,
         )
 
     def apply_weights(

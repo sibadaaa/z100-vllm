@@ -15,10 +15,15 @@ Contract:
 * Single-stream: the buffer is filled and consumed by one CUDA stream.  A call
   from another stream gets ``None`` (fall back to the W8A16 kernel) instead of
   racing on the buffer.
-* No allocation while a stream is capturing: a capture-time allocation would
-  bake a stale pointer into the graph, so the router declines instead.
+* Eager-only: a call while ``torch.compile`` is tracing returns ``None`` (the
+  raw dequant op has no Meta/fake implementation and the M branch is symbolic)
+  and the stream-affine scratch is never allocated inside a CUDA-graph capture,
+  so a captured graph never contains the route.  ``VLLM_DCU_FP16_PREFILL``
+  therefore stays Dynamo-safe.
 * Every failure (dtype/layout, OOM, missing op) returns ``None`` so the caller
   falls back to the W8A16 kernel; this module never raises.
+* A layer role that is missing from ``_ROLE_MIN_M`` warns once, so a table miss
+  is visible instead of silently using ``_DEFAULT_MIN_M``.
 
 The router is only reachable when W8A16 is wired (``apply_input_quant`` is
 False, i.e. the activation arrives as fp16 and is not quantized).  The caller
@@ -30,6 +35,9 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+
+from .BlockScaledMMLinearKernel import FP8BlockParams
+from .gfx906_fp8 import _device_lut
 
 logger = init_logger(__name__)
 
@@ -50,10 +58,24 @@ if _MODE not in ("0", "1", "auto"):
 # where dequant + rocBLAS becomes strictly faster than the shipped W8A8 layer
 # (the tile sits between the two).  Wide-N shapes pay a larger fixed dequant
 # cost, so gate_up crosses later; deep-K down_proj wins from the floor.
+#
+# ``in_proj_qkvz`` is the fused GDN projection that Qwen3.5-family models
+# register at runtime (``...linear_attn.in_proj_qkvz``, the largest FP8 layer;
+# the split ``in_proj_qkv`` / ``in_proj_z`` names are aliased for the
+# gguf/compressed-tensors variants).  Missing it sent 48/64 layers of the
+# served model to the 4096 default, i.e. the W8A16 tile -- measured 1.26-1.30x
+# slower than the shipped W8A8 path at M >= 512 on the served 4096:5120
+# per-rank shape, while the route/tile ratio there is already 0.685 at M = 16
+# (.s23/logs/w8a16-p1-perf.log).
 _ROLE_MIN_M: dict[str, int | None] = {
     "gate_up_proj": 128,
     "down_proj": 16,
     "qkv_proj": 128,
+    "in_proj_qkvz": 16,
+    # Split-projection variants: qkv is the same wide-N family as qkv_proj,
+    # z is narrow-N/deep-K like out_proj.  Extrapolated until swept.
+    "in_proj_qkv": 128,
+    "in_proj_z": 16,
     "o_proj": 16,
     "out_proj": 16,
 }
@@ -62,8 +84,10 @@ _ENV_MIN_M = envs.VLLM_DCU_FP16_PREFILL_MIN_M
 if _ENV_MIN_M > 0:
     _DEFAULT_MIN_M = _ENV_MIN_M
 
-# Fixed workspace size in bytes (0 = size it from the weight).  Setting it lets
-# the buffer exist before graph capture warms up.
+# Minimum workspace size in bytes (0 = size it from the weight); a bigger layer
+# still grows the buffer.  Only useful with eager execution: under CUDA-graph
+# capture the stream-affine guard declines the route regardless (see the module
+# contract), so this cannot pre-warm a graph.
 _WS_BYTES = envs.VLLM_DCU_FP16_WS_BYTES
 
 # (device_index, dtype) -> fp16 scratch, plus the stream that filled it.  The
@@ -73,9 +97,20 @@ _WS: dict[tuple, torch.Tensor] = {}
 _WS_STREAM: dict[tuple, int | None] = {}
 
 
+_DEQUANT_OP: bool | None = None
+
+
 def _enabled() -> bool:
-    """Whether the router may engage at all (switch on and dequant op built)."""
-    return _MODE != "0" and hasattr(torch.ops._rocm_C, "fp8_dequant_to_fp16_out")
+    """Whether the router may engage at all (switch on and dequant op built).
+
+    The op lookup is cached after the first call: the hook runs for every
+    linear layer of every step while the switch is on, and the extension is
+    loaded by the time ``apply_weights`` calls it.
+    """
+    global _DEQUANT_OP
+    if _DEQUANT_OP is None:
+        _DEQUANT_OP = hasattr(torch.ops._rocm_C, "fp8_dequant_to_fp16_out")
+    return _MODE != "0" and _DEQUANT_OP
 
 
 def _role(layer: torch.nn.Module) -> str:
@@ -94,6 +129,23 @@ def _min_m(role: str, _w: torch.Tensor | None) -> int:
         return _FORCE_MIN_M
     value = _ROLE_MIN_M.get(role)
     return int(value) if value is not None else _DEFAULT_MIN_M
+
+
+_UNKNOWN_ROLES_WARNED: set[str] = set()
+
+
+def _warn_unknown_role(role: str) -> None:
+    """Warn once per unknown role, so a missing table entry cannot hide."""
+    if role in _UNKNOWN_ROLES_WARNED:
+        return
+    _UNKNOWN_ROLES_WARNED.add(role)
+    logger.warning(
+        "gfx906 fp16 prefill: no measured min_m for layer role %r; using "
+        "_DEFAULT_MIN_M=%d.  Add the role to _ROLE_MIN_M (or set "
+        "VLLM_DCU_FP16_PREFILL_MIN_M) if it should route earlier.",
+        role,
+        _DEFAULT_MIN_M,
+    )
 
 
 def _workspace(w: torch.Tensor) -> torch.Tensor | None:
@@ -171,6 +223,11 @@ def try_prefill(
         None when the caller must fall back to the W8A16 kernel.
 
     """
+    if torch.compiler.is_compiling():
+        # Dynamo-safe fallback: ``fp8_dequant_to_fp16_out`` has no Meta/fake
+        # implementation and this function branches on a symbolic M, so the
+        # traced route is the W8A16 custom_op, not this router.
+        return None
     if not _enabled() or getattr(kernel, "apply_input_quant", True):
         return None
     try:
@@ -187,21 +244,26 @@ def _try_prefill(
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Body of :func:`try_prefill`; preconditions already checked."""
-    from .BlockScaledMMLinearKernel import FP8BlockParams
-    from .gfx906_fp8 import _device_lut
-
     if x.dtype != torch.float16 or not x.is_contiguous():
+        return None
+    # Cheap gates first: while VLLM_DCU_FP16_PREFILL is on this runs for every
+    # linear layer of every step, and decode (M <= 8) never routes.
+    K = x.shape[-1]
+    m = x.numel() // K
+    role = _role(layer)
+    if role not in _ROLE_MIN_M:
+        _warn_unknown_role(role)
+    if m < _min_m(role, None) or m < _FORCE_MIN_M:
         return None
     params = FP8BlockParams.from_layer(layer)
     w = params.weight
     w_s = params.block_scale
     if w is None or w.element_size() != 1 or w_s.dtype != torch.float32:
         return None
-    if w_s.dim() != 2 or not w_s.is_contiguous():
+    if w.dim() != 2 or w_s.dim() != 2 or not w_s.is_contiguous():
         return None
-    K = x.shape[-1]
     N = w.shape[0]
-    if w.dim() != 2 or w.shape[1] != K or w.stride(1) != 1:
+    if w.shape[1] != K or w.stride(1) != 1:
         return None
     if K % 8 or w.stride(0) % 8:
         return None
@@ -210,10 +272,6 @@ def _try_prefill(
     if block_n <= 0 or block_k <= 0 or K % block_k:
         return None
     if tuple(w_s.shape) != ((N + block_n - 1) // block_n, K // block_k):
-        return None
-    m = x.numel() // K
-    min_m = _min_m(_role(layer), w)
-    if m < min_m or m < 16:
         return None
     ws = _workspace(w)
     if ws is None:

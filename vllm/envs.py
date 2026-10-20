@@ -228,18 +228,22 @@ if TYPE_CHECKING:
     # W8A16 route for the gfx906 FP8 emulation kernels: the activation is fed
     # as fp16 and is never quantized, only the weight stays fp8
     # (docs/design/z100-w8a16-prefill-fp16-construction.md).  "0"/unset keeps
-    # the W8A8 path bit-for-bit; "1" requires the W8A16 op and fails loudly if
-    # it is missing; "auto" uses it when the op exists.
+    # the W8A8 path bit-for-bit; "1" requires the W8A16 op and raises at load
+    # if it (or a fp16 activation layer) is missing; "auto" uses it when the op
+    # exists and degrades to W8A8 for unsupported layers.
     VLLM_DCU_FP8_W8A16: str = "0"
     # Prefill fp16 weight materialization: dequantize the current layer into a
     # reused fp16 scratch and run rocBLAS `torch.mm` above a per-role token
-    # count.  "0"/unset off, "1" force on the table's min_m, "auto" on when the
-    # dequant op exists.
+    # count.  "0"/unset off; "1" force for every role from 16 tokens (ignores
+    # the per-role table); "auto" uses the measured per-role table when the
+    # dequant op exists.  Eager-only (declines while tracing / capturing).
     VLLM_DCU_FP16_PREFILL: str = "0"
-    # Override the prefill router's per-role min-M table (0 = use the table).
+    # Override the fallback min-M for layer roles that are absent from the
+    # measured per-role table (0 = keep the built-in 4096).  Known roles keep
+    # their measured values.
     VLLM_DCU_FP16_PREFILL_MIN_M: int = 0
-    # Fixed prefill workspace size in bytes (0 = size it from the weight);
-    # setting it lets the buffer exist before graph capture warms up.
+    # Minimum prefill workspace size in bytes (0 = size it from the weight);
+    # the buffer still grows for a bigger layer.  Eager-only.
     VLLM_DCU_FP16_WS_BYTES: int = 0
     # S24 L3.2 dynamic-k: truncate the speculative verify length to 3/1 rows
     # beyond these computed-token thresholds unless the per-request acceptance

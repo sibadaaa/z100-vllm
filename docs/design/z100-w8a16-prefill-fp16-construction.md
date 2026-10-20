@@ -207,14 +207,28 @@ def ops_available_block_w8a16() -> bool:
 
 **4.4.2 类属性**
 ```python
+_W8A16_ENGAGED = _W8A16 and ops_available_block_w8a16()   # 构建期答案
+
 class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
     # W8A16: activations arrive fp16 and are NOT quantized (base-class hook,
     # same mechanism as FlashInfer/CPU block kernels).  Base then passes a
     # 1-element placeholder as `As` — this kernel must never read it.
-    apply_input_quant = _W8A16 and ops_available_block_w8a16()
+    # 极性：True == 量化（W8A8），False == 原始 fp16（W8A16）。
+    apply_input_quant = not _W8A16_ENGAGED
+
+    def __init__(self, config):
+        super().__init__(config)
+        # 激活 dtype 是逐层的：只有 fp16 能跳过激活量化。
+        if _W8A16_ENGAGED and not _w8a16_applies(config.input_dtype):
+            if _W8A16_MODE == "1":
+                raise RuntimeError("…W8A16=1 requires float16 activations…")
+            self.apply_input_quant = True   # auto 下 bf16 层保持 W8A8
 ```
-`is_supported()` 追加：`_W8A16_MODE == "1"` 且 op 缺失 → 返回 `(False, "…w8a16 op missing; rebuild.")`
-（显式开启必须报错，`auto` 才允许静默降级）。
+`is_supported()` 追加：`_W8A16_MODE == "1"` 且 op 缺失 → **直接 `raise RuntimeError`**
+（返回 `(False, …)` 只会静默落到下一个 kernel——gfx906 上即 ~36× 慢的 Triton 软件模拟，
+所以显式开启必须抛错；`auto` 才允许静默降级）。这是 2026-10-20 生产事故
+（commit 756096310）的根因，初稿极性是反的：`_W8A16 and …` 会让开关关闭时
+`apply_input_quant=False`，把原始 fp16 交给 W8A16 分支并在 baseline `.so` 上崩溃。
 
 **4.4.3 分流**（`apply_block_scaled_mm`，保持现有 W8A8 分支逐字不动）
 ```python
@@ -247,12 +261,16 @@ custom_op 名字 `vllm::fp8_emu_mm_block_w8a16`，`register_fake` 返回正确 s
 **4.4.5 给 T6 预留的 hook**（本任务里就写好，T6 只填实现）
 ```python
 def apply_weights(self, layer, x, bias=None, **kwargs):
-    from . import gfx906_fp16_prefill  # T6 提供
-    routed = gfx906_fp16_prefill.try_prefill(self, layer, x, bias)
-    if routed is not None:
-        return routed
+    if _PREFILL_ROUTE:                      # 开关关掉时连 import 都不付
+        from . import gfx906_fp16_prefill  # T6 提供
+        routed = gfx906_fp16_prefill.try_prefill(self, layer, x, bias)
+        if routed is not None:
+            return routed
     return super().apply_weights(layer, x, bias, **kwargs)
 ```
+注意：`try_prefill` 在 `torch.compiler.is_compiling()` 时直接返回 `None`（dequant 是
+无 Meta 的裸 op，且 M 分支是符号的；被 trace 的路径是 W8A16 custom_op）。
+路由器是 **eager-only**，CUDA graph capture 期内也必然拒绝（workspace 按 stream 归属）。
 > 这个 override 只在 `apply_input_quant=False` 时才有意义；若 W8A16 关闭，`try_prefill` 必须返回 `None`。
 
 ### 4.5 T5 — dequant kernel（新文件，与 T1/T2 零冲突）

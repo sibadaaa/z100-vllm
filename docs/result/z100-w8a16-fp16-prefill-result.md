@@ -142,3 +142,63 @@ RN-EVEN。两侧各距精确值 0.5 ulp、彼此 ≤1 ulp——都是合法最�
   greedy 输出可能与启用前有轻微差异；观察指标 = 异常输出/长稳 OOM/ITL 回归。
   **回滚**：`systemctl --user unset-environment VLLM_DCU_FP8_W8A16 VLLM_DCU_FP16_PREFILL`
   + 重启 unit（或换回基线 `.so`）。e2e parity/soak 仍建议尽快补做。
+
+## 6. 2026-10-20 代码评审修复（Python 侧，无需重编 `.so`）
+
+评审结论：算子本体（kernel / dequant / bindings）未发现正确性缺陷；问题集中在
+路由与调优层，且**其中一个已在生产 auto 下生效**。本节记录修复内容与依据，
+重启 unit 后生效（生产 `PYTHONPATH` 指向本仓库）。
+
+### 6.1 生产退化：`_ROLE_MIN_M` 漏掉运行时真实层名 `in_proj_qkvz`
+
+Qwen3.5 家族在 fp8 下把 checkpoint 的 `in_proj_qkv` + `in_proj_z` 融合成
+`...linear_attn.in_proj_qkvz`（`GatedDeltaNetAttention(create_in_proj_qkvz=True)`，
+权重 `[16384,5120]`，TP4 每 rank `4096:5120`，64 层里 48 层）。该 role 不在表里
+⇒ 落 `_DEFAULT_MIN_M=4096` ⇒ M∈[16,4096) 走 W8A16 tile。按本仓 P1 日志
+`.s23/logs/w8a16-p1-perf.log`（`4096:5120`）：
+
+| M | tile/W8A8 | route/tile | route/W8A8 |
+|---|---|---|---|
+| 16 | 0.960 | 0.685 | 0.66 |
+| 512 | 1.259 | 0.656 | 0.83 |
+| 1024 | 1.278 | 0.429 | 0.55 |
+| 4096 | 1.290 | 0.394 | 0.51 |
+
+即 48/64 层在 prefill M≥512 上比改造前 W8A8 慢 26–29%，M≥4096 才切到 route。
+修复：`_ROLE_MIN_M` 增加 `in_proj_qkvz=16`（同族 split 名 `in_proj_qkv=128`、
+`in_proj_z=16` 一并覆盖，待实测替换）；未知 role 首次进路由器打一次 warning，
+避免同类表漏再次静默。
+
+### 6.2 其余修复
+
+- **显式 `VLLM_DCU_FP8_W8A16=1` 改为启动期抛错**：`is_supported()==False` 只会落到
+  下一个 kernel（gfx906 上即 ~36× 慢的 Triton 软件模拟），并不"报错"；现在 raise。
+- **prefill 路由器 compile/eager 边界**：`torch.compiler.is_compiling()` 时直接返回
+  `None`（dequant 是无 Meta 的裸 op、M 分支是符号的），被 trace 的路径回到 W8A16
+  custom_op；模块 docstring 明确路由器是 eager-only（CUDA graph 下因 workspace
+  按 stream 归属也必然拒绝）。
+- **宿主侧热点**：`apply_weights` 的 router 前导代码缩短——先算 M/role 并做 min_m
+  早退，再构造 `FP8BlockParams`；`_enabled()` 的 op 查询缓存；`_prefill_cfg` 改为
+  import 时快照（不再每次调用 `os.environ.get`，decode 臂根本不算 cfg）。
+- **bf16 降级**：`_W8A16_ENGAGED` + 逐实例 `apply_input_quant`——auto 下 bf16 层保持
+  W8A8（不再首次 forward 崩）；`=1` + bf16 在 `__init__` 抛错。
+- **`_GEMV_MAX_M` clamp 到 [0, kMsMax=8]**：env>8 时 python 曾会把 M=9..N 交给
+  `fp8_emu_gemv_block`，其入口 `TORCH_CHECK(M<=8)` 会直接失败；同时使 W8A16 的
+  "decode 臂恒 cfg 0" 与 kernel 内部阈值一致。
+- **显式 `import vllm._rocm_C`**：`torch.ops._rocm_C` 是惰性命名空间，import 期若扩展
+  尚未加载，`_W8A16_ENGAGED` 会静默为 False（auto 下静默退回 W8A8）；现在模块 import
+  时先注册扩展（失败则保持原行为）。
+- **测试**：新增纯 Python 用例（role 名解析、表覆盖、未知 role warning、compile 守卫、
+  `=1` 缺 op 抛错、bf16 逐实例降级）与真实 `apply_weights` 全链路用例（on/off 两臂）；
+  W8A16/dequant 用例改走 `w8a16_ops` fixture，baseline/回滚 `.so` 下 skip 而不是 ERROR。
+
+### 6.3 仍待处理
+
+1. **e2e 门禁未跑**（§5）：greedy parity / DFlash2 accept / 32k+64k soak。
+2. `_ROLE_MIN_M` 的 128/16 交点主要在 11B/TP2 形状上扫得；建议在 27B TP4 的
+   `gate_up_proj=4352:5120`、`qkv_proj=2048:5120` 上补扫，并按"vs W8A16 tile"（而非
+   vs W8A8）重定 16 阶梯（`out_proj/o_proj` 在 M=16 时 route/tile=1.13）。
+3. C++ 硬化项（无落地 bug，需下一次串行 staging build 验证）：动态 LDS 的
+   `__align__(16)`、stream kernel 的 `a_s=nullptr` 改为传合法指针、dequant helper 的
+   guard/stream 顺序、入口 2-D 检查前置、`check_block_w8a16` 的设备一致性/`w%4`、
+   `A16Conf` 的 BK `static_assert`、`w8a16_cfg` 对 W8A8 cfg 11..19 的 M 相关映射。
