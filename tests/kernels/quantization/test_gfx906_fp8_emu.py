@@ -720,13 +720,24 @@ def test_block_w8a16_rejects_bad_activations_and_scales(fp8_ops):
 
 
 def test_w8a16_route_is_off_unless_asked(fp8_ops):
-    """Default build/route stays W8A8: `apply_input_quant` follows the switch."""
+    """Default build/route stays W8A8: `apply_input_quant` follows the switch.
+
+    Polarity: the base-class hook True == quantize (W8A8), False == raw fp16
+    (W8A16).  Switch off (or the op missing) must keep quantization ON -- the
+    inverted polarity crashed production at the first forward (the base handed
+    raw fp16 to the missing W8A16 op).
+    """
     import vllm.model_executor.kernels.linear.scaled_mm.gfx906_fp8 as m
 
-    expected = m._W8A16 and m.ops_available_block_w8a16()
-    assert m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant is expected
+    engaged = m._W8A16 and m.ops_available_block_w8a16()
+    assert (
+        m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant
+        is not engaged
+    )
     if m._W8A16_MODE in ("0", ""):
-        assert m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant is False
+        assert (
+            m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant is True
+        ), "switch off must keep the W8A8 quantization"
 
 
 # ---------------------------------------------------------------------------

@@ -710,12 +710,15 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
     # whether the wiring is safe when the artifact and the tree disagree.
     fuses_input_quant = _FUSE_QUANT and ops_available_block_quant()
 
-    # W8A16: activations arrive fp16 and are **not** quantized -- the same
-    # base-class hook FlashInfer/CPU use.  The base then hands the kernel a
-    # 1-element placeholder as ``As``, which this kernel must never read (the
-    # W8A16 entry point has no activation scale at all, P2).  Gated on the op
-    # being present so the artifact and the tree cannot disagree silently.
-    apply_input_quant = _W8A16 and ops_available_block_w8a16()
+    # W8A16 polarity: the base-class hook quantizes when True and passes the
+    # raw fp16 activation with a 1-element placeholder ``As`` when False
+    # (same mechanism FlashInfer/CPU use; P2 -- this kernel must never read
+    # that placeholder).  So the hook is False only when the W8A16 route is
+    # actually engaged: switch on AND the built op present.  Switch off (or
+    # the artifact lacking the op) must stay True -- the W8A8 path, verbatim.
+    # Found by the production restart after P1: the inverted polarity made the
+    # switch-off path skip quantization and crash on the missing W8A16 op.
+    apply_input_quant = not (_W8A16 and ops_available_block_w8a16())
 
     @classmethod
     def is_supported(
