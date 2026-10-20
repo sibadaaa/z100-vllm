@@ -122,6 +122,13 @@ def ops_available_block_quant() -> bool:
     return hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_quant")
 
 
+def ops_available_block_w8a16() -> bool:
+    """Whether the build carries the W8A16 entry point and its custom_op."""
+    return hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16") and hasattr(
+        torch.ops.vllm, "fp8_emu_mm_block_w8a16"
+    )
+
+
 # ---------------------------------------------------------------------------
 # fp8 -> fp16 conversion table (host side, exact)
 # ---------------------------------------------------------------------------
@@ -177,6 +184,15 @@ def _device_lut(fp8_dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """
     return fp8_to_fp16_lut(fp8_dtype).to(device)
 
+
+# W8A16 route (docs/design/z100-w8a16-prefill-fp16-construction.md): the
+# activation arrives as fp16 and is never quantized, so the A-side LUT widening
+# and the per-token quantization launch disappear while the weight stays fp8 in
+# HBM.  "0" (default) keeps the W8A8 path bit-for-bit identical; "1" forces the
+# route and fails loudly if the built op is missing; "auto" takes it whenever
+# the op is present.  Read once at import, never per call (P1).
+_W8A16_MODE = str(envs.VLLM_DCU_FP8_W8A16).strip().lower()
+_W8A16 = _W8A16_MODE in ("1", "auto")
 
 # Eager fast path (S23 O1).  The custom_ops below exist only so Dynamo gets a
 # shape contract; while eager that contract buys nothing, but its schema
@@ -260,6 +276,45 @@ def _fp8_emu_mm_block_impl(
     return torch.ops._rocm_C.fp8_emu_gemm_block(
         a, w, a_s, w_s, lut, bias, out_dtype,
         _prefill_cfg(a.shape[0], w.shape[0]), block_n, block_k,
+    )
+
+
+def _fp8_emu_mm_block_w8a16_impl(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    w_s: torch.Tensor,
+    lut: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    nthreads: int,
+    cfg: int,
+    block_n: int,
+    block_k: int,
+) -> torch.Tensor:
+    """Issue the W8A16 block-scaled kernel for one ``[M, K] x [N, K]`` call.
+
+    ``a`` is fp16 and is *not* quantized; there is no activation scale.  The
+    M branch (decode GEMV/stream vs tiled GEMM) stays inside the opaque body so
+    Dynamo never sees a symbolic-M branch (S11k).
+
+    Args:
+        a: Activations, ``[M, K]`` float16, contiguous.
+        w: Weights, ``[N, K]`` fp8 (K-contiguous; row stride may be padded).
+        w_s: Per-block weight scales, ``[N // block_n, K // block_k]`` fp32.
+        lut: fp8 -> fp16 conversion table, device-resident.
+        bias: Optional ``[N]`` bias in ``out_dtype``.
+        out_dtype: Output dtype.
+        nthreads: Decode GEMV launch width.
+        cfg: Tile selector; 0 = the kernel's auto rule.
+        block_n: Weight block rows.
+        block_k: Weight block columns.
+
+    Returns:
+        ``[M, N]`` output in ``out_dtype``.
+
+    """
+    return torch.ops._rocm_C.fp8_emu_gemm_block_w8a16(
+        a, w, w_s, lut, bias, out_dtype, nthreads, cfg, block_n, block_k
     )
 
 
@@ -480,6 +535,50 @@ def _register_fp8_emu_mm_block_quant() -> None:
         )
 
 
+def _register_fp8_emu_mm_block_w8a16() -> None:
+    """``torch.library.custom_op`` wrapper for the W8A16 entry point (once).
+
+    Same S11k reason as the other wrappers: a raw ``TORCH_LIBRARY`` op pins the
+    symbolic token dimension with an ``Eq(dim, hint)`` guard and aborts vLLM's
+    compile.
+    """
+    if hasattr(torch.ops.vllm, "fp8_emu_mm_block_w8a16"):
+        return
+
+    @torch.library.custom_op("vllm::fp8_emu_mm_block_w8a16", mutates_args=())
+    def fp8_emu_mm_block_w8a16(
+        a: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        lut: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        nthreads: int,
+        cfg: int,
+        block_n: int,
+        block_k: int,
+    ) -> torch.Tensor:
+        # Runs eagerly: the branch is on the concrete runtime M, never traced.
+        return _fp8_emu_mm_block_w8a16_impl(
+            a, w, w_s, lut, bias, out_dtype, nthreads, cfg, block_n, block_k
+        )
+
+    @fp8_emu_mm_block_w8a16.register_fake
+    def _(
+        a: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        lut: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        nthreads: int,
+        cfg: int,
+        block_n: int,
+        block_k: int,
+    ) -> torch.Tensor:
+        return a.new_empty((a.shape[0], w.shape[0]), dtype=out_dtype)
+
+
 if ops_available():
     _register_fp8_emu_mm()
 
@@ -488,6 +587,9 @@ if ops_available_block():
 
 if ops_available_block_quant():
     _register_fp8_emu_mm_block_quant()
+
+if hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16"):
+    _register_fp8_emu_mm_block_w8a16()
 
 
 class Gfx906Fp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
@@ -593,6 +695,13 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
     # whether the wiring is safe when the artifact and the tree disagree.
     fuses_input_quant = _FUSE_QUANT and ops_available_block_quant()
 
+    # W8A16: activations arrive fp16 and are **not** quantized -- the same
+    # base-class hook FlashInfer/CPU use.  The base then hands the kernel a
+    # 1-element placeholder as ``As``, which this kernel must never read (the
+    # W8A16 entry point has no activation scale at all, P2).  Gated on the op
+    # being present so the artifact and the tree cannot disagree silently.
+    apply_input_quant = _W8A16 and ops_available_block_w8a16()
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -610,6 +719,13 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             return False, "torch.ops._rocm_C.fp8_emu_*_block is not registered."
         if not hasattr(torch.ops.vllm, "fp8_emu_mm_block"):
             return False, "torch.ops.vllm.fp8_emu_mm_block is not registered."
+        # An explicit VLLM_DCU_FP8_W8A16=1 must not silently degrade to W8A8:
+        # that would change tokens without anyone noticing.  "auto" may degrade.
+        if _W8A16_MODE == "1" and not ops_available_block_w8a16():
+            return False, (
+                "VLLM_DCU_FP8_W8A16=1 but the W8A16 entry point is missing from "
+                "the loaded extension; rebuild _rocm_C or use =auto/=0."
+            )
         return True, None
 
     @classmethod
@@ -684,6 +800,71 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             _QUANT_EPS,
         )
 
+    def _apply_block_scaled_mm_w8a16(
+        self,
+        A: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        block_n: int,
+        block_k: int,
+    ) -> torch.Tensor:
+        """Issue the W8A16 kernel for ``A`` fp16 ``[M, K]`` and ``w`` fp8.
+
+        Args:
+            A: fp16 activations, ``[M, K]``.
+            w: fp8 weight, ``[N, K]`` (K-contiguous, row stride may be padded).
+            w_s: Per-block weight scales, ``[N // block_n, K // block_k]``.
+            block_n: Weight block rows.
+            block_k: Weight block columns.
+
+        Returns:
+            ``[M, N]`` output in ``self.config.out_dtype``.
+
+        """
+        lut = _device_lut(w.dtype, A.device)
+        # Compiling must stay on the custom_op: it is what keeps Dynamo from
+        # pinning the token dimension (S11k).
+        if _EMU_FASTPATH and not torch.compiler.is_compiling():
+            return _fp8_emu_mm_block_w8a16_impl(
+                A, w, w_s, lut, None, self.config.out_dtype, _GEMV_THREADS,
+                _prefill_cfg(A.shape[0], w.shape[0]), block_n, block_k,
+            )
+        return torch.ops.vllm.fp8_emu_mm_block_w8a16(
+            A, w, w_s, lut, None, self.config.out_dtype, _GEMV_THREADS,
+            _prefill_cfg(A.shape[0], w.shape[0]), block_n, block_k,
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Prefill fp16 materialization first, then the base-class path.
+
+        Above the router's per-role token threshold the current layer's weight is
+        dequantized into one reused fp16 scratch and handed to rocBLAS, which is
+        faster than the emulation tile GEMM at large M.  The router only engages
+        when this kernel is on the W8A16 route (``apply_input_quant`` False) and
+        returns None on every failure, so the fallback is the W8A16 kernel.
+
+        Args:
+            layer: The quantized linear layer.
+            x: Activation, ``[*leading, K]``.
+            bias: Optional ``[N]`` bias.
+
+        Returns:
+            ``[*x.shape[:-1], N]`` in the layer's configured out dtype.
+
+        """
+        from . import gfx906_fp16_prefill
+
+        routed = gfx906_fp16_prefill.try_prefill(self, layer, x, bias)
+        if routed is not None:
+            return routed
+        return super().apply_weights(layer, x, bias, **kwargs)
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -709,6 +890,20 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             )
         block_n = int(self.weight_group_shape.row)
         block_k = int(self.weight_group_shape.col)
+        # W8A16 route: the base class skipped the activation quantization, so
+        # ``A`` is the raw fp16 activation and ``As`` is a 1-element placeholder
+        # that must not be read.  Everything below this branch is the W8A8 path,
+        # kept verbatim.
+        if not self.apply_input_quant:
+            if A.dtype != torch.float16:
+                raise RuntimeError(
+                    "gfx906 W8A16 requires float16 activations (gfx906 has no "
+                    f"bf16 datapath); got {A.dtype}.  Set "
+                    "VLLM_DCU_FP8_W8A16=0 to use the W8A8 path."
+                )
+            return self._apply_block_scaled_mm_w8a16(
+                A, w, Bs.contiguous(), block_n, block_k
+            )
         lut = _device_lut(A.dtype, A.device)
         a_s = As.contiguous()
         w_s = Bs.contiguous()

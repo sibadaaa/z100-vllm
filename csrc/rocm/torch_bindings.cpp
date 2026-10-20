@@ -141,6 +141,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int block_n, int block_k) -> Tensor");
   rocm_ops.impl("fp8_emu_gemm_block", torch::kCUDA, &fp8_emu_gemm_block);
 
+  // W8A16: `a` is fp16 and is never quantized; only the weight stays fp8 with
+  // its block scales (so there is no activation scale at all).  Gated in python
+  // by VLLM_DCU_FP8_W8A16, default off.
+  rocm_ops.def(
+      "fp8_emu_gemm_block_w8a16(Tensor a, Tensor w, Tensor w_s, Tensor lut, "
+      "Tensor? bias, ScalarType out_dtype, int nthreads, int cfg, "
+      "int block_n, int block_k) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemm_block_w8a16", torch::kCUDA,
+                &fp8_emu_gemm_block_w8a16);
+
+  // Materialize one layer's fp8 weight * block scales into an fp16 scratch kept
+  // in [N, K] row order (the prefill fp16 route consumes out.t()).  In-place on
+  // `out` so the caller can reuse one buffer across layers.
+  rocm_ops.def(
+      "fp8_dequant_to_fp16_out(Tensor(a!) out, Tensor wq, Tensor ws, "
+      "Tensor lut, int block_n, int block_k) -> ()");
+  rocm_ops.impl("fp8_dequant_to_fp16_out", torch::kCUDA,
+                &fp8_dequant_to_fp16_out);
+
   // S23 / O5: activation quantization fused into the block-scaled path.  `a` is
   // the unquantized activation; `w_s` is the block-scale matrix.  Gated in
   // python by VLLM_DCU_FP8_FUSE_QUANT (default off).
@@ -177,6 +196,8 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
   rocm_meta_ops.impl("fp8_emu_gemm", &fp8_emu_gemm_meta);
   rocm_meta_ops.impl("fp8_emu_gemv_block", &fp8_emu_gemv_block_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block", &fp8_emu_gemm_block_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm_block_w8a16",
+                     &fp8_emu_gemm_block_w8a16_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant",
                      &fp8_emu_gemm_block_quant_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant_x",

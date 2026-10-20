@@ -110,3 +110,29 @@ torch::Tensor fp8_emu_gemm_block_meta(torch::Tensor a, torch::Tensor w,
                                       std::optional<torch::Tensor> bias,
                                       at::ScalarType out_dtype, int64_t cfg,
                                       int64_t block_n, int64_t block_k);
+
+// W8A16: `a` is fp16 [M, K] and is **never quantized**; only the weight stays
+// fp8 [N, K] with fp32 block scales.  Same block-scaled kernel family as
+// `fp8_emu_gemm_block`, minus the A-side LUT widening and minus the per-token
+// activation scale (there is no `a_s` at all).  `cfg` selects a tile out of the
+// W8A16 set (see the host-side mapping in fp8_emu_gemm.cu; 0 = auto rule),
+// `nthreads` sizes the decode GEMV.  K must be a multiple of 8 and of
+// `block_k`, and `block_k` a multiple of 32.
+torch::Tensor fp8_emu_gemm_block_w8a16(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t cfg, int64_t block_n, int64_t block_k);
+
+torch::Tensor fp8_emu_gemm_block_w8a16_meta(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t cfg, int64_t block_n, int64_t block_k);
+
+// Materialize one layer's fp8 weight (times its block scales) into fp16,
+// keeping the [N, K] row order so the caller can hand `out.t()` to a row-major
+// GEMM.  In-place on `out`; no allocation, so the buffer can be reused across
+// layers (the prefill router owns it).
+void fp8_dequant_to_fp16_out(torch::Tensor out, torch::Tensor wq,
+                             torch::Tensor ws, torch::Tensor lut,
+                             int64_t block_n, int64_t block_k);
+

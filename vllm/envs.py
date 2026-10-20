@@ -225,6 +225,22 @@ if TYPE_CHECKING:
     # issues one kernel instead of two (S23: 256 of each per step).  Off by
     # default; the unfused path stays reachable for A/B and rollback.
     VLLM_DCU_FP8_FUSE_QUANT: bool = False
+    # W8A16 route for the gfx906 FP8 emulation kernels: the activation is fed
+    # as fp16 and is never quantized, only the weight stays fp8
+    # (docs/design/z100-w8a16-prefill-fp16-construction.md).  "0"/unset keeps
+    # the W8A8 path bit-for-bit; "1" requires the W8A16 op and fails loudly if
+    # it is missing; "auto" uses it when the op exists.
+    VLLM_DCU_FP8_W8A16: str = "0"
+    # Prefill fp16 weight materialization: dequantize the current layer into a
+    # reused fp16 scratch and run rocBLAS `torch.mm` above a per-role token
+    # count.  "0"/unset off, "1" force on the table's min_m, "auto" on when the
+    # dequant op exists.
+    VLLM_DCU_FP16_PREFILL: str = "0"
+    # Override the prefill router's per-role min-M table (0 = use the table).
+    VLLM_DCU_FP16_PREFILL_MIN_M: int = 0
+    # Fixed prefill workspace size in bytes (0 = size it from the weight);
+    # setting it lets the buffer exist before graph capture warms up.
+    VLLM_DCU_FP16_WS_BYTES: int = 0
     # S24 L3.2 dynamic-k: truncate the speculative verify length to 3/1 rows
     # beyond these computed-token thresholds unless the per-request acceptance
     # EMA still rates the drafter (see
@@ -1552,6 +1568,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCU_FP8_FUSE_QUANT": lambda: (
         os.getenv("VLLM_DCU_FP8_FUSE_QUANT", "False").lower() in ("true", "1")
+    ),
+    # W8A16 + prefill-materialization switches (tri-state "0"/"1"/"auto").
+    # Defaults keep the shipped W8A8 behaviour byte-for-byte.
+    "VLLM_DCU_FP8_W8A16": lambda: os.getenv("VLLM_DCU_FP8_W8A16", "0").strip().lower(),
+    "VLLM_DCU_FP16_PREFILL": lambda: (
+        os.getenv("VLLM_DCU_FP16_PREFILL", "0").strip().lower()
+    ),
+    "VLLM_DCU_FP16_PREFILL_MIN_M": lambda: int(
+        os.getenv("VLLM_DCU_FP16_PREFILL_MIN_M", "0") or 0
+    ),
+    "VLLM_DCU_FP16_WS_BYTES": lambda: int(
+        os.getenv("VLLM_DCU_FP16_WS_BYTES", "0") or 0
     ),
     "VLLM_S24_DYNK_LO": lambda: int(os.getenv("VLLM_S24_DYNK_LO", "0") or 0),
     "VLLM_S24_DYNK_HI": lambda: int(os.getenv("VLLM_S24_DYNK_HI", "0") or 0),

@@ -564,3 +564,373 @@ def test_block_gemv_decode_stream_matches_gemm(fp8_ops):
     assert torch.allclose(gemv, gemm, rtol=1e-3, atol=1e-3), (
         (gemv - gemm).abs().max().item()
     )
+
+
+# ---------------------------------------------------------------------------
+# W8A16 route: fp16 activations against fp8 block-scaled weights
+# (csrc/rocm/fp8_emu_gemm.cu, fp8_emu_gemm_block_w8a16)
+# ---------------------------------------------------------------------------
+# docs/design/z100-w8a16-prefill-fp16-construction.md.  The activation is no
+# longer quantized, so the reference is the *raw* fp16 activation against the
+# same fp8 weight: the only remaining error is the fp32 accumulation order (or
+# the final cast).  `cfg` values are the W8A16 tile set (1..5) plus the W8A8
+# numbers the Python A/B knobs still pass, which the kernel maps onto it.
+
+W8A16_CFGS = [0, 2, 3, 4, 5, 16, 36, 40]
+
+
+def _dequantized_weight(w_q, w_s):
+    """fp32 dequantized weight, i.e. the W8A16 reference operand."""
+    n, k = w_q.shape
+    return (
+        w_q.to(torch.float32)
+        * w_s.repeat_interleave(BLOCK_N, dim=0)[:n].repeat_interleave(
+            BLOCK_K, dim=1
+        )[:, :k]
+    )
+
+
+def _reference_block_w8a16(a, w_q, w_s):
+    return a.to(torch.float32) @ _dequantized_weight(w_q, w_s).t()
+
+
+def _w8a16(a, w_q, w_s, lut, bias=None, out_dtype=torch.float32, cfg=0):
+    return torch.ops._rocm_C.fp8_emu_gemm_block_w8a16(
+        a, w_q, w_s, lut, bias, out_dtype, 64, cfg, BLOCK_N, BLOCK_K
+    )
+
+
+def _rel_err(out, ref):
+    return (out.to(torch.float32) - ref).abs().max().item() / ref.abs().max().item()
+
+
+def _cos(x, y):
+    x = x.to(torch.float64).flatten()
+    y = y.to(torch.float64).flatten()
+    return float((x * y).sum() / (x.norm() * y.norm()))
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6, 8])
+def test_block_gemv_w8a16(fp8_ops, m, out_dtype):
+    """Decode M = 1..8: the GEMV reads the fp16 activation directly."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 384, 1024
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block_w8a16(a, w_q, w_s)
+
+    out = _w8a16(a, w_q, w_s, fp8_ops(fp8_dtype), out_dtype=out_dtype)
+    tol = 1e-5 if out_dtype == torch.float32 else 1e-3
+    err = _rel_err(out, ref)
+    assert err < tol, f"m={m} max|err|/max|ref| = {err}"
+
+
+@pytest.mark.parametrize("m", [16, 64, 129, 512])
+@pytest.mark.parametrize("cfg", W8A16_CFGS)
+def test_block_gemm_w8a16(fp8_ops, m, cfg):
+    """Prefill tile path: every W8A16 cfg must match the fp32 reference."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 256, 512
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    ref = _reference_block_w8a16(a, w_q, w_s)
+
+    out = _w8a16(a, w_q, w_s, fp8_ops(fp8_dtype), cfg=cfg)
+    err = _rel_err(out, ref)
+    assert err < 1e-5, f"m={m} cfg={cfg} max|err|/max|ref| = {err}"
+
+
+def test_block_w8a16_bias_and_bf16_out(fp8_ops):
+    """Bias is added in out_dtype, and the bf16 *output* cast still works."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m, n, k = 17, 256, 512
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    ref = _reference_block_w8a16(a, w_q, w_s) + bias.to(torch.float32).reshape(1, -1)
+
+    out = _w8a16(
+        a, w_q, w_s, fp8_ops(fp8_dtype), bias=bias, out_dtype=torch.float16
+    )
+    assert _rel_err(out, ref) < 1e-3
+
+    bf16 = _w8a16(a, w_q, w_s, fp8_ops(fp8_dtype), out_dtype=torch.bfloat16)
+    assert bf16.dtype == torch.bfloat16
+    assert _rel_err(bf16, ref) < 1e-2
+
+
+def test_block_w8a16_accepts_padded_weight_row_stride(fp8_ops):
+    """`process_fp8_weight_block_strategy` pads K, so stride(0) != K."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m, n, k, pad = 32, 256, 512, 256
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    lut = fp8_ops(fp8_dtype)
+
+    padded = torch.zeros(n, k + pad, dtype=torch.uint8, device="cuda")
+    padded[:, :k] = w_q.view(torch.uint8)
+    w_pad = padded.view(fp8_dtype)[:, :k]
+    assert w_pad.stride(0) == k + pad and w_pad.stride(1) == 1
+
+    out = _w8a16(a, w_pad, w_s, lut)
+    ref = _w8a16(a, w_q.contiguous(), w_s, lut)
+    assert torch.equal(out, ref), "padded row stride changed the result"
+
+
+def test_block_w8a16_rejects_bad_activations_and_scales(fp8_ops):
+    """A must be fp16 (gfx906 has no bf16 datapath) and w_s must be well-shaped."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 128, 256
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    lut = fp8_ops(fp8_dtype)
+
+    a_bf16 = torch.randn(16, k, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="float16"):
+        _w8a16(a_bf16, w_q, w_s, lut)
+
+    a_q, _ = _quantize_block(torch.randn(16, k, device="cuda"), fp8_dtype, 1)
+    with pytest.raises(RuntimeError, match="float16"):
+        _w8a16(a_q, w_q, w_s, lut)
+
+    a = torch.randn(16, k, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="w_s must be"):
+        _w8a16(a, w_q, w_s[:1], lut)
+
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        _w8a16(a[:, :250].contiguous(), w_q[:, :250].contiguous(), w_s, lut)
+
+    with pytest.raises(RuntimeError, match="multiple of 32"):
+        torch.ops._rocm_C.fp8_emu_gemm_block_w8a16(
+            a, w_q, w_s, lut, None, torch.float32, 64, 0, BLOCK_N, 48
+        )
+
+
+def test_w8a16_route_is_off_unless_asked(fp8_ops):
+    """Default build/route stays W8A8: `apply_input_quant` follows the switch."""
+    import vllm.model_executor.kernels.linear.scaled_mm.gfx906_fp8 as m
+
+    expected = m._W8A16 and m.ops_available_block_w8a16()
+    assert m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant is expected
+    if m._W8A16_MODE in ("0", ""):
+        assert m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant is False
+
+
+# ---------------------------------------------------------------------------
+# prefill fp16 weight materialization (csrc/rocm/fp8_dequant.cuh)
+# ---------------------------------------------------------------------------
+
+
+def _dequant(w_q, w_s, lut):
+    out = torch.empty(
+        w_q.shape, dtype=torch.float16, device=w_q.device
+    )
+    torch.ops._rocm_C.fp8_dequant_to_fp16_out(out, w_q, w_s, lut, BLOCK_N, BLOCK_K)
+    return out
+
+
+def test_dequant_kernel_matches_reference(fp8_ops):
+    """Bit-exact: fp32 multiply then one fp16 rounding, no fp16-domain product."""
+    torch.manual_seed(0)
+    for fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        n, k = 384, 1024
+        w = torch.randn(n, k, device="cuda") * 0.02
+        w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+        out = _dequant(w_q, w_s, fp8_ops(fp8_dtype))
+        ref = _dequantized_weight(w_q, w_s).to(torch.float16)
+        assert out.dtype == torch.float16 and out.shape == w_q.shape
+        assert torch.equal(out, ref), (out.to(torch.float32) - ref).abs().max()
+
+
+def test_dequant_accepts_padded_weight_row_stride(fp8_ops):
+    """The kernel must address W through `stride(0)`, not assume K."""
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k, pad = 256, 512, 256
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    lut = fp8_ops(fp8_dtype)
+    padded = torch.zeros(n, k + pad, dtype=torch.uint8, device="cuda")
+    padded[:, :k] = w_q.view(torch.uint8)
+    out = _dequant(padded.view(fp8_dtype)[:, :k], w_s, lut)
+    assert torch.equal(out, _dequant(w_q.contiguous(), w_s, lut))
+
+
+def test_dequant_rejects_bad_layout(fp8_ops):
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 128, 256
+    w_q, w_s = _quantize_block(
+        torch.randn(n, k, device="cuda") * 0.02, fp8_dtype, BLOCK_N
+    )
+    lut = fp8_ops(fp8_dtype)
+    with pytest.raises(RuntimeError, match="out must be float16"):
+        torch.ops._rocm_C.fp8_dequant_to_fp16_out(
+            torch.empty(n, k, dtype=torch.float32, device="cuda"), w_q, w_s, lut,
+            BLOCK_N, BLOCK_K,
+        )
+    with pytest.raises(RuntimeError, match=r"out must be \[N, K\]"):
+        torch.ops._rocm_C.fp8_dequant_to_fp16_out(
+            torch.empty(n, k // 2, dtype=torch.float16, device="cuda"), w_q, w_s,
+            lut, BLOCK_N, BLOCK_K,
+        )
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        torch.ops._rocm_C.fp8_dequant_to_fp16_out(
+            torch.empty(n, k - 4, dtype=torch.float16, device="cuda"),
+            w_q[:, : k - 4].contiguous(), w_s, lut, BLOCK_N, BLOCK_K,
+        )
+
+
+class _StubKernel:
+    """Minimal stand-in for the block-scaled kernel instance."""
+
+    def __init__(self, out_dtype=torch.float16):
+        self.apply_input_quant = False
+        self.weight_group_shape = type("GS", (), {"row": BLOCK_N, "col": BLOCK_K})()
+        self.config = type("Cfg", (), {"out_dtype": out_dtype})()
+
+
+class _StubLayer:
+    """Minimal stand-in for a quantized linear layer (`FP8BlockParams`)."""
+
+    weight = None
+    weight_scale = None
+    weight_scale_inv = None
+    input_scale = None
+    input_scale_ub = None
+
+    def __init__(self, w, w_s, prefix="model.layers.0.mlp.down_proj"):
+        self.weight = w
+        self.weight_scale = w_s
+        self.prefix = prefix
+
+
+def _prefill_module():
+    import vllm.model_executor.kernels.linear.scaled_mm.gfx906_fp16_prefill as pre
+
+    return pre
+
+
+def test_prefill_route_matches_w8a16(fp8_ops, monkeypatch):
+    """The fp16-materialized route must agree with the W8A16 kernel."""
+    pre = _prefill_module()
+    monkeypatch.setattr(pre, "_MODE", "1")
+    monkeypatch.setattr(pre, "_DEFAULT_MIN_M", 0)
+    pre._WS.clear()
+    pre._WS_STREAM.clear()
+
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    m, n, k = 64, 256, 512
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
+    w = torch.randn(n, k, device="cuda") * 0.02
+    w_q, w_s = _quantize_block(w, fp8_dtype, rows_per_group=BLOCK_N)
+    lut = fp8_ops(fp8_dtype)
+
+    routed = pre.try_prefill(_StubKernel(), _StubLayer(w_q, w_s), a, None)
+    assert routed is not None, "router declined a shape it should serve"
+    assert routed.dtype == torch.float16 and routed.shape == (m, n)
+
+    direct = _w8a16(a, w_q, w_s, lut, out_dtype=torch.float16)
+    assert _cos(routed, direct) >= 0.99999
+    assert _rel_err(routed, _reference_block_w8a16(a, w_q, w_s)) < 1e-3
+
+    bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    routed_b = pre.try_prefill(_StubKernel(), _StubLayer(w_q, w_s), a, bias)
+    assert routed_b is not None
+    assert _cos(routed_b, direct + bias) >= 0.99999
+
+
+def test_prefill_route_declines_small_m_and_bad_dtypes(fp8_ops, monkeypatch):
+    pre = _prefill_module()
+    monkeypatch.setattr(pre, "_MODE", "auto")
+    monkeypatch.setattr(pre, "_DEFAULT_MIN_M", 4096)
+    pre._WS.clear()
+    pre._WS_STREAM.clear()
+
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 256, 512
+    w_q, w_s = _quantize_block(
+        torch.randn(n, k, device="cuda") * 0.02, fp8_dtype, BLOCK_N
+    )
+    kernel = _StubKernel()
+    layer = _StubLayer(w_q, w_s)
+
+    # Below the min-M table: the W8A16 tile kernel handles it.
+    small = torch.randn(64, k, device="cuda", dtype=torch.float16)
+    assert pre.try_prefill(kernel, layer, small, None) is None
+
+    # The W8A8 route (activation quantized in python) must never be intercepted.
+    big = torch.randn(4096, k, device="cuda", dtype=torch.float16)
+    kernel_quant = _StubKernel()
+    kernel_quant.apply_input_quant = True
+    assert pre.try_prefill(kernel_quant, layer, big, None) is None
+
+    # bf16 / non-K-major weights are not materialized either.
+    assert pre.try_prefill(kernel, layer, big.to(torch.bfloat16), None) is None
+    w_kmajor = w_q.t().contiguous().t()
+    assert pre.try_prefill(kernel, _StubLayer(w_kmajor, w_s), big, None) is None
+
+
+def test_prefill_route_falls_back_on_oom(fp8_ops, monkeypatch):
+    """A workspace OOM must return None (fall back), never raise."""
+    pre = _prefill_module()
+    monkeypatch.setattr(pre, "_MODE", "1")
+    monkeypatch.setattr(pre, "_DEFAULT_MIN_M", 0)
+    pre._WS.clear()
+    pre._WS_STREAM.clear()
+
+    torch.manual_seed(0)
+    fp8_dtype = torch.float8_e4m3fn
+    n, k = 256, 512
+    w_q, w_s = _quantize_block(
+        torch.randn(n, k, device="cuda") * 0.02, fp8_dtype, BLOCK_N
+    )
+    a = torch.randn(64, k, device="cuda", dtype=torch.float16)
+
+    real_empty = torch.empty
+
+    def _oom(*args, **kwargs):
+        if kwargs.get("dtype") is torch.float16:
+            raise torch.OutOfMemoryError("simulated workspace OOM")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", _oom)
+    assert pre.try_prefill(_StubKernel(), _StubLayer(w_q, w_s), a, None) is None
+
+
+def test_prefill_route_snapshot(monkeypatch):
+    """Regression guard: the (role, M) -> route decision must not drift."""
+    pre = _prefill_module()
+    monkeypatch.setattr(pre, "_MODE", "auto")
+    monkeypatch.setattr(pre, "_DEFAULT_MIN_M", 4096)
+
+    roles = ["gate_up_proj", "down_proj", "qkv_proj", "o_proj", "out_proj"]
+    table = {role: pre._min_m(role, None) for role in roles}
+    assert table == {role: 4096 for role in roles}
+    # Unknown role falls back to the default rather than routing everything.
+    assert pre._min_m("lm_head", None) == 4096
+
+    decisions = [
+        (m, m >= pre._min_m("down_proj", None) and m >= 16)
+        for m in (8, 16, 1024, 4095, 4096, 8192)
+    ]
+    assert decisions == [
+        (8, False),
+        (16, False),
+        (1024, False),
+        (4095, False),
+        (4096, True),
+        (8192, True),
+    ]
