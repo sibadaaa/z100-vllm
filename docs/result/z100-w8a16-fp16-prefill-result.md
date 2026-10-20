@@ -133,5 +133,12 @@ RN-EVEN。两侧各距精确值 0.5 ulp、彼此 ≤1 ulp——都是合法最�
 - W8A16 tile A 侧 staging 目前按 `uint32`（2 fp16/线程·次）；tile 相对现状 W8A8 在大 M
   慢 1.3×，但生产上 tile 只服务 M∈[16, min_m) 窄带——若后续要收窄该带，优先调
   `_ROLE_MIN_M`，其次评估 staging `uint4` 化。
-- **e2e（greedy parity / DFlash2 accept / 32k+64k soak）未跑**，需独立服务窗口
-  （W8A16=1 臂 + W8A8 臂各起一次）；晋级 commit（默认值 → `auto`）以 e2e 全绿为前提。
+- **e2e（greedy parity / DFlash2 accept / 32k+64k soak）未跑**——但按运维决定（2026-10-20
+  18:2x），生产已在 e2e 之前**直接启用**新路由：manager env `VLLM_DCU_FP8_W8A16=auto` +
+  `VLLM_DCU_FP16_PREFILL=auto` 注入，transient unit 重建，engine 已带新树 + `.so`
+  （`475d7eba…`）运行。启用证据链：manager env → unit 继承 → 集成探针（auto ⇒
+  `apply_input_quant=False` ⇒ W8A16 / prefill 按 min_m 表路由）→ live 日志无回退告警 →
+  多请求 smoke 正常。**注意：W8A16 与 W8A8 数值上必然不逐 bit 相同（激活不量化，更准）**，
+  greedy 输出可能与启用前有轻微差异；观察指标 = 异常输出/长稳 OOM/ITL 回归。
+  **回滚**：`systemctl --user unset-environment VLLM_DCU_FP8_W8A16 VLLM_DCU_FP16_PREFILL`
+  + 重启 unit（或换回基线 `.so`）。e2e parity/soak 仍建议尽快补做。
