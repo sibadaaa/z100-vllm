@@ -186,7 +186,11 @@ def fp8_to_fp16_lut(fp8_dtype: torch.dtype) -> torch.Tensor:
         (1.0 + man_f * mant_scale) * torch.pow(2.0, exp_f - bias),
     )
     out = sign * val
-    if inf_codes.any():
+    # Static branch: e4m3fn has no inf encoding (``inf_codes`` is all-False), so
+    # the e5m2-only where() is skipped and the table is bitwise unchanged.  A
+    # tensor predicate here (``if inf_codes.any():``) is a data-dependent branch
+    # that Dynamo cannot trace, which blocks torch.compile on gfx906.
+    if fp8_dtype == torch.float8_e5m2:
         out = torch.where(inf_codes, sign * float("inf"), out)
     out = torch.where(nan_codes, torch.tensor(float("nan")), out)
     lut = out.to(torch.float16)

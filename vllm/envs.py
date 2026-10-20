@@ -164,8 +164,18 @@ if TYPE_CHECKING:
     # Hygon DCU (DTK) overrides. VLLM_DCU_GCN_ARCH is an explicit escape
     # hatch for the GCN arch probe (DTK's amdsmi can return a bogus arch).
     VLLM_DCU_GCN_ARCH: str = ""
-    # "auto" probes the device, "1"/"0" force bf16 on/off on gfx906.
-    VLLM_DCU_BF16: str = "auto"
+    # Default "off": gfx906 runs fp16-only and bfloat16 model dtypes are
+    # coerced to fp16 at load. "1" opts back into the emulated bf16
+    # datapath, "auto" probes the device, "0" keeps it off explicitly.
+    VLLM_DCU_BF16: str = "off"
+    # Opt-in for the custom all-reduce on gfx906 PCIe-only multi-rank groups
+    # (WP2). Unset keeps the upstream topology gate (<= 2 PCIe GPUs).
+    VLLM_DCU_CUSTOM_AR: bool = False
+    # Allocation flag for the custom all-reduce IPC buffers, read by the C++
+    # side (csrc/custom_all_reduce.cu) via hipExtMallocWithFlags: "uncached"
+    # (default, upstream MI200 behavior), "finegrained" (gfx906 on DTK 26.04)
+    # or "default".
+    VLLM_DCU_CUSTOM_AR_ALLOC: str = ""
     # Master switch for the three gfx906 (Z100) emulation kernels: the W8A8
     # INT8 `v_dot4_i32_i8` kernel, the FP8 emulation kernel and the dense
     # fp16/bf16 decode GEMV (see
@@ -227,11 +237,12 @@ if TYPE_CHECKING:
     VLLM_DCU_FP8_FUSE_QUANT: bool = False
     # W8A16 route for the gfx906 FP8 emulation kernels: the activation is fed
     # as fp16 and is never quantized, only the weight stays fp8
-    # (docs/design/z100-w8a16-prefill-fp16-construction.md).  "0"/unset keeps
-    # the W8A8 path bit-for-bit; "1" requires the W8A16 op and raises at load
-    # if it (or a fp16 activation layer) is missing; "auto" uses it when the op
-    # exists and degrades to W8A8 for unsupported layers.
-    VLLM_DCU_FP8_W8A16: str = "0"
+    # (docs/design/z100-w8a16-prefill-fp16-construction.md).  "auto" (default)
+    # uses the W8A16 route whenever the built op is present and degrades to
+    # W8A8 for unsupported layers; "0" keeps the W8A8 path bit-for-bit; "1"
+    # requires the W8A16 op and raises at load if it (or a fp16 activation
+    # layer) is missing.
+    VLLM_DCU_FP8_W8A16: str = "auto"
     # Prefill fp16 weight materialization: dequantize the current layer into a
     # reused fp16 scratch and run rocBLAS `torch.mm` above a per-role token
     # count.  "0"/unset off; "1" force for every role from 16 tokens (ignores
@@ -1519,7 +1530,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bf16 availability on gfx906 (DTK): "auto" probes the device, "1" forces
     # bf16 on, "0" forces it off. gfx906 has no native bf16 instructions, so
     # bf16 is emulated and its usability is verified rather than assumed.
-    "VLLM_DCU_BF16": lambda: os.getenv("VLLM_DCU_BF16", "auto").strip().lower(),
+    "VLLM_DCU_BF16": lambda: os.getenv("VLLM_DCU_BF16", "off").strip().lower(),
+    "VLLM_DCU_CUSTOM_AR": lambda: (
+        os.getenv("VLLM_DCU_CUSTOM_AR", "").strip().lower() in ("1", "true")
+    ),
+    "VLLM_DCU_CUSTOM_AR_ALLOC": lambda: (
+        os.getenv("VLLM_DCU_CUSTOM_AR_ALLOC", "").strip()
+    ),
     # Master switch for the gfx906 emulation kernels (see the annotation
     # above). Per-kernel switches below override it when set explicitly.
     "VLLM_DCU_USE_GFX906_EMU": lambda: (
@@ -1573,9 +1590,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCU_FP8_FUSE_QUANT": lambda: (
         os.getenv("VLLM_DCU_FP8_FUSE_QUANT", "False").lower() in ("true", "1")
     ),
-    # W8A16 + prefill-materialization switches (tri-state "0"/"1"/"auto").
-    # Defaults keep the shipped W8A8 behaviour byte-for-byte.
-    "VLLM_DCU_FP8_W8A16": lambda: os.getenv("VLLM_DCU_FP8_W8A16", "0").strip().lower(),
+    # W8A16 + prefill materialization switches (tri-state "0"/"1"/"auto").
+    # The W8A16 default "auto" is an intentional behavior flip relative to
+    # earlier builds that shipped "0" (bit-for-bit W8A8): whenever the
+    # built op is present the W8A16 route is preferred and unsupported
+    # layers degrade to W8A8. Set "0" to restore the W8A8-only behavior;
+    # prefill materialization stays off by default either way.
+    "VLLM_DCU_FP8_W8A16": lambda: (
+        os.getenv("VLLM_DCU_FP8_W8A16", "auto").strip().lower()
+    ),
     "VLLM_DCU_FP16_PREFILL": lambda: (
         os.getenv("VLLM_DCU_FP16_PREFILL", "0").strip().lower()
     ),

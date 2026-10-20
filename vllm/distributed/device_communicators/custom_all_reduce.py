@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import Literal, cast
 
@@ -17,6 +18,7 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.hygon_dtk import dcu_custom_ar_enabled
 
 try:
     ops.meta_size()
@@ -34,6 +36,16 @@ logger = init_logger(__name__)
 
 _ReduceScatterBackend = Literal["legacy", "mnnvl_lamport", "mnnvl_multimem"]
 _MNNVL_MULTIMEM_REDUCE_SCATTER_WORLD_SIZES = (2, 4, 8)
+
+
+_DCU_CUSTOM_AR_ALGOS = ("1stage", "oneshot", "2stage", "twoshot")
+
+
+def _dcu_custom_ar_algo() -> str:
+    # Must match the exact strcmp values in csrc/custom_all_reduce.cuh: no
+    # strip/lower, so a value the C++ dispatch would reject at runtime is
+    # rejected here first and the RCCL all-reduce is kept instead.
+    return os.getenv("VLLM_CUSTOM_ALLREDUCE_ALGO", "")
 
 
 def _has_local_multicast_support(device: torch.device) -> bool:
@@ -268,12 +280,23 @@ class CustomAllreduce:
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if same_node and world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+            if dcu_custom_ar_enabled():
+                # Opt-in for gfx906 PCIe-only groups (WP2). Only warn: the
+                # kernels need VLLM_CUSTOM_ALLREDUCE_ALGO to be forced and
+                # peer P2P across the PCIe switch to actually work.
+                logger.warning(
+                    "Custom allreduce: enabling on a %d-rank PCIe-only group "
+                    "because VLLM_DCU_CUSTOM_AR=1. If this hangs, fall back "
+                    "to RCCL by unsetting the env var.",
+                    world_size,
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -511,6 +534,29 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
             return self.batch_invariant or inp_size < self.max_size
+        if dcu_custom_ar_enabled():
+            # WP2 opt-in for PCIe-only multi-rank groups. Without a forced
+            # algorithm the C++ dispatch launches nothing for this topology,
+            # which would return garbage instead of a reduction, and world
+            # sizes outside (2, 4, 6, 8) throw in the C++ dispatch.
+            if self.world_size not in (2, 4, 6, 8):
+                logger.warning_once(
+                    "VLLM_DCU_CUSTOM_AR=1 does not support a %d-rank "
+                    "PCIe-only group (the custom kernels only cover 2/4/6/8 "
+                    "GPUs); keeping the RCCL all-reduce.",
+                    self.world_size,
+                )
+                return False
+            algo = _dcu_custom_ar_algo()
+            if algo not in _DCU_CUSTOM_AR_ALGOS:
+                logger.warning_once(
+                    "VLLM_DCU_CUSTOM_AR=1 needs VLLM_CUSTOM_ALLREDUCE_ALGO="
+                    "2stage on a PCIe-only multi-rank group (exact values: "
+                    "1stage, oneshot, 2stage, twoshot); keeping the RCCL "
+                    "all-reduce."
+                )
+                return False
+            return inp_size < self.max_size
         return False
 
     def all_reduce(

@@ -272,7 +272,7 @@ def test_rocminfo_candidates_include_dtk(monkeypatch):
         ("off", True, False),
         ("auto", True, True),
         ("auto", False, False),
-        ("", True, True),
+        ("", True, False),
         ("", False, False),
     ],
 )
@@ -297,6 +297,106 @@ def test_gfx906_supported_dtypes_keep_fp16_first(monkeypatch):
         torch.bfloat16,
         torch.float32,
     ]
+
+
+def test_gfx906_bf16_default_off(monkeypatch):
+    """With VLLM_DCU_BF16 unset the default policy is off, not the probe."""
+    monkeypatch.delenv("VLLM_DCU_BF16", raising=False)
+    monkeypatch.setattr(hygon_dtk, "dcu_bf16_probe", lambda: True)
+    assert hygon_dtk.gfx906_bf16_enabled() is False
+
+
+def test_bf16_policy_warns_on_unrecognized_value(monkeypatch):
+    """An unrecognized VLLM_DCU_BF16 value falls back to 'off' with a warning."""
+    monkeypatch.setenv("VLLM_DCU_BF16", "disable")
+    assert hygon_dtk.bf16_policy() == "off"
+    # Empty string (unset) falls back to 'off' silently.
+    monkeypatch.setenv("VLLM_DCU_BF16", "")
+    assert hygon_dtk.bf16_policy() == "off"
+
+
+def test_use_custom_allreduce_gfx906_opt_in(monkeypatch):
+    """gfx906 joins the custom allreduce only via VLLM_DCU_CUSTOM_AR=1."""
+    rocm = pytest.importorskip("vllm.platforms.rocm")
+    monkeypatch.setattr(rocm, "_GCN_ARCH", "gfx906")
+    monkeypatch.setattr(rocm, "_ON_GFX906", True)
+
+    monkeypatch.setattr(rocm, "dcu_custom_ar_enabled", lambda: False)
+    assert rocm.RocmPlatform.use_custom_allreduce() is False
+    monkeypatch.setattr(rocm, "dcu_custom_ar_enabled", lambda: True)
+    assert rocm.RocmPlatform.use_custom_allreduce() is True
+
+    # MI300-class arches keep their unconditional opt-in.
+    monkeypatch.setattr(rocm, "_GCN_ARCH", "gfx942")
+    monkeypatch.setattr(rocm, "_ON_GFX906", False)
+    monkeypatch.setattr(rocm, "dcu_custom_ar_enabled", lambda: False)
+    assert rocm.RocmPlatform.use_custom_allreduce() is True
+
+
+def test_should_custom_ar_dcu_pcie_branch(monkeypatch):
+    """PCIe-only multi-rank gate: forced algo, world size, and opt-in flag."""
+    torch = pytest.importorskip("torch")
+    ca = pytest.importorskip(
+        "vllm.distributed.device_communicators.custom_all_reduce"
+    )
+
+    def make(world_size):
+        # Bypass __init__: only the attributes should_custom_ar reads matter.
+        obj = ca.CustomAllreduce.__new__(ca.CustomAllreduce)
+        obj.disabled = False
+        obj.world_size = world_size
+        obj.max_size = 8192 * 1024
+        obj.batch_invariant = False
+        obj.fully_connected = False
+        return obj
+
+    # 2048 B fp16, 16-byte aligned, so the upstream dtype/alignment gates pass.
+    x = torch.zeros(1024, dtype=torch.float16)
+
+    monkeypatch.setattr(ca, "dcu_custom_ar_enabled", lambda: True)
+
+    # No forced algo: the C++ dispatch would launch nothing (garbage out),
+    # so the RCCL all-reduce is kept.
+    monkeypatch.setattr(ca, "_dcu_custom_ar_algo", lambda: "")
+    assert make(4).should_custom_ar(x) is False
+
+    # Forced algo: custom kernels are used.
+    monkeypatch.setattr(ca, "_dcu_custom_ar_algo", lambda: "2stage")
+    assert make(4).should_custom_ar(x) is True
+
+    # World sizes 3/5/7 throw in the C++ dispatch and must never reach it.
+    assert make(3).should_custom_ar(x) is False
+
+    # The algo value must match the C++ strcmp values exactly (no case fold).
+    monkeypatch.setattr(ca, "_dcu_custom_ar_algo", lambda: "2Stage")
+    assert make(4).should_custom_ar(x) is False
+
+    # Without the opt-in, the upstream gate (False for >2 PCIe GPUs) holds.
+    monkeypatch.setattr(ca, "dcu_custom_ar_enabled", lambda: False)
+    monkeypatch.setattr(ca, "_dcu_custom_ar_algo", lambda: "2stage")
+    assert make(4).should_custom_ar(x) is False
+
+
+def test_gfx906_coerce_model_dtype(monkeypatch):
+    """gfx906_coerce_model_dtype: bf16 -> fp16 unless the user opts in."""
+    torch = pytest.importorskip("torch")
+    rocm = pytest.importorskip("vllm.platforms.rocm")
+    monkeypatch.setattr(rocm, "_ON_GFX906", True)
+
+    # Default (bf16 off): bfloat16 coerces to float16, the rest passes through.
+    monkeypatch.setattr(rocm, "gfx906_bf16_enabled", lambda: False)
+    assert rocm.gfx906_coerce_model_dtype(torch.bfloat16) is torch.float16
+    assert rocm.gfx906_coerce_model_dtype(torch.float16) is torch.float16
+    assert rocm.gfx906_coerce_model_dtype(torch.float32) is torch.float32
+
+    # Opt-in (VLLM_DCU_BF16=1 / probe pass): bfloat16 stays bfloat16.
+    monkeypatch.setattr(rocm, "gfx906_bf16_enabled", lambda: True)
+    assert rocm.gfx906_coerce_model_dtype(torch.bfloat16) is torch.bfloat16
+
+    # Off gfx906: no coercion, other arches keep their bf16 support.
+    monkeypatch.setattr(rocm, "_ON_GFX906", False)
+    monkeypatch.setattr(rocm, "gfx906_bf16_enabled", lambda: False)
+    assert rocm.gfx906_coerce_model_dtype(torch.bfloat16) is torch.bfloat16
 
 
 def test_get_gcn_arch_normalizes_amdsmi_hygon_alias(monkeypatch):

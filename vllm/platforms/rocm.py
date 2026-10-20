@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .hygon_dtk import (
+    dcu_custom_ar_enabled,
     dcu_device_memory_total_bytes,
     dcu_device_unique_id,
     gcn_arch,
@@ -283,11 +284,13 @@ def _rocm_supported_dtypes() -> list[torch.dtype]:
 
     gfx906 (Vega20 / Hygon DCU Z100) has no bf16 instructions at all: the
     ISA provides neither a bf16 conversion nor a bf16 dot product, so any
-    bf16 math is emulated in software. Emulation can still be numerically
-    correct, so gfx906 bf16 is offered only when the device probe (see
-    ``vllm.platforms.hygon_dtk``) confirms it, or when the user forces it
-    with ``VLLM_DCU_BF16=1``. float16 stays first, so ``--dtype auto`` keeps
-    preferring the natively accelerated dtype.
+    bf16 math is emulated in software -- and the emulated bf16 GEMM is the
+    slowest of the three precisions (measured 8.2 vs 10.5 TFLOP/s fp32 at
+    4096^3 on Z100L; fp16 reaches 18.2). The default is therefore
+    fp16-only: bf16 is offered only when the user opts back in with
+    ``VLLM_DCU_BF16=1`` (or ``=auto`` with a passing device probe, see
+    ``vllm.platforms.hygon_dtk``). float16 stays first, so ``--dtype auto``
+    keeps preferring the natively accelerated dtype.
 
     Both stacks are covered: the probe runs torch ops only, and on the
     ROCm 10.1 stack real-model bf16 execution was verified correct (Qwen3-0.6B
@@ -302,6 +305,29 @@ def _rocm_supported_dtypes() -> list[torch.dtype]:
             dtypes.insert(1, torch.bfloat16)
         return dtypes
     return [torch.float16, torch.bfloat16, torch.float32]
+
+
+def gfx906_coerce_model_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Coerce a requested model dtype for gfx906 (Z100).
+
+    gfx906 has no native bf16 hardware: every bf16 op is emulated in
+    software and the emulated bf16 GEMM is the slowest of the three
+    precisions. Unless the user opts back in with ``VLLM_DCU_BF16``, a
+    bfloat16 request is coerced to float16 at load so every op runs on
+    its fp16 kernel; the weights convert once through fp32 with the
+    standard fp16 inference semantics. Non-bf16 dtypes and non-gfx906
+    platforms pass through unchanged.
+    """
+    if dtype != torch.bfloat16 or not _ON_GFX906:
+        return dtype
+    if gfx906_bf16_enabled():
+        return dtype
+    logger.warning_once(
+        "gfx906 (Z100) has no native bfloat16: coercing the requested "
+        "bfloat16 model dtype to float16 (weights convert at load). Set "
+        "VLLM_DCU_BF16=1 to keep the emulated bf16 datapath instead."
+    )
+    return torch.float16
 
 
 def _set_rocm_nccl_workarounds():
@@ -1353,7 +1379,10 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
+            return True
+        # gfx906 is opt-in only: VLLM_DCU_CUSTOM_AR=1, off by default.
+        return _ON_GFX906 and dcu_custom_ar_enabled()
 
     @classmethod
     def opaque_attention_op(cls) -> bool:

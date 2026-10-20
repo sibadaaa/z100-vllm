@@ -1,5 +1,8 @@
 #include "torch_utils.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include <torch/csrc/stable/macros.h>
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/tensor.h>
@@ -154,6 +157,36 @@ void register_graph_buffers(fptr_t _fa,
   fa->register_graph_buffers(bytes, offsets);
 }
 
+namespace {
+#if defined(USE_ROCM)
+// Allocation flag for the custom all-reduce IPC buffers.
+//
+// VLLM_DCU_CUSTOM_AR_ALLOC selects the hipExtMallocWithFlags flag; unset (or
+// an empty value) keeps the upstream behavior bit for bit. gfx906 on DTK 26.04
+// needs "finegrained": hipDeviceMallocUncached (0x3) always returns
+// hipErrorOutOfMemory there. Read once per process.
+unsigned int dcu_custom_ar_alloc_flags() {
+  static const unsigned int cached = []() -> unsigned int {
+    const char* val = std::getenv("VLLM_DCU_CUSTOM_AR_ALLOC");
+    if (val == nullptr || val[0] == '\0' || std::strcmp(val, "uncached") == 0) {
+      return hipDeviceMallocUncached;
+    }
+    if (std::strcmp(val, "finegrained") == 0) {
+      return hipDeviceMallocFinegrained;
+    }
+    if (std::strcmp(val, "default") == 0) {
+      return hipDeviceMallocDefault;
+    }
+    STD_TORCH_CHECK(false,
+                    "Invalid VLLM_DCU_CUSTOM_AR_ALLOC=", val,
+                    ". Valid values: uncached (default), finegrained, default");
+    return hipDeviceMallocUncached;  // unreachable
+  }();
+  return cached;
+}
+#endif
+}  // namespace
+
 std::tuple<fptr_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
     int64_t size) {
   int device_index;
@@ -166,9 +199,10 @@ std::tuple<fptr_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
 
   // Allocate buffer
 #if defined(USE_ROCM)
-  // data buffers need to be "uncached" for signal on MI200
-  STD_CUDA_CHECK(
-      hipExtMallocWithFlags((void**)&buffer, size, hipDeviceMallocUncached));
+  // data buffers default to "uncached" (upstream MI200 behavior);
+  // VLLM_DCU_CUSTOM_AR_ALLOC=finegrained is required on gfx906/DTK 26.04.
+  STD_CUDA_CHECK(hipExtMallocWithFlags((void**)&buffer, size,
+                                       dcu_custom_ar_alloc_flags()));
 #else
   STD_CUDA_CHECK(cudaMalloc((void**)&buffer, size));
 #endif

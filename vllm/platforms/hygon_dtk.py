@@ -20,8 +20,14 @@ ROCm installation, so callers keep their existing code path.
 
 Related environment variables:
     VLLM_DCU_GCN_ARCH: explicit GCN arch override, bypasses all probing.
-    VLLM_DCU_BF16: ``auto`` (default, probe the device), ``1`` to force
-        bf16 on, ``0`` to force it off.
+    VLLM_DCU_BF16: ``off`` (default: gfx906 coerces bfloat16 to fp16 at
+        load), ``1`` to force the emulated bf16 datapath on, ``auto`` to
+        probe the device, ``0`` to force it off.
+    VLLM_DCU_CUSTOM_AR: ``1`` opts a gfx906 PCIe-only multi-rank group into
+        the custom all-reduce (WP2); unset keeps the upstream topology gate.
+    VLLM_DCU_CUSTOM_AR_ALLOC: allocation flag for the custom all-reduce IPC
+        buffers (C++ side): ``uncached`` (default, upstream MI200 behavior),
+        ``finegrained`` (gfx906 on DTK 26.04) or ``default``.
 """
 
 from __future__ import annotations
@@ -321,13 +327,31 @@ def gcn_arch(device_index: int = 0) -> str | None:
 
 
 def bf16_policy() -> str:
-    """``VLLM_DCU_BF16`` as one of ``auto``/``on``/``off``."""
+    """``VLLM_DCU_BF16`` as one of ``on``/``off``/``auto`` (default ``off``)."""
     raw = envs.VLLM_DCU_BF16.strip().lower()
     if raw in ("1", "true", "on", "yes", "force"):
         return "on"
     if raw in ("0", "false", "off", "no"):
         return "off"
-    return "auto"
+    if raw == "auto":
+        return "auto"
+    if raw:
+        logger.warning_once(
+            "Unrecognized VLLM_DCU_BF16=%r; treating it as 'off' (valid "
+            "values: 1/true/on/yes/force, 0/false/off/no, auto).",
+            raw,
+        )
+    return "off"
+
+
+def dcu_custom_ar_enabled() -> bool:
+    """Whether ``VLLM_DCU_CUSTOM_AR=1`` opts into the custom all-reduce.
+
+    Single source of truth shared by the ``RocmPlatform.use_custom_allreduce``
+    gate and the ``CustomAllreduce`` topology gate. Unset keeps every default
+    gate unchanged.
+    """
+    return envs.VLLM_DCU_CUSTOM_AR
 
 
 @lru_cache(maxsize=1)
@@ -416,8 +440,10 @@ def _run_bf16_probe(torch) -> bool:
 def gfx906_bf16_enabled() -> bool:
     """Whether bf16 should be offered as a supported dtype on gfx906.
 
-    ``VLLM_DCU_BF16=1`` forces it on (useful to experiment), ``=0`` forces
-    it off, and the default probes the device.
+    Default ``off``: bfloat16 requests are coerced to float16 at load (see
+    ``vllm.platforms.rocm.gfx906_coerce_model_dtype``). ``VLLM_DCU_BF16=1``
+    opts back into the emulated bf16 datapath, ``=0`` keeps it off
+    explicitly, and ``auto`` probes the device.
     """
     policy = bf16_policy()
     if policy == "on":

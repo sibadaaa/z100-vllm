@@ -2714,6 +2714,15 @@ def _get_and_verify_dtype(
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
 
+    # gfx906 (Z100) entry-level bf16 -> fp16 handling: unless the emulated
+    # bf16 datapath is explicitly enabled, a bfloat16 request loads the
+    # model as float16 so every op runs on its fp16 kernel. Imported lazily
+    # so non-ROCm platforms never load the rocm platform module from here.
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import gfx906_coerce_model_dtype
+
+        torch_dtype = gfx906_coerce_model_dtype(torch_dtype)
+
     _check_valid_dtype(model_type, torch_dtype)
 
     if torch_dtype != config_dtype:
