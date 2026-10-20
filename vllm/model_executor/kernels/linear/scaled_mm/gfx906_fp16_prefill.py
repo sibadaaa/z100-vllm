@@ -227,6 +227,10 @@ def _try_prefill(
         block_k,
     )
     out = torch.mm(x.view(m, K), w16.t())
+    # Contract §1.2: the bias is added in out_dtype, after the output cast --
+    # the same order as the emu kernel's epilogue (matters only when out_dtype
+    # is fp32; production fp16 makes the cast a no-op).
+    out = out.to(dtype=kernel.config.out_dtype)
     if bias is not None:
         out = out + bias.to(dtype=out.dtype)
-    return out.to(dtype=kernel.config.out_dtype).view(*x.shape[:-1], N)
+    return out.view(*x.shape[:-1], N)

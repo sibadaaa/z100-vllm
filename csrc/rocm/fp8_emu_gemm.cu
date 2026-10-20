@@ -2265,6 +2265,23 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
 // ---------------------------------------------------------------------------
 // W8A16 host side
 // ---------------------------------------------------------------------------
+// GEMV threshold for the W8A16 M branch.  The W8A8 route splits gemv/gemm on
+// the python side with `_GEMV_MAX_M` (VLLM_DCU_FP8_GEMV_MAX_M); the W8A16
+// entry owns the branch (routing matrix in
+// docs/design/z100-w8a16-prefill-fp16-construction.md §3), so it reads the
+// same knob once per process here (invariant 5: never per call) and clamps it
+// to the compiled GEMV range.
+int w8a16_gemv_max_m() {
+  static const int m = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_MAX_M");
+    if (e == nullptr) return kMsMax;
+    const int v = std::atoi(e);
+    if (v < 1) return 1;
+    return v > kMsMax ? kMsMax : v;
+  }();
+  return m;
+}
+
 void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
                        const torch::Tensor& w_s, const torch::Tensor& lut,
                        const std::optional<torch::Tensor>& bias,
@@ -2272,12 +2289,23 @@ void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
                        int64_t block_k, int64_t& w_stride, int& nkb) {
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && w_s.is_cuda() && lut.is_cuda(),
               "fp8_emu_block_w8a16: all tensors must be on the GPU");
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu_block_w8a16: a and w must be 2-D, got ",
+              a.dim(), " and ", w.dim());
   TORCH_CHECK(a.scalar_type() == at::kHalf,
               "fp8_emu_block_w8a16: activations must be float16 (gfx906 has no "
               "bf16 datapath), got ",
               a.scalar_type());
   TORCH_CHECK(a.is_contiguous(),
               "fp8_emu_block_w8a16: `a` must be contiguous");
+  // Unlike the W8A8 route (whose A is a fresh quantizer output), the W8A16
+  // activation is the caller's raw tensor and every kernel loads it through
+  // 4-byte dwords (the streaming variant through 16-byte uint4, gated in
+  // `run_block_w8a16`), so an odd-element view must fail loudly instead of
+  // trapping on a misaligned address.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(a.data_ptr()) % 4 == 0,
+              "fp8_emu_block_w8a16: `a` must be 4-byte aligned (got a "
+              "2-byte-aligned view); call .contiguous() on it");
   TORCH_CHECK(w.element_size() == 1,
               "fp8_emu_block_w8a16: `w` must be an 8-bit (fp8) tensor");
   TORCH_CHECK(w.stride(1) == 1 && w.stride(0) > 0,
@@ -2354,7 +2382,13 @@ void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
                                  (int)block_k, stream_block_mode(), s_rows,
                                  s_nt)
            : 0;
-  const bool use_stream = (s_mode != 0);
+  bool use_stream = (s_mode != 0);
+  // The streaming kernels copy A as flat uint4 (16 B), one step beyond the
+  // 4-byte guarantee checked above.  An activation that only meets the dword
+  // alignment still runs -- on the non-streaming GEMV, whose staging reads
+  // dwords -- so this stays a silent, correctness-preserving fallback.
+  if (use_stream && (reinterpret_cast<uintptr_t>(a.data_ptr()) % 16) != 0)
+    use_stream = false;
   // Same decode policy as the W8A8 route: M = 5..8 is M-flat on the tile and
   // cheaper there than on the streaming GEMV.
   const bool gemv_use_gemm = gemv && !use_stream && M > 4;
@@ -3083,8 +3117,9 @@ torch::Tensor fp8_emu_gemm_block_w8a16(torch::Tensor a, torch::Tensor w,
 
   const c10::cuda::CUDAGuard guard(a.device());
   auto out = at::empty({M, w.size(0)}, a.options().dtype(out_dtype));
-  run_block_w8a16(a, w, w_s, lut, bias, out, /*gemv=*/M <= kMsMax, (int)nthreads,
-                  (int)cfg, block_n, block_k);
+  run_block_w8a16(a, w, w_s, lut, bias, out,
+                  /*gemv=*/M <= w8a16_gemv_max_m(), (int)nthreads, (int)cfg,
+                  block_n, block_k);
   return out;
 }
 

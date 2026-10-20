@@ -194,6 +194,15 @@ def _device_lut(fp8_dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 _W8A16_MODE = str(envs.VLLM_DCU_FP8_W8A16).strip().lower()
 _W8A16 = _W8A16_MODE in ("1", "auto")
 
+# Cheap pre-filter for the prefill-materialization hook in ``apply_weights``:
+# with VLLM_DCU_FP16_PREFILL at its default ("0") the override must not touch
+# the router at all -- the hook would otherwise add a call + attribute lookup
+# to every layer of every step, the very per-layer host cost this workstream
+# removes.  The router itself re-checks the switch and the dequant op (the
+# authoritative ``gfx906_fp16_prefill._enabled``); this constant only decides
+# whether that check runs.
+_PREFILL_ROUTE = str(envs.VLLM_DCU_FP16_PREFILL).strip().lower() in ("1", "auto")
+
 # Eager fast path (S23 O1).  The custom_ops below exist only so Dynamo gets a
 # shape contract; while eager that contract buys nothing, but its schema
 # check, dispatcher hop and Python frame cost 31-55 us per call, 256 calls per
@@ -295,7 +304,9 @@ def _fp8_emu_mm_block_w8a16_impl(
 
     ``a`` is fp16 and is *not* quantized; there is no activation scale.  The
     M branch (decode GEMV/stream vs tiled GEMM) stays inside the opaque body so
-    Dynamo never sees a symbolic-M branch (S11k).
+    Dynamo never sees a symbolic-M branch (S11k); the decode arm always passes
+    cfg 0 (the kernel's auto rule picks the exact-M decode tile), so a prefill
+    tile chosen for a large-M layer can never leak into a decode call.
 
     Args:
         a: Activations, ``[M, K]`` float16, contiguous.
@@ -305,7 +316,7 @@ def _fp8_emu_mm_block_w8a16_impl(
         bias: Optional ``[N]`` bias in ``out_dtype``.
         out_dtype: Output dtype.
         nthreads: Decode GEMV launch width.
-        cfg: Tile selector; 0 = the kernel's auto rule.
+        cfg: Tile selector for the M > GEMV-max arm; 0 = the kernel's auto rule.
         block_n: Weight block rows.
         block_k: Weight block columns.
 
@@ -313,6 +324,10 @@ def _fp8_emu_mm_block_w8a16_impl(
         ``[M, N]`` output in ``out_dtype``.
 
     """
+    if a.shape[0] <= _GEMV_MAX_M:
+        return torch.ops._rocm_C.fp8_emu_gemm_block_w8a16(
+            a, w, w_s, lut, bias, out_dtype, nthreads, 0, block_n, block_k
+        )
     return torch.ops._rocm_C.fp8_emu_gemm_block_w8a16(
         a, w, w_s, lut, bias, out_dtype, nthreads, cfg, block_n, block_k
     )
@@ -858,11 +873,12 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             ``[*x.shape[:-1], N]`` in the layer's configured out dtype.
 
         """
-        from . import gfx906_fp16_prefill
+        if _PREFILL_ROUTE:
+            from . import gfx906_fp16_prefill
 
-        routed = gfx906_fp16_prefill.try_prefill(self, layer, x, bias)
-        if routed is not None:
-            return routed
+            routed = gfx906_fp16_prefill.try_prefill(self, layer, x, bias)
+            if routed is not None:
+                return routed
         return super().apply_weights(layer, x, bias, **kwargs)
 
     def apply_block_scaled_mm(
