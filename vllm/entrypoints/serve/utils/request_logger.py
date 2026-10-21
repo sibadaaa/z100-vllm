@@ -71,13 +71,18 @@ class RequestLogger:
         )
 
     def log_request_body(self, request: AnyRequest | AnyPoolingRequest) -> None:
+        level_name = envs.VLLM_REQUEST_BODY_LOG_LEVEL
         try:
-            level = logging.getLevelNamesMapping()[envs.VLLM_REQUEST_BODY_LOG_LEVEL]
+            level = logging.getLevelNamesMapping()[level_name]
+        except AttributeError:  # Python < 3.11
+            level = logging.getLevelName(level_name)
         except KeyError:
+            level = logging.getLevelName(level_name)
+        if not isinstance(level, int):
             logger.warning_once(
                 "Invalid logging level for request content: %s. "
                 "Request JSON body will not be logged.",
-                envs.VLLM_REQUEST_BODY_LOG_LEVEL,
+                level_name,
             )
             return
 
