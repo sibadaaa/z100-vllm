@@ -84,6 +84,12 @@ _ENV_MIN_M = envs.VLLM_DCU_FP16_PREFILL_MIN_M
 if _ENV_MIN_M > 0:
     _DEFAULT_MIN_M = _ENV_MIN_M
 
+logger.info(
+    "gfx906 fp16 prefill materialization: VLLM_DCU_FP16_PREFILL=%s, "
+    "role min_m %s, default %d.",
+    envs.VLLM_DCU_FP16_PREFILL, _ROLE_MIN_M, _DEFAULT_MIN_M,
+)
+
 # Minimum workspace size in bytes (0 = size it from the weight); a bigger layer
 # still grows the buffer.  Only useful with eager execution: under CUDA-graph
 # capture the stream-affine guard declines the route regardless (see the module
@@ -121,6 +127,10 @@ def _role(layer: torch.nn.Module) -> str:
 # "1" means "force": the route engages as soon as the tile path is meaningful
 # (M >= 16), regardless of the per-role table.  "auto" follows the table.
 _FORCE_MIN_M = 16
+
+# Set once the first call actually goes through dequant + rocBLAS; backs the
+# one-time "route engaged" INFO line.
+_ROUTE_SEEN = False
 
 
 def _min_m(role: str, _w: torch.Tensor | None) -> int:
@@ -288,6 +298,14 @@ def _try_prefill(
         block_k,
     )
     out = torch.mm(x.view(m, K), w16.t())
+    global _ROUTE_SEEN
+    if not _ROUTE_SEEN:
+        _ROUTE_SEEN = True
+        logger.info(
+            "gfx906 fp16 prefill: first materialization route engaged "
+            "(role=%s, M=%d, N=%d, K=%d); further routes are silent.",
+            role, m, N, K,
+        )
     # Contract §1.2: the bias is added in out_dtype, after the output cast --
     # the same order as the emu kernel's epilogue (matters only when out_dtype
     # is fp32; production fp16 makes the cast a no-op).

@@ -643,6 +643,15 @@ if hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16"):
 # disagree.
 _W8A16_ENGAGED = _W8A16 and ops_available_block_w8a16()
 
+# The route engages silently by design ("auto" never warns); without a positive
+# line in the log an operator cannot tell the W8A16 and W8A8 paths apart from
+# serving output alone (P0 retest, 2026-10-21).
+logger.info(
+    "gfx906 fp8-emu route: VLLM_DCU_FP8_W8A16=%s, W8A16 engaged=%s "
+    "(built op %s), GEMV_MAX_M=%d.",
+    _W8A16_MODE, _W8A16_ENGAGED, ops_available_block_w8a16(), _GEMV_MAX_M,
+)
+
 
 def _w8a16_applies(input_dtype: torch.dtype) -> bool:
     """Whether a layer with this activation dtype takes the W8A16 route.
