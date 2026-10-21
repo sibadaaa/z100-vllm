@@ -1004,6 +1004,139 @@ def test_prefill_route_snapshot(monkeypatch):
     ]
 
 
+def test_prefill_workspace_declines_during_capture(monkeypatch):
+    """The scratch must never be served inside a CUDA graph capture.
+
+    Regression guard: ``_workspace`` used to decline during capture only when
+    it would have to allocate, so a buffer pre-allocated by an eager warmup
+    (piecewise cudagraph capture always has one) was handed to the captured
+    dequant + rocBLAS mm anyway.
+    """
+    pre = _prefill_module()
+    pre._WS.clear()
+    pre._WS_STREAM.clear()
+    try:
+        w = torch.empty(8, 64, dtype=torch.float8_e4m3fn, device="cuda")
+        key = (w.device.index, torch.float16)
+        pre._WS[key] = torch.empty(1024, dtype=torch.float16, device="cuda")
+        pre._WS_STREAM[key] = torch.cuda.current_stream(w.device).cuda_stream
+
+        # Eager: the pre-existing, same-stream buffer is served.
+        assert pre._workspace(w) is pre._WS[key]
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = pre._workspace(w)
+            assert captured is None
+            # Keep the capture non-empty.
+            pre._WS[key].fill_(0.0)
+    finally:
+        pre._WS.clear()
+        pre._WS_STREAM.clear()
+
+
+def test_prefill_route_auto_op_matches_eager(w8a16_ops, monkeypatch):
+    """The traced entry point must reproduce the eager (role, M) decision.
+
+    ``torch.compile`` sees a symbolic token count, so the whole route decision
+    moved into ``vllm::fp8_emu_mm_block_w8a16_auto``.  Its body runs eagerly and
+    must therefore agree with the router on both arms: below the threshold the
+    W8A16 tile kernel, above it the fp16 materialization.
+    """
+    pre = _prefill_module()
+    monkeypatch.setattr(pre, "_MODE", "auto")
+    monkeypatch.setattr(pre, "_DEFAULT_MIN_M", 16)
+    pre._WS.clear()
+    pre._WS_STREAM.clear()
+
+    torch.manual_seed(0)
+    n, k = 256, 512
+    w_q, w_s = _quantize_block(
+        torch.randn(n, k, device="cuda") * 0.02, torch.float8_e4m3fn, BLOCK_N
+    )
+    kernel = _StubKernel()
+    layer = _StubLayer(w_q, w_s)
+
+    lut = w8a16_ops(torch.float8_e4m3fn)
+    # M below the floor: the router declines and the op must fall back to the
+    # same W8A16 tile kernel.
+    a = torch.randn(8, k, device="cuda", dtype=torch.float16) * 0.5
+    assert pre.try_prefill(kernel, layer, a, None) is None
+    tile = pre.materialize_or_tile(
+        a, w_q, w_s, None, torch.float16, BLOCK_N, BLOCK_K, 16
+    )
+    assert _cos(tile, _w8a16(a, w_q, w_s, lut, out_dtype=torch.float16)) >= 0.999999
+
+    # M above it: both take the materialization arm and agree bit-for-bit.
+    a = torch.randn(64, k, device="cuda", dtype=torch.float16) * 0.5
+    routed = pre.materialize_or_tile(
+        a, w_q, w_s, None, torch.float16, BLOCK_N, BLOCK_K, 16
+    )
+    eager = pre.try_prefill(kernel, layer, a, None)
+    assert routed.shape == (64, n) and routed.dtype == torch.float16
+    assert torch.equal(routed, eager)
+
+    bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    routed_b = pre.materialize_or_tile(
+        a, w_q, w_s, bias, torch.float16, BLOCK_N, BLOCK_K, 16
+    )
+    assert torch.equal(routed_b, pre.try_prefill(kernel, layer, a, bias))
+
+
+def test_prefill_route_traces_under_compile(w8a16_ops, monkeypatch):
+    """Fullgraph compile must accept the route and keep both M arms correct."""
+    pre = _prefill_module()
+    monkeypatch.setattr(pre, "_MODE", "auto")
+    monkeypatch.setattr(pre, "_DEFAULT_MIN_M", 16)
+    pre._WS.clear()
+    pre._WS_STREAM.clear()
+
+    torch.manual_seed(0)
+    n, k = 256, 512
+    w_q, w_s = _quantize_block(
+        torch.randn(n, k, device="cuda") * 0.02, torch.float8_e4m3fn, BLOCK_N
+    )
+
+    def fn(x, w, w_s, bias):
+        return torch.ops.vllm.fp8_emu_mm_block_w8a16_auto(
+            x, w, w_s, bias, torch.float16, BLOCK_N, BLOCK_K, 16
+        )
+
+    compiled = torch.compile(fn, fullgraph=True, dynamic=True)
+    for m in (8, 64):
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
+        out = compiled(a, w_q, w_s, None)
+        ref = pre.materialize_or_tile(
+            a, w_q, w_s, None, torch.float16, BLOCK_N, BLOCK_K, 16
+        )
+        assert out.shape == (m, n)
+        assert _cos(out, ref) >= 0.999999
+
+
+def test_lut_op_matches_device_lut(w8a16_ops):
+    """The opaque LUT lookup must return the same table as the eager helper."""
+    import vllm.model_executor.kernels.linear.scaled_mm.gfx906_fp8 as fp8
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    ref = torch.empty(1, device=device, dtype=torch.float16)
+    for dtype, code in (
+        (torch.float8_e4m3fn, 0),
+        (torch.float8_e5m2, 1),
+    ):
+        op_lut = torch.ops.vllm.fp8_emu_lut(ref, code)
+        assert op_lut.device == device
+        assert torch.equal(op_lut, fp8._device_lut(dtype, device))
+
+    def fn(ref, code):
+        return torch.ops.vllm.fp8_emu_lut(ref, code)
+
+    compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+    ref = torch.empty(1, device=device, dtype=torch.float16)
+    out = compiled(ref, 0)
+    assert out.device == device
+    assert torch.equal(out, fp8._device_lut(torch.float8_e4m3fn, device))
+
+
 # ---------------------------------------------------------------------------
 # W8A16 routing-layer unit tests (pure python: no kernel launch, no GPU work)
 # ---------------------------------------------------------------------------

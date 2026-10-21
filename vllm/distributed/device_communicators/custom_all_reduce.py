@@ -530,6 +530,20 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
+        # gfx906 is opt-in only (RocmPlatform.use_custom_allreduce), so when
+        # this gate is reachable at all VLLM_DCU_CUSTOM_AR=1 is set -- it must
+        # sit *above* the world_size==2 / fully_connected early return below,
+        # which would otherwise let bf16 through on the same broken kernel.
+        # The gfx906 _C build has no bf16 allreduce instantiation: the C++
+        # dispatch throws "custom allreduce only supports float32, float16
+        # and bfloat16" for it (Z100 e2e 2026-10-21). The DFlash draft tower
+        # is bf16, so those tensors keep RCCL; fp16/fp32 use CUSTOM.
+        if dcu_custom_ar_enabled() and inp.dtype == torch.bfloat16:
+            logger.warning_once(
+                "VLLM_DCU_CUSTOM_AR=1: bf16 all-reduce keeps RCCL (gfx906 "
+                "custom-AR build has no bf16 kernel); fp16/fp32 use CUSTOM."
+            )
+            return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:

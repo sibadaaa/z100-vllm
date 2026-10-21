@@ -457,9 +457,21 @@ class InprocClient(EngineCoreClient):
         )
 
     async def profile_async(
-        self, is_start: bool = True, profile_prefix: str | None = None
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
     ) -> None:
-        self.profile(is_start, profile_prefix)
+        # AsyncLLM.start_profile forwards all four args positionally; the
+        # inproc path already supports them in profile() -- keep parity with
+        # SyncMPClient instead of dropping the iteration-session args.
+        self.profile(
+            is_start,
+            profile_prefix,
+            delay_iterations=delay_iterations,
+            max_iterations=max_iterations,
+        )
 
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()

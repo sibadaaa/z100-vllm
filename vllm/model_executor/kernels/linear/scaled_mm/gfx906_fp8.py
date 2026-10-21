@@ -208,6 +208,42 @@ def _device_lut(fp8_dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     return fp8_to_fp16_lut(fp8_dtype).to(device)
 
 
+def _register_fp8_emu_lut() -> None:
+    """``torch.library.custom_op`` wrapper for the LUT lookup (S26).
+
+    Dynamo inlines ``functools.lru_cache``-wrapped helpers, so a traced call to
+    :func:`_device_lut` puts the whole 256-entry table construction (25 tensor
+    ops on a 256-element tensor plus the H2D copy) into the compiled graph,
+    once per layer and per step.  An opaque op keeps it out: the body runs
+    eagerly and hits the cache.
+    """
+    if hasattr(torch.ops.vllm, "fp8_emu_lut"):
+        return
+
+    @torch.library.custom_op("vllm::fp8_emu_lut", mutates_args=())
+    def fp8_emu_lut(ref: torch.Tensor, dtype_code: int) -> torch.Tensor:
+        # ``ref`` is only the tracing anchor; the table is dtype/device keyed.
+        dtype = torch.float8_e5m2 if dtype_code else torch.float8_e4m3fn
+        return _device_lut(dtype, ref.device)
+
+    @fp8_emu_lut.register_fake
+    def _(ref: torch.Tensor, dtype_code: int) -> torch.Tensor:
+        return torch.empty(256, dtype=torch.float16, device=ref.device)
+
+
+def _lut_for(ref: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
+    """LUT for a caller that may be traced; eager callers keep the plain path.
+
+    The op needs at least one tensor argument: with none, AOT turns the call
+    into a compile-time constant and hands back a Meta tensor.
+    """
+    if not torch.compiler.is_compiling():
+        return _device_lut(fp8_dtype, ref.device)
+    return torch.ops.vllm.fp8_emu_lut(
+        ref, 1 if fp8_dtype == torch.float8_e5m2 else 0
+    )
+
+
 # W8A16 route (docs/design/z100-w8a16-prefill-fp16-construction.md): the
 # activation arrives as fp16 and is never quantized, so the A-side LUT widening
 # and the per-token quantization launch disappear while the weight stays fp8 in
@@ -231,6 +267,9 @@ _W8A16 = _W8A16_MODE in ("1", "auto")
 # authoritative ``gfx906_fp16_prefill._enabled``); this constant only decides
 # whether that check runs.
 _PREFILL_ROUTE = str(envs.VLLM_DCU_FP16_PREFILL).strip().lower() in ("1", "auto")
+# Forces the auto op's tile arm: the fallback below is reached only when the
+# prefill router already declined, so it must never materialize.
+_FORCE_TILE_MIN_M = 1 << 30
 
 # Eager fast path (S23 O1).  The custom_ops below exist only so Dynamo gets a
 # shape contract; while eager that contract buys nothing, but its schema
@@ -623,6 +662,52 @@ def _register_fp8_emu_mm_block_w8a16() -> None:
         return a.new_empty((a.shape[0], w.shape[0]), dtype=out_dtype)
 
 
+def _register_fp8_emu_mm_block_w8a16_auto() -> None:
+    """``custom_op`` that owns the W8A16 *route* decision (S26).
+
+    Compiled callers cannot branch on the symbolic token count, and the fp16
+    prefill materialization (dequant into a scratch + rocBLAS) is only reached
+    above a per-role threshold.  Hoisting the whole decision into one opaque
+    op makes the traced graph M-agnostic while the body keeps the exact eager
+    policy, so ``torch.compile`` gets the same dispatch eager does.
+    """
+    if hasattr(torch.ops.vllm, "fp8_emu_mm_block_w8a16_auto"):
+        return
+
+    @torch.library.custom_op(
+        "vllm::fp8_emu_mm_block_w8a16_auto", mutates_args=()
+    )
+    def fp8_emu_mm_block_w8a16_auto(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        block_n: int,
+        block_k: int,
+        min_m: int,
+    ) -> torch.Tensor:
+        # Runs eagerly: every branch is on the concrete runtime M.
+        from . import gfx906_fp16_prefill
+
+        return gfx906_fp16_prefill.materialize_or_tile(
+            x, w, w_s, bias, out_dtype, block_n, block_k, min_m
+        )
+
+    @fp8_emu_mm_block_w8a16_auto.register_fake
+    def _(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        block_n: int,
+        block_k: int,
+        min_m: int,
+    ) -> torch.Tensor:
+        return x.new_empty((*x.shape[:-1], w.shape[0]), dtype=out_dtype)
+
+
 if ops_available():
     _register_fp8_emu_mm()
 
@@ -634,6 +719,9 @@ if ops_available_block_quant():
 
 if hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16"):
     _register_fp8_emu_mm_block_w8a16()
+    _register_fp8_emu_mm_block_w8a16_auto()
+
+_register_fp8_emu_lut()
 
 
 # Whether this build can serve W8A16.  Computed *after* the custom_op
@@ -921,6 +1009,20 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             ``[M, N]`` output in ``self.config.out_dtype``.
 
         """
+        # Traced callers keep everything inside one opaque op (S26): the
+        # LUT lookup and the ``A.shape[0] > _GEMV_MAX_M`` cfg choice are both
+        # Python-level on a symbolic M, so tracing them bakes the first hint.
+        if torch.compiler.is_compiling():
+            return torch.ops.vllm.fp8_emu_mm_block_w8a16_auto(
+                A,
+                w,
+                w_s,
+                None,
+                self.config.out_dtype,
+                block_n,
+                block_k,
+                _FORCE_TILE_MIN_M,
+            )
         lut = _device_lut(w.dtype, A.device)
         # The decode arm always passes cfg 0 (the kernel's auto rule picks the
         # exact-M tile); only the M > GEMV arm looks at the prefill knob, so a
@@ -930,9 +1032,8 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             if A.shape[0] > _GEMV_MAX_M
             else 0
         )
-        # Compiling must stay on the custom_op: it is what keeps Dynamo from
-        # pinning the token dimension (S11k).
-        if _EMU_FASTPATH and not torch.compiler.is_compiling():
+        # Eager fast path: the custom_op costs 31-55 us per call (S23 O1).
+        if _EMU_FASTPATH:
             return _fp8_emu_mm_block_w8a16_impl(
                 A, w, w_s, lut, None, self.config.out_dtype, _GEMV_THREADS,
                 cfg, block_n, block_k,
@@ -1013,7 +1114,7 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             return self._apply_block_scaled_mm_w8a16(
                 A, w, Bs.contiguous(), block_n, block_k
             )
-        lut = _device_lut(A.dtype, A.device)
+        lut = _lut_for(A, A.dtype)
         a_s = As.contiguous()
         w_s = Bs.contiguous()
         # Compiling must stay on the custom_op: it is what keeps Dynamo from

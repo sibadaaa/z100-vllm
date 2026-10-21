@@ -143,3 +143,51 @@ fp8_emu_gemm 的 BFloat16 分支、quickreduce bf16 codec)全部保留——默�
 | 回到仿真 bf16(不转 fp16) | `VLLM_DCU_BF16=1` |
 | FP8 回到 W8A8 量化路径 | `VLLM_DCU_FP8_W8A16=0` |
 | 完全回退本次改动 | revert `vllm/envs.py`、`vllm/platforms/{rocm,hygon_dtk}.py`、`vllm/config/model.py`、`vllm/model_executor/layers/quantization/gguf.py`、`tests/platforms/test_hygon_dtk.py` 中本次 bf16/W8A16 相关 hunk |
+
+---
+
+## 7. 运维记录(2026-10-21):`VLLM_DCU_FP8_W8A16=1` 上线
+
+### 7.1 落地
+
+- `tools/dcu/serve_host_dflash2.sh` 增加常驻
+  `export VLLM_DCU_FP8_W8A16="${VLLM_DCU_FP8_W8A16:-1}"`(调用方可覆盖)。
+  目标模型 `--dtype float16`,W8A16=1 的两个硬前提(构建含
+  `fp8_emu_gemm_block_w8a16` op、激活全 fp16)在启动前已验证。
+- 服务:`z100-vllm-host.service`(transient unit,启动脚本
+  `serve_host_dflash2.sh`,Qwen3.8-27B-FP8 + DFlash2 k=7,TP4,262144)。
+  注:该 unit 带 `CollectMode=inactive-or-failed`,失败即被 systemd 回收,
+  重建用 `tools/dcu/s24_post_l2v2.sh` 里的同款 `systemd-run` 命令。
+
+### 7.2 启动 OOM 事件与定位(与 bf16→fp16 改造无关)
+
+重启后 6 次启动全部失败:worker 在 `RequestState` 的
+`UvaBuffer((256, 262144), int32)`(256 MB pinned)分配处
+`hipErrorOutOfMemory`。排查结论:
+
+| 排除项 | 证据 |
+|---|---|
+| W8A16=1 改动 | `=auto` 同样失败(二分);失败点在内核选择之前 |
+| bf16→fp16 入口改造 | 失败路径不经过 dtype 解析;同代码 `07:05/07:38`(本地)刚成功启动过 |
+| 代码差异 | 失败栈涉及的全部文件 mtime 早于上次成功启动;git 树仅多本篇文档相关提交 |
+| GPU 显存 | HIP 视角 31.72/31.98 GiB free,单卡连续分配 8/16/20/24 GiB 全部成功 |
+| 锁页/GTT | 独立进程 pin 1 GiB、精确复现 (256,262144) 形状均成功;GTT sysfs 全程 0;`Mlocked` 27 MB;无孤儿 GPU 进程 |
+| RCCL | 4 rank TP4 NCCL 初始化 + 各 1 GiB pin 复现探针全部成功 |
+
+结论:对长驻实例执行 SIGTERM(30 s)→SIGKILL 之后,rock 驱动层的
+worker 可用 pinned 预算出现对计数器不可见的收缩;fresh 进程不受影响,
+vLLM worker 的 (256, 262144) int32 pinned 分配确定性失败。
+昨天 22:27-22:34 的 3 连败后成功与此为同一现象。
+
+### 7.3 处置(workaround)
+
+- `MAX_SEQS` 写入 `serve_host_dflash2.sh` 为默认 **4**(调用方仍可用
+  `MAX_SEQS=n` 覆盖):`RequestState` 的 pinned 降为 (4, 262144) int32 =
+  4 MB,worker 全部通过,服务完整起来:262144 上下文、KV cache
+  806,753 tokens、W8A16=1 生效(=1 硬模式干净启动即代表全部 FP8 层
+  走 W8A16;若 op 缺失或层非 fp16 会在启动期直接 raise)。冒烟请求正常。
+  (中间曾以 64 验证过路径,后按操作员指示收敛到 4。)
+- **代价**:`max_num_seqs` 256 → 4(服务端并发上限;对 262144 全长请求
+  本就只有 ~3x KV 并发,主要影响短请求并发)。
+- **恢复大并发**:需要 root 侧动作(hymgr/driver reload 或重启主机)后,
+  用 `MAX_SEQS=n` 覆盖重新拉起即可;本次会话无 sudo,未执行。
