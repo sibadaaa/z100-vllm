@@ -2585,8 +2585,6 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   const int ty = tid / C_::NG;
   const int m0 = blockIdx.y * BM;
   const int n0 = blockIdx.x * BN;
-  const int K4 = K >> 2;
-  const int w4 = (int)(w_stride >> 2);
   const int NK = (K + kQbk - 1) / kQbk;
   const int ar = tid >> 5;    // A row owned by this thread
   const int ajd = tid & 31;   // 4-element position inside the group
