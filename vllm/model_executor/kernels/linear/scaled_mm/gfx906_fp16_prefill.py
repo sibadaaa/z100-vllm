@@ -15,11 +15,14 @@ Contract:
 * Single-stream: the buffer is filled and consumed by one CUDA stream.  A call
   from another stream gets ``None`` (fall back to the W8A16 kernel) instead of
   racing on the buffer.
-* Eager-only: a call while ``torch.compile`` is tracing returns ``None`` (the
-  raw dequant op has no Meta/fake implementation and the M branch is symbolic)
-  and the stream-affine scratch is never allocated inside a CUDA-graph capture,
-  so a captured graph never contains the route.  ``VLLM_DCU_FP16_PREFILL``
-  therefore stays Dynamo-safe.
+* Compile-safe (S26): ``torch.compile`` sees a symbolic token count and cannot
+  branch on it, and the raw dequant op has no Meta/fake implementation, so
+  traced callers are routed through ``vllm::fp8_emu_mm_block_w8a16_auto``.
+  That op runs its body eagerly on the concrete M and therefore applies the
+  same per-role threshold as this eager router; the scratch is never used
+  inside a CUDA-graph capture (the capture guard in ``_workspace`` declines
+  and the tile kernel serves the call).  ``VLLM_DCU_FP16_PREFILL`` stays
+  Dynamo-safe.
 * Every failure (dtype/layout, OOM, missing op) returns ``None`` so the caller
   falls back to the W8A16 kernel; this module never raises.
 * A layer role that is missing from ``_ROLE_MIN_M`` warns once, so a table miss
@@ -84,9 +87,15 @@ _ENV_MIN_M = envs.VLLM_DCU_FP16_PREFILL_MIN_M
 if _ENV_MIN_M > 0:
     _DEFAULT_MIN_M = _ENV_MIN_M
 
+logger.info(
+    "gfx906 fp16 prefill materialization: VLLM_DCU_FP16_PREFILL=%s, "
+    "role min_m %s, default %d.",
+    envs.VLLM_DCU_FP16_PREFILL, _ROLE_MIN_M, _DEFAULT_MIN_M,
+)
+
 # Minimum workspace size in bytes (0 = size it from the weight); a bigger layer
 # still grows the buffer.  Only useful with eager execution: under CUDA-graph
-# capture the stream-affine guard declines the route regardless (see the module
+# capture the workspace guard declines the route regardless (see the module
 # contract), so this cannot pre-warm a graph.
 _WS_BYTES = envs.VLLM_DCU_FP16_WS_BYTES
 
@@ -122,6 +131,10 @@ def _role(layer: torch.nn.Module) -> str:
 # (M >= 16), regardless of the per-role table.  "auto" follows the table.
 _FORCE_MIN_M = 16
 
+# Set once the first call actually goes through dequant + rocBLAS; backs the
+# one-time "route engaged" INFO line.
+_ROUTE_SEEN = False
+
 
 def _min_m(role: str, _w: torch.Tensor | None) -> int:
     """Token threshold for ``role``; unknown roles use the default."""
@@ -156,14 +169,24 @@ def _workspace(w: torch.Tensor) -> torch.Tensor | None:
 
     Returns:
         A flat fp16 buffer with at least ``w.numel()`` elements, or None when
-        the buffer would have to be allocated during graph capture, was filled
-        by a different stream, or does not fit in memory.
+        inside a CUDA-graph capture, was filled by a different stream, or does
+        not fit in memory.
 
     """
     key = (w.device.index, torch.float16)
     need = w.numel()
     if _WS_BYTES > 0:
         need = max(need, _WS_BYTES // 2)
+    if torch.cuda.is_current_stream_capturing():
+        # Never hand the scratch to a captured graph, not even the
+        # pre-allocated buffer: the dequant + rocBLAS mm must stay eager, and
+        # a replayed graph would otherwise race the next eager prefill on the
+        # shared buffer.
+        logger.warning_once(
+            "gfx906 fp16 prefill: workspace declined during CUDA graph "
+            "capture; using the W8A16 kernel"
+        )
+        return None
     stream = torch.cuda.current_stream(w.device).cuda_stream
     ws = _WS.get(key)
     if ws is not None:
@@ -177,12 +200,6 @@ def _workspace(w: torch.Tensor) -> torch.Tensor | None:
             return None
         if ws.numel() >= need:
             return ws
-    if torch.cuda.is_current_stream_capturing():
-        logger.warning_once(
-            "gfx906 fp16 prefill: refusing to allocate the workspace during "
-            "CUDA graph capture; using the W8A16 kernel"
-        )
-        return None
     try:
         ws = torch.empty(need, dtype=torch.float16, device=w.device)
     except torch.OutOfMemoryError:
@@ -196,6 +213,174 @@ def _workspace(w: torch.Tensor) -> torch.Tensor | None:
     return ws
 
 
+def _layout_ok(
+    w: torch.Tensor | None,
+    w_s: torch.Tensor,
+    K: int,
+    block_n: int,
+    block_k: int,
+) -> bool:
+    """Trace-safe weight/layout gates shared by the eager and traced routers."""
+    if w is None or w.element_size() != 1 or w_s.dtype != torch.float32:
+        return False
+    if w.dim() != 2 or w_s.dim() != 2 or not w_s.is_contiguous():
+        return False
+    N = w.shape[0]
+    if w.shape[1] != K or w.stride(1) != 1:
+        return False
+    if K % 8 or w.stride(0) % 8:
+        return False
+    if block_n <= 0 or block_k <= 0 or K % block_k:
+        return False
+    return tuple(w_s.shape) == ((N + block_n - 1) // block_n, K // block_k)
+
+
+def _materialize(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_n: int,
+    block_k: int,
+    role: str,
+) -> torch.Tensor | None:
+    """Dequantize ``w`` into the shared scratch and run ``x @ w16.T``.
+
+    Returns:
+        The output in ``out_dtype`` (bias folded in), or None when the scratch
+        is unavailable and the caller must fall back to the W8A16 kernel.
+
+    """
+    ws = _workspace(w)
+    if ws is None:
+        return None
+    K = x.shape[-1]
+    m = x.numel() // K
+    # W16 is [N, K] so hipBLAS eats `W16.T()` as a zero-copy transpose view and
+    # the dequant kernel keeps the checkpoint's row order (P12).
+    w16 = ws[: w.numel()].view(w.shape)
+    torch.ops._rocm_C.fp8_dequant_to_fp16_out(
+        w16,
+        w,
+        w_s,
+        _device_lut(w.dtype, w.device),
+        block_n,
+        block_k,
+    )
+    out = torch.mm(x.reshape(m, K), w16.t()).to(dtype=out_dtype)
+    global _ROUTE_SEEN
+    if not _ROUTE_SEEN:
+        _ROUTE_SEEN = True
+        logger.info(
+            "gfx906 fp16 prefill: first materialization route engaged "
+            "(role=%s, M=%d, N=%d, K=%d); further routes are silent.",
+            role, m, w.shape[0], K,
+        )
+    # Contract §1.2: the bias is added after the output cast -- the same order
+    # as the emu kernel's epilogue (matters only when out_dtype is fp32;
+    # production fp16 makes the cast a no-op).
+    if bias is not None:
+        out = out + bias.to(dtype=out.dtype)
+    return out.view(*x.shape[:-1], w.shape[0])
+
+
+def materialize_or_tile(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_n: int,
+    block_k: int,
+    min_m: int,
+) -> torch.Tensor:
+    """Dispatch one W8A16 call on the concrete runtime M (custom_op body).
+
+    This is the traced entry point's body: ``vllm::fp8_emu_mm_block_w8a16_auto``
+    calls it eagerly, so the token count is a real integer and the eager policy
+    (materialize above ``min_m``, tile below) applies unchanged under
+    ``torch.compile``.
+
+    Args:
+        x: fp16 activation, ``[*leading, K]``.
+        w: fp8 weight, ``[N, K]``.
+        w_s: Per-block weight scales.
+        bias: Optional ``[N]`` bias.
+        out_dtype: Configured output dtype.
+        block_n: Weight block rows.
+        block_k: Weight block columns.
+        min_m: Router threshold for this layer role.
+
+    Returns:
+        ``[*x.shape[:-1], N]`` in ``out_dtype``.
+
+    """
+    from .gfx906_fp8 import (
+        _GEMV_MAX_M,
+        _GEMV_THREADS,
+        _fp8_emu_mm_block_w8a16_impl,
+        _prefill_cfg,
+    )
+
+    K = x.shape[-1]
+    m = x.numel() // K
+    if _enabled() and m >= min_m and m >= _FORCE_MIN_M:
+        out = _materialize(x, w, w_s, bias, out_dtype, block_n, block_k, "auto")
+        if out is not None:
+            return out
+    cfg = _prefill_cfg(m, w.shape[0]) if m > _GEMV_MAX_M else 0
+    out = _fp8_emu_mm_block_w8a16_impl(
+        x.reshape(m, K),
+        w,
+        w_s,
+        _device_lut(w.dtype, w.device),
+        None,
+        out_dtype,
+        _GEMV_THREADS,
+        cfg,
+        block_n,
+        block_k,
+    )
+    if bias is not None:
+        out = out + bias.to(dtype=out.dtype)
+    return out.view(*x.shape[:-1], w.shape[0])
+
+
+def _traced_route(
+    kernel: torch.nn.Module,
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Traced router: trace-time constants here, the M decision inside the op."""
+    if not _enabled() or getattr(kernel, "apply_input_quant", True):
+        return None
+    if not hasattr(torch.ops.vllm, "fp8_emu_mm_block_w8a16_auto"):
+        return None
+    if x.dtype != torch.float16 or not x.is_contiguous():
+        return None
+    role = _role(layer)
+    if role not in _ROLE_MIN_M:
+        _warn_unknown_role(role)
+    params = FP8BlockParams.from_layer(layer)
+    K = x.shape[-1]
+    block_n = int(kernel.weight_group_shape.row)
+    block_k = int(kernel.weight_group_shape.col)
+    if not _layout_ok(params.weight, params.block_scale, K, block_n, block_k):
+        return None
+    return torch.ops.vllm.fp8_emu_mm_block_w8a16_auto(
+        x,
+        params.weight,
+        params.block_scale,
+        bias,
+        kernel.config.out_dtype,
+        block_n,
+        block_k,
+        _min_m(role, None),
+    )
+
+
 def try_prefill(
     kernel: torch.nn.Module,
     layer: torch.nn.Module,
@@ -204,10 +389,13 @@ def try_prefill(
 ) -> torch.Tensor | None:
     """Route one linear call to fp16 weight materialization plus rocBLAS.
 
-    Dequantizes the layer weight into the shared scratch (``W16`` stays
-    ``[N, K]``, row order unchanged) and computes ``x @ W16.T``.  The bias is
-    added in the matmul dtype, before the final cast to the configured output
-    dtype, matching the base-class bias order.
+    Above the per-role token threshold the layer weight is dequantized into the
+    shared scratch (``W16`` stays ``[N, K]``, row order unchanged) and
+    ``x @ W16.T`` runs on rocBLAS.  The bias is added after the output cast.
+
+    Under ``torch.compile`` the token count is symbolic, so the decision is
+    delegated to ``vllm::fp8_emu_mm_block_w8a16_auto``; that op runs eagerly on
+    the concrete M and therefore makes the same choice as this eager path.
 
     Args:
         kernel: The block-scaled kernel instance.  Must have
@@ -224,10 +412,7 @@ def try_prefill(
 
     """
     if torch.compiler.is_compiling():
-        # Dynamo-safe fallback: ``fp8_dequant_to_fp16_out`` has no Meta/fake
-        # implementation and this function branches on a symbolic M, so the
-        # traced route is the W8A16 custom_op, not this router.
-        return None
+        return _traced_route(kernel, layer, x, bias)
     if not _enabled() or getattr(kernel, "apply_input_quant", True):
         return None
     try:
@@ -256,42 +441,17 @@ def _try_prefill(
     if m < _min_m(role, None) or m < _FORCE_MIN_M:
         return None
     params = FP8BlockParams.from_layer(layer)
-    w = params.weight
-    w_s = params.block_scale
-    if w is None or w.element_size() != 1 or w_s.dtype != torch.float32:
-        return None
-    if w.dim() != 2 or w_s.dim() != 2 or not w_s.is_contiguous():
-        return None
-    N = w.shape[0]
-    if w.shape[1] != K or w.stride(1) != 1:
-        return None
-    if K % 8 or w.stride(0) % 8:
-        return None
     block_n = int(kernel.weight_group_shape.row)
     block_k = int(kernel.weight_group_shape.col)
-    if block_n <= 0 or block_k <= 0 or K % block_k:
+    if not _layout_ok(params.weight, params.block_scale, K, block_n, block_k):
         return None
-    if tuple(w_s.shape) != ((N + block_n - 1) // block_n, K // block_k):
-        return None
-    ws = _workspace(w)
-    if ws is None:
-        return None
-    # W16 is [N, K] so hipBLAS eats `W16.T()` as a zero-copy transpose view and
-    # the dequant kernel keeps the checkpoint's row order (P12).
-    w16 = ws[: w.numel()].view(w.shape)
-    torch.ops._rocm_C.fp8_dequant_to_fp16_out(
-        w16,
-        w,
-        w_s,
-        _device_lut(w.dtype, w.device),
+    return _materialize(
+        x,
+        params.weight,
+        params.block_scale,
+        bias,
+        kernel.config.out_dtype,
         block_n,
         block_k,
+        role,
     )
-    out = torch.mm(x.view(m, K), w16.t())
-    # Contract §1.2: the bias is added in out_dtype, after the output cast --
-    # the same order as the emu kernel's epilogue (matters only when out_dtype
-    # is fp32; production fp16 makes the cast a no-op).
-    out = out.to(dtype=kernel.config.out_dtype)
-    if bias is not None:
-        out = out + bias.to(dtype=out.dtype)
-    return out.view(*x.shape[:-1], N)

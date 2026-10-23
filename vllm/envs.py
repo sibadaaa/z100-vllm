@@ -227,11 +227,12 @@ if TYPE_CHECKING:
     VLLM_DCU_FP8_FUSE_QUANT: bool = False
     # W8A16 route for the gfx906 FP8 emulation kernels: the activation is fed
     # as fp16 and is never quantized, only the weight stays fp8
-    # (docs/design/z100-w8a16-prefill-fp16-construction.md).  "0"/unset keeps
-    # the W8A8 path bit-for-bit; "1" requires the W8A16 op and raises at load
-    # if it (or a fp16 activation layer) is missing; "auto" uses it when the op
-    # exists and degrades to W8A8 for unsupported layers.
-    VLLM_DCU_FP8_W8A16: str = "0"
+    # (docs/design/z100-w8a16-prefill-fp16-construction.md).  "auto" (default)
+    # uses the W8A16 route whenever the built op is present and degrades to
+    # W8A8 for unsupported layers; "0" keeps the W8A8 path bit-for-bit; "1"
+    # requires the W8A16 op and raises at load if it (or a fp16 activation
+    # layer) is missing.
+    VLLM_DCU_FP8_W8A16: str = "auto"
     # Prefill fp16 weight materialization: dequantize the current layer into a
     # reused fp16 scratch and run rocBLAS `torch.mm` above a per-role token
     # count.  "0"/unset off; "1" force for every role from 16 tokens (ignores
@@ -1574,8 +1575,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DCU_FP8_FUSE_QUANT", "False").lower() in ("true", "1")
     ),
     # W8A16 + prefill-materialization switches (tri-state "0"/"1"/"auto").
-    # Defaults keep the shipped W8A8 behaviour byte-for-byte.
-    "VLLM_DCU_FP8_W8A16": lambda: os.getenv("VLLM_DCU_FP8_W8A16", "0").strip().lower(),
+    # The W8A16 default "auto" is an intentional behavior flip relative to
+    # earlier builds that shipped "0" (bit-for-bit W8A8): whenever the
+    # built op is present the W8A16 route is preferred and unsupported
+    # layers degrade to W8A8. Set "0" to restore the W8A8-only behavior;
+    # prefill materialization stays off by default either way.
+    "VLLM_DCU_FP8_W8A16": lambda: (
+        os.getenv("VLLM_DCU_FP8_W8A16", "auto").strip().lower()
+    ),
     "VLLM_DCU_FP16_PREFILL": lambda: (
         os.getenv("VLLM_DCU_FP16_PREFILL", "0").strip().lower()
     ),
