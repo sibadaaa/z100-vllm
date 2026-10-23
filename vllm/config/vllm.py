@@ -1561,6 +1561,13 @@ class VllmConfig:
         cache_dtype = self.cache_config.cache_dtype
         if self.model_config is None or cache_dtype not in ("float16", "bfloat16"):
             return
+        # Hygon gfx906 site: the DFlash2 drafter intentionally runs a bf16 KV
+        # cache behind the fp16 target (production-validated on this stack;
+        # the drafter's eagle KV group only forms with its own bf16 KV spec).
+        # The explicit-KV mismatch check therefore only applies to
+        # non-speculative deployments.
+        if self.speculative_config is not None:
+            return
         model_dtype = str(self.model_config.dtype).removeprefix("torch.")
         if model_dtype == cache_dtype:
             return
