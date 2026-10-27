@@ -147,8 +147,11 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-        cls, hf_quant_cfg, user_quant
+        cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
+        # `hf_config` is accepted for signature compatibility with
+        # QuantizationConfig.override_quantization_method and the sibling
+        # overrides; detection here only needs the quantization config dict.
         can_convert = cls.is_moe_wna16_compatible(hf_quant_cfg)
         if can_convert and user_quant == "moe_wna16":
             return cls.get_name()
@@ -522,15 +525,18 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
         return fused_experts(
             x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            quant_config=self.moe_quant_config,
+            layer.w13_weight,
+            layer.w2_weight,
+            router_logits,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
+            routing_sink=layer.routing_sink,
         )
 
     @staticmethod
@@ -633,13 +639,17 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 )
 
             if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
-                    tp_rank
-                ]
+                tensor = loaded_weight.view(
+                    layer.moe_config.tp_size, -1, loaded_weight.size(1)
+                )[tp_rank]
+                # qzeros are packed along the intermediate dim by
+                # bit8_pack_factor, so the w1/w3 boundary is in packed units
+                # (equals shard_size // 2 only for 4-bit).
+                shard_zp_size = shard_size // layer.quant_config.bit8_pack_factor
                 if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
+                    param.data[expert_id, :shard_zp_size] = tensor
                 else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
+                    param.data[expert_id, shard_zp_size:] = tensor
                 return True if return_success else None
             elif "w2_qzeros" in weight_name:
                 param.data[expert_id] = loaded_weight.view(

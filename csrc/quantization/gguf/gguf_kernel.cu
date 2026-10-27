@@ -8,7 +8,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "../../cuda_compat.h"
-#include "dispatch_utils.h"
+#include "../../legacy_dispatch_utils.h"
 
 #include "ggml-common.h"
 #include "vecdotq.cuh"

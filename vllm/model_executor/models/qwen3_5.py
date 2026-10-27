@@ -28,10 +28,18 @@ import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
+from collections.abc import Iterable
+from typing import ClassVar
 
 import torch
 from einops import rearrange
 from torch import nn
+from transformers import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
+)
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -53,8 +61,11 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -76,17 +87,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
-from vllm.transformers_utils.configs.qwen3_5 import (
-    Qwen3_5Config,
-    Qwen3_5TextConfig,
-)
-from vllm.transformers_utils.configs.qwen3_5_moe import (
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeTextConfig,
-)
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from .interfaces import (
     HasInnerState,
@@ -114,6 +117,7 @@ from .qwen3_vl import (
     Qwen3VLForConditionalGeneration,
     Qwen3VLMultiModalProcessor,
     Qwen3VLProcessingInfo,
+    mrope_positions_factor,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -770,6 +774,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                mrope_positions_factor=mrope_positions_factor(vllm_config),
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -1642,14 +1647,8 @@ class Qwen3_5ForCausalLMBase(
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
-        if cache_config.mamba_cache_mode == "all":
-            raise NotImplementedError(
-                "Qwen3.5 currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
-            )
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
@@ -1780,6 +1779,15 @@ class Qwen3_5ForCausalLMBase(
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[torch.Tensor, int]:
+        positions = torch.arange(len(input_tokens), dtype=torch.long)
+        return positions.unsqueeze(0).expand(3, -1), 0
+
+
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
     pass
 
@@ -1815,7 +1823,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         nn.Module.__init__(self)
         config: Qwen3_5Config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        multimodal_config = vllm_config.model_config.multimodal_config
+        multimodal_config = vllm_config.model_config.get_multimodal_config()
         enable_multimodal = (
             multimodal_config is not None
             and not multimodal_config.language_model_only
@@ -1859,6 +1867,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                     config.vision_config,
                     norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                     quant_config=quant_config,
+                    input_norm=build_mm_input_norm(self.model_config),
                     prefix=maybe_prefix(prefix, "visual"),
                 )
         else:
@@ -2018,6 +2027,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
 
 class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
+    language_model: Qwen3_5ForCausalLM
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -2071,12 +2083,15 @@ class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
 class Qwen3_5MoeForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
 ):
+    # For MoE LoRA weights loading
+    is_3d_moe_weight: ClassVar[bool] = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        multimodal_config = vllm_config.model_config.multimodal_config
+        multimodal_config = vllm_config.model_config.get_multimodal_config()
         mm_limits = (
             getattr(multimodal_config, "limit_per_prompt", {})
             if multimodal_config is not None
@@ -2130,6 +2145,7 @@ class Qwen3_5MoeForConditionalGeneration(
                     config.vision_config,
                     norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                     quant_config=quant_config,
+                    input_norm=build_mm_input_norm(self.model_config),
                     prefix=maybe_prefix(prefix, "visual"),
                 )
         else:

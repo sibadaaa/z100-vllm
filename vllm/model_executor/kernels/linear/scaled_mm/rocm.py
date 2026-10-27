@@ -79,11 +79,22 @@ class ROCmFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if not current_platform.is_rocm():
             return False, "requires ROCm."
 
-        from vllm.platforms.rocm import get_cdna_version, on_gfx12x, on_gfx1250
+        from vllm.platforms.rocm import (
+            get_cdna_version,
+            on_gfx12x,
+            on_gfx1250,
+            on_gfx906,
+        )
 
         # wvSplitKQ (skinny GEMM) is excluded from the gfx1250 build.
         if on_gfx1250():
             return False, "wvSplitKQ (skinny GEMM) is not built on gfx1250"
+
+        # ...and from the gfx906 build: those kernels target the gfx9/gfx11
+        # MFMA ISA, which Vega20 (gfx906) does not implement, so the build
+        # registers no wvSplitK* ops there.
+        if on_gfx906():
+            return False, "wvSplitKQ (skinny GEMM) is not built on gfx906 (no MFMA)"
 
         # Restore RDNA4 (gfx12x) dropped by the get_cdna_version()>2 refactor.
         if get_cdna_version() <= 2 and not on_gfx12x():

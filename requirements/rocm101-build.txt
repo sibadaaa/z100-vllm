@@ -1,0 +1,19 @@
+# Build requirements for the self-built PyTorch 2.16 + ROCm 10.1 (TheRock)
+# gfx906 stack.  See docs/z100-torch216-rocm101-adapt-plan.md.
+#
+# torch / triton / amdsmi come from the locally built artifacts (see
+# requirements/rocm101.txt); do NOT add `--extra-index-url
+# https://download.pytorch.org/whl/rocm7.2`, `torch==...`, `triton-rocm` or
+# `amdsmi==7.0.2` here.  The HIP extensions are compiled by the SFU-patched
+# clang 24 at /mnt/game/torch-rocm10/llvm-build/bin (HIP_CLANG_PATH), not by
+# the toolchain shipped in the ROCm SDK.
+
+-r common.txt
+
+cmake>=3.26.1,<4
+ninja
+packaging>=24.2
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=8
+wheel
+jinja2>=3.1.6

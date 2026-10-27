@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ctypes
+import glob
 import importlib.util
 import json
 import logging
@@ -41,6 +42,88 @@ envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 
+# Hygon DCU Toolkit (DTK) markers. The DTK install layout is the only
+# difference that matters here: same HIP runtime, but the prefix is
+# /opt/dtk, the requirements live in requirements/dcu*.txt and the version
+# tag is `+dtkXX.XX` instead of `+rocmXX`.
+_DTK_INFO_VERSION = Path(".info") / "rocm_version"
+
+
+def _hygon_dtk_prefix() -> str | None:
+    """DTK install prefix on this host, or None when there is no DTK.
+
+    ``vllm`` cannot be imported while ``setup.py`` runs (nothing is
+    installed yet), so the conditions of
+    ``vllm.platforms.hygon_dtk.is_hygon_dtk()`` are duplicated here and must
+    be kept in sync with it:
+
+    * ``<prefix>/.info/rocm_version`` exists, with ``<prefix>`` taken from
+      ``ROCM_PATH``, ``DTKROOT`` or the conventional ``/opt/dtk``;
+    * or ``HYHAL_PATH`` is set;
+    * or a ``hy-smi`` binary exists under ``/opt/dtk*/bin``.
+
+    Returns None for CUDA and for community ROCm installations so that
+    their build behaviour is unchanged.
+    """
+    candidates = [
+        prefix
+        for prefix in (
+            os.environ.get("ROCM_PATH"),
+            os.environ.get("DTKROOT"),
+            "/opt/dtk",
+        )
+        if prefix
+    ]
+    for prefix in candidates:
+        if (Path(prefix) / _DTK_INFO_VERSION).is_file():
+            return prefix
+    if os.environ.get("HYHAL_PATH") or glob.glob("/opt/dtk*/bin/hy-smi"):
+        return os.environ.get("DTKROOT") or "/opt/dtk"
+    return None
+
+
+def _dtk_version() -> str | None:
+    """DTK release string from ``<prefix>/.info/rocm_version`` (e.g. 26.04)."""
+    prefix = _DTK_PREFIX
+    if prefix is None:
+        return None
+    try:
+        return (Path(prefix) / _DTK_INFO_VERSION).read_text().strip() or None
+    except OSError:
+        return None
+def has_precompiled_rust_extensions() -> bool:
+    if not rust_build.rust_py_extension_module_names():
+        return False
+    return not get_missing_precompiled_rust_extension_modules()
+
+
+_DTK_PREFIX = _hygon_dtk_prefix()
+_DTK_HIP_FALLBACK_WARNED = False
+
+if _DTK_PREFIX is not None:
+    # DTK's rocm_agent_enumerator reports every arch listed in
+    # /opt/dtk/bin/target.lst ("gfx906;gfx926;gfx928"); building all of them
+    # triples the binary size and can emit ISA the Z100 cannot execute. The
+    # Z100 is gfx906. An explicit PYTORCH_ROCM_ARCH from the caller wins, so
+    # the arch is still overridable for other Hygon boards.
+    _DTK_ARCH = os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx906")
+    logger.info(
+        "Building for DTK %s at %s (PYTORCH_ROCM_ARCH=%s)",
+        _dtk_version(),
+        _DTK_PREFIX,
+        _DTK_ARCH,
+    )
+
+
+def _is_hygon_dtk() -> bool:
+    return _DTK_PREFIX is not None
+
+
+def _is_rocm101() -> bool:
+    """Whether this is the self-built torch 2.16 + ROCm 10.1 (TheRock) stack."""
+    return os.environ.get("VLLM_ROCM101") == "1" or "+rocm10.1" in torch.__version__
+
+
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
@@ -59,6 +142,18 @@ elif sys.platform.startswith("linux") and os.getenv("VLLM_TARGET_DEVICE") is Non
     elif torch.version.cuda is not None:
         VLLM_TARGET_DEVICE = "cuda"
         logger.info("Auto-detected CUDA")
+    elif _is_hygon_dtk():
+        # Some DTK torch builds leave torch.version.hip unset even though the
+        # stack is HIP. The DTK install markers are then the only signal.
+        # This branch is deliberately last so that CUDA and community ROCm
+        # hosts keep their original auto-detection.
+        VLLM_TARGET_DEVICE = "rocm"
+        logger.warning(
+            "torch.version.hip is None but DTK %s is installed at %s; "
+            "building for ROCm/HIP.",
+            _dtk_version(),
+            _DTK_PREFIX,
+        )
     else:
         VLLM_TARGET_DEVICE = "cpu"
 
@@ -225,8 +320,8 @@ class cmake_build_ext(build_ext):
         cfg = envs.CMAKE_BUILD_TYPE or default_cfg
 
         cmake_args = [
-            "-DCMAKE_BUILD_TYPE={}".format(cfg),
-            "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
+            f"-DCMAKE_BUILD_TYPE={cfg}",
+            f"-DVLLM_TARGET_DEVICE={VLLM_TARGET_DEVICE}",
         ]
 
         verbose = envs.VERBOSE
@@ -250,7 +345,7 @@ class cmake_build_ext(build_ext):
 
         # Pass the python executable to cmake so it can find an exact
         # match.
-        cmake_args += ["-DVLLM_PYTHON_EXECUTABLE={}".format(sys.executable)]
+        cmake_args += [f"-DVLLM_PYTHON_EXECUTABLE={sys.executable}"]
 
         # Pass the python path to cmake so it can reuse the build dependencies
         # on subsequent calls to python.
@@ -262,7 +357,7 @@ class cmake_build_ext(build_ext):
         # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
         fc_base_dir = os.path.join(ROOT_DIR, ".deps")
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
-        cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
+        cmake_args += [f"-DFETCHCONTENT_BASE_DIR={fc_base_dir}"]
 
         #
         # Setup parallelism and build tool
@@ -270,13 +365,13 @@ class cmake_build_ext(build_ext):
         num_jobs, nvcc_threads = self.compute_num_jobs()
 
         if nvcc_threads:
-            cmake_args += ["-DNVCC_THREADS={}".format(nvcc_threads)]
+            cmake_args += [f"-DNVCC_THREADS={nvcc_threads}"]
 
         if is_ninja_available():
             build_tool = ["-G", "Ninja"]
             cmake_args += [
                 "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
-                "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
+                f"-DCMAKE_JOB_POOLS:STRING=compile={num_jobs}",
             ]
         else:
             # Default build tool to whatever cmake picks.
@@ -284,8 +379,13 @@ class cmake_build_ext(build_ext):
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda() and CUDA_HOME is not None:
             cmake_args += [f"-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc"]
-        elif _is_hip() and ROCM_HOME is not None:
-            cmake_args += [f"-DROCM_PATH={ROCM_HOME}"]
+        elif _is_hip():
+            # DTK installs under /opt/dtk. Its torch builds normally report
+            # that as ROCM_HOME; fall back to the detected DTK prefix so the
+            # HIP language is still configured without a /opt/rocm symlink.
+            rocm_path = ROCM_HOME or _DTK_PREFIX
+            if rocm_path is not None:
+                cmake_args += [f"-DROCM_PATH={rocm_path}"]
 
         other_cmake_args = os.environ.get("CMAKE_ARGS")
         if other_cmake_args:
@@ -548,6 +648,93 @@ class precompiled_wheel_utils:
         print(f"Using ROCm precompiled wheel: {wheel_url}")
         return wheel_url, download_filename
 
+    # Publication lags main by roughly 5-10 commits; anything much older is
+    # unlikely to still match the checkout's compiled sources.
+    WHEEL_SEARCH_DEPTH = 20
+    # Changes here make an older wheel's extensions unusable.
+    WHEEL_BLOCKING_PATHS = (
+        "csrc",
+        "cmake",
+        "CMakeLists.txt",
+        "pyproject.toml",
+        "vllm/_custom_ops.py",
+    )
+    # Changes here are usually harmless for an older wheel.
+    WHEEL_WARNING_PATHS = ("rust", "setup.py")
+
+    @staticmethod
+    def find_published_wheel_commit(
+        base_commit: str, variant: str | None, arch: str
+    ) -> str:
+        """Find the nearest ancestor of base_commit that has a published wheel.
+
+        Raises:
+            ValueError: If no wheel is published within WHEEL_SEARCH_DEPTH
+                commits, or compiled sources changed since the nearest one.
+
+        """
+        from urllib.error import HTTPError
+
+        utils = precompiled_wheel_utils
+        candidates = subprocess.check_output(
+            [
+                "git",
+                "rev-list",
+                "--first-parent",
+                f"--max-count={utils.WHEEL_SEARCH_DEPTH}",
+                base_commit,
+            ],
+            text=True,
+        ).splitlines()
+        for distance, commit in enumerate(candidates):
+            try:
+                wheels, _ = utils.fetch_metadata_for_variant(commit, variant)
+            except HTTPError as err:
+                if err.code != 404:
+                    raise
+                continue
+            if not any(
+                wheel.get("package_name") == "vllm"
+                and arch in wheel.get("platform_tag", "")
+                for wheel in wheels
+            ):
+                continue
+            if distance == 0:
+                return commit
+
+            diff = ["git", "diff", "--name-only", commit, base_commit, "--"]
+            blocking, warning = (
+                subprocess.check_output([*diff, *paths], text=True).strip()
+                for paths in (utils.WHEEL_BLOCKING_PATHS, utils.WHEEL_WARNING_PATHS)
+            )
+            if blocking:
+                raise ValueError(
+                    f"No precompiled wheel is published yet for {base_commit}, and "
+                    f"the nearest one ({commit}, {distance} commits older) was "
+                    f"built from different compiled sources:\n{blocking}\n"
+                    "Wait for wheel publication, rebase onto a commit with a "
+                    "published wheel, build from source (unset "
+                    "VLLM_USE_PRECOMPILED), or set VLLM_PRECOMPILED_WHEEL_COMMIT "
+                    "to a full commit SHA to skip this check."
+                )
+            if warning:
+                logger.warning(
+                    "Precompiled wheel %s predates changes to:\n%s\n"
+                    "The Rust frontend and packaged files may be stale.",
+                    commit,
+                    warning,
+                )
+            print(
+                f"No precompiled wheel is published yet for {base_commit}; using "
+                f"{commit} ({distance} commits older)"
+            )
+            return commit
+        raise ValueError(
+            f"No published precompiled wheel for variant {variant} and "
+            f"architecture {arch} within {utils.WHEEL_SEARCH_DEPTH} commits of "
+            f"{base_commit}. Wait for wheel publication or build vLLM from source."
+        )
+
     @staticmethod
     def determine_wheel_url() -> tuple[str, str | None]:
         """
@@ -560,8 +747,8 @@ class precompiled_wheel_utils:
         3. the default variant from nightly repo
 
         If downloading from the nightly repo, the commit can be specified via
-        VLLM_PRECOMPILED_WHEEL_COMMIT; otherwise, the head commit in the main branch
-        is used.
+        VLLM_PRECOMPILED_WHEEL_COMMIT; otherwise, local checkouts search backwards
+        from their merge-base with upstream main for a compatible published wheel.
         """
         wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
         if wheel_location is not None:
@@ -588,6 +775,14 @@ class precompiled_wheel_utils:
                     ", trying to fetch base commit in main branch"
                 )
                 commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
+                if (
+                    envs.VLLM_USE_PRECOMPILED
+                    and not envs.VLLM_DOCKER_BUILD_CONTEXT
+                    and commit != "nightly"
+                ):
+                    commit = precompiled_wheel_utils.find_published_wheel_commit(
+                        commit, variant, arch
+                    )
             print(f"Using precompiled wheel commit {commit} with variant {variant}")
             try_default = False
             wheels, repo_url, download_filename = None, None, None
@@ -762,17 +957,9 @@ class precompiled_wheel_utils:
                     ["git", "fetch", "https://github.com/vllm-project/vllm", "main"]
                 )
 
-            # Then get the commit hash of the current branch that is the same as
-            # the upstream main commit.
-            current_branch = (
-                subprocess.check_output(["git", "branch", "--show-current"])
-                .decode("utf-8")
-                .strip()
-            )
-
             base_commit = (
                 subprocess.check_output(
-                    ["git", "merge-base", f"{upstream_main_commit}", current_branch]
+                    ["git", "merge-base", upstream_main_commit, "HEAD"]
                 )
                 .decode("utf-8")
                 .strip()
@@ -800,9 +987,25 @@ def _is_cuda() -> bool:
 
 
 def _is_hip() -> bool:
-    return (
-        VLLM_TARGET_DEVICE == "cuda" or VLLM_TARGET_DEVICE == "rocm"
-    ) and torch.version.hip is not None
+    if VLLM_TARGET_DEVICE != "cuda" and VLLM_TARGET_DEVICE != "rocm":
+        return False
+    if torch.version.hip is not None:
+        return True
+    # Some DTK torch builds leave torch.version.hip unset; treat DTK as HIP so
+    # that the HIP build path is taken. Non-DTK hosts are untouched because
+    # _is_hygon_dtk() is False there.
+    if _is_hygon_dtk():
+        global _DTK_HIP_FALLBACK_WARNED
+        if not _DTK_HIP_FALLBACK_WARNED:
+            _DTK_HIP_FALLBACK_WARNED = True
+            logger.warning(
+                "torch.version.hip is None but DTK %s is installed at %s; "
+                "treating this build as ROCm/HIP.",
+                _dtk_version(),
+                _DTK_PREFIX,
+            )
+        return True
+    return False
 
 
 def _is_tpu() -> bool:
@@ -913,10 +1116,17 @@ def get_vllm_version() -> str:
                     version += f"{sep}cu{cuda_version_str}"
     elif _is_hip():
         # ROCm/HIP environment - skip CUDA version checks
-        # Get the Rocm Version
-        rocm_version = get_rocm_version() or torch.version.hip
-        if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
-            version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+        # Hygon DTK versions its stack independently of community ROCm (the
+        # DTK 26.04 image ships a ROCm 6.3-era HIP), so the local version tag
+        # carries the DTK release, matching the vendor wheel naming
+        # (+das.dtk2604).
+        dtk_version = _dtk_version()
+        if dtk_version:
+            version += f"{sep}dtk{dtk_version.replace('.', '')}"
+        else:
+            rocm_version = get_rocm_version() or torch.version.hip
+            if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
+                version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
     elif _is_tpu():
         version += f"{sep}tpu"
     elif _is_cpu():
@@ -945,6 +1155,74 @@ def get_vllm_version() -> str:
             )
 
     return version
+
+
+def _check_requirements_preinstalled(requirements: list[str]) -> None:
+    """`python setup.py develop` satisfies missing `install_requires` via
+    setuptools' legacy easy_install path instead of pip's wheel-aware
+    resolver. That path has repeatedly tried (and failed) to compile old
+    sdists of fast-moving C-extension packages such as aiohttp from source
+    against the running Python's headers, e.g.
+    https://github.com/vllm-project/vllm/issues/34073. Fail fast with an
+    actionable message instead of a cryptic compiler error.
+
+    Skipped under `--no-deps`, which makes setuptools skip `install_requires`
+    processing entirely, so the easy_install path this guards against is
+    unreachable anyway.
+    """
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import requires as installed_requires
+    from importlib.metadata import version as installed_version
+
+    from packaging.requirements import Requirement
+
+    missing = []
+    checked = set()
+
+    def _check(req_str: str, extra: str | None = None) -> None:
+        # Strip inline "# comment" suffixes (as pip does when reading
+        # requirements files); packaging.Requirement cannot parse them.
+        req_str = re.split(r"\s+#", req_str, maxsplit=1)[0].strip()
+        try:
+            req = Requirement(req_str)
+        except Exception:
+            return
+        # `extra` is only set when recursing into an extra's own deps
+        # below; it selects which `; extra == "..."` markers apply.
+        if req.marker is not None and not req.marker.evaluate(
+            {"extra": extra} if extra else None
+        ):
+            return
+        if (req.name, extra) in checked:
+            return
+        checked.add((req.name, extra))
+        try:
+            installed = installed_version(req.name)
+        except PackageNotFoundError:
+            missing.append(req_str)
+            return
+        if req.specifier and not req.specifier.contains(installed, prereleases=True):
+            missing.append(f"{req_str} (found {req.name}=={installed})")
+            return
+        # A requested extra (e.g. "fastapi[standard]") pulls in packages
+        # that easy_install resolves too, so check those as well.
+        for extra_name in req.extras:
+            for dep in installed_requires(req.name) or []:
+                _check(dep, extra=extra_name)
+
+    for req_str in requirements:
+        _check(req_str)
+
+    if missing:
+        raise RuntimeError(
+            "The following dependencies are missing or outdated:\n  "
+            + "\n  ".join(missing)
+            + "\n\n`python setup.py develop` cannot reliably install these "
+            "itself (see https://github.com/vllm-project/vllm/issues/34073). "
+            "Install them with pip first, e.g.:\n"
+            "  pip install -r requirements/rocm.txt\n"
+            "then re-run `python setup.py develop`."
+        )
 
 
 def get_requirements() -> list[str]:
@@ -977,10 +1255,31 @@ def get_requirements() -> list[str]:
                 # vllm-flash-attn is built only for CUDA 12.x.
                 # Skip for other versions.
                 continue
+            if "flashinfer-cubin" in req or "flashinfer-jit-cache" in req:
+                # Not on PyPI (only https://flashinfer.ai/whl), so they
+                # cannot be wheel dependencies; flashinfer handles the
+                # absence of pre-compiled cubins/jit-cache at runtime.
+                continue
+            if "nvidia-cutlass-dsl[cu13]" in req and cuda_major == "12":
+                # [cu13] extra is the default; strip it on CUDA 12 builds.
+                req = req.replace("nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl")
+            if "humming-kernels[cu13]" in req and cuda_major == "12":
+                req = req.replace("humming-kernels[cu13]", "humming-kernels[cu12]")
             modified_requirements.append(req)
         requirements = modified_requirements
     elif _is_hip():
-        requirements = _read_requirements("rocm.txt")
+        # DTK replaces torch/triton/amdsmi with vendor wheels and must never
+        # resolve the community ROCm index; see requirements/dcu.txt.  The
+        # self-built torch 2.16 + ROCm 10.1 stack pins its artifacts locally
+        # as well; see requirements/rocm101.txt.
+        if _is_hygon_dtk():
+            requirements = _read_requirements("dcu.txt")
+        elif _is_rocm101():
+            requirements = _read_requirements("rocm101.txt")
+        else:
+            requirements = _read_requirements("rocm.txt")
+        if "develop" in sys.argv[1:] and "--no-deps" not in sys.argv[1:]:
+            _check_requirements_preinstalled(requirements)
     elif _is_tpu():
         requirements = _read_requirements("tpu.txt")
     elif _is_cpu():
@@ -1077,10 +1376,13 @@ setup(
     ext_modules=ext_modules,
     install_requires=get_requirements(),
     extras_require={
+        # AMD Zen CPU optimizations via zentorch
+        "zen": ["zentorch==2.14.0.1"],
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],
         "tensorizer": ["tensorizer==2.10.1"],
-        "fastsafetensors": ["fastsafetensors >= 0.2.2"],
-        "runai": ["runai-model-streamer[s3,gcs] >= 0.15.3"],
+        "fastsafetensors": ["fastsafetensors >= 0.3.3"],
+        "instanttensor": ["instanttensor >= 0.2.2"],
+        "runai": ["runai-model-streamer[s3,gcs,azure] >= 0.15.7"],
         "audio": [
             "librosa",
             "scipy",
@@ -1092,6 +1394,7 @@ setup(
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for AMD FP4 quantization support
         "petit-kernel": ["petit-kernel"],
+        "b12x": ["b12x==1.5.1"],
         # Optional deps for Helion kernel development
         "helion": ["helion"],
         # Optional deps for OpenTelemetry tracing

@@ -340,6 +340,12 @@ def test_gfx906_packed_decode_matches_indexed_decode():
         state_indices=state_indices,
         scale=scale,
         use_qk_l2norm_in_kernel=True,
+        # Both are required by the op (vllm/_custom_ops.py) and default to
+        # False in the layer-level wrapper
+        # (vllm/model_executor/layers/fla/ops/fused_recurrent.py), so use the
+        # same values here.
+        use_tiled_qk_head_mapping=False,
+        use_transposed_state=False,
     )
 
     torch.testing.assert_close(

@@ -662,7 +662,18 @@ class GGUFConfig(QuantizationConfig):
         return "gguf"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.half, torch.bfloat16, torch.float32]
+        # gfx906 (Z100) has no native bf16 and the platform coerces bf16
+        # model dtypes to fp16 at load, so bf16 activations are not offered
+        # there unless the emulated bf16 datapath is explicitly enabled
+        # (VLLM_DCU_BF16=1).
+        dtypes = [torch.half, torch.bfloat16, torch.float32]
+        if current_platform.is_rocm():
+            from vllm.platforms.hygon_dtk import gfx906_bf16_enabled
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906() and not gfx906_bf16_enabled():
+                dtypes.remove(torch.bfloat16)
+        return dtypes
 
     @classmethod
     def get_min_capability(cls) -> int:

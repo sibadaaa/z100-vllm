@@ -26,6 +26,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # a non-causal layer onto a causal-only backend would fail.
     draft_vllm_config = replace(
         vllm_config,
+        # The drafter has its own ModelConfig (its own dtype via
+        # SpeculativeConfig.dtype, e.g. bf16 DFlash behind an fp16 target);
+        # model classes read vllm_config.model_config, so it must be the
+        # drafter's, not the target's.
+        model_config=draft_model_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
@@ -61,8 +66,12 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
-        dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
+    if (
+        target_lm_head is not None
+        and not getattr(dflash_model.config, "has_own_lm_head", False)
+        and _should_share(
+            dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
+        )
     ):
         if draft_lm_head is not None:
             del dflash_model.lm_head

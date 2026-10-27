@@ -15,7 +15,10 @@ from transformers import (
     PreTrainedTokenizerFast,
     SiglipVisionConfig,
 )
-from transformers.integrations.ggml import convert_gguf_tokenizer
+try:  # transformers >= 5.16 moved this out of integrations.ggml
+    from transformers.integrations.gguf import convert_gguf_tokenizer
+except ImportError:  # pragma: no cover - older transformers
+    from transformers.integrations.ggml import convert_gguf_tokenizer
 from transformers.modeling_gguf_pytorch_utils import (
     GGUF_TO_TRANSFORMERS_MAPPING,
     _gguf_parse_value,

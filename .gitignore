@@ -243,9 +243,6 @@ benchmarks/**/*.json
 actionlint
 shellcheck*/
 
-# Ignore moe/marlin_moe gen code
-csrc/libtorch_stable/moe/marlin_moe_wna16/kernel_*
-
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
 
@@ -301,11 +298,18 @@ verify_*.py
 test_*.py
 !tests/v1/core/test_mamba_align_chunk_split.py
 !tests/v1/attention/test_gdn_metadata_builder.py
+!tests/parser/test_metrics.py
+!tests/v1/spec_decode/test_metrics.py
 *_test.py
 *_verify.py
 *_validation.py
 .trash/
 
+# Local benchmark / profiling scratch
+.bench/
+.s20/
+.s21/
+.s*/
 !.buildkite/scripts/lib/
 
 # Generated gRPC protobuf files (compiled at build time from vllm_engine.proto)
@@ -315,3 +319,14 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# --- Hygon Z100 / gfx906 deliverables (hard rules 14 & 19) -------------------
+# The generic "*.sh" rule above hides tools/dcu/*.sh (s8b_gate.sh, s7_env.sh,
+# ...) and "test_*.py" hides tests/kernels/test_gfx906_packed_silu_fp16.py and
+# tests/platforms/test_hygon_dtk.py, so the Z100 gate scripts and regression
+# tests never showed up in `git status`. Whitelist them explicitly.
+!tools/dcu/**
+# ...but keep bytecode caches inside the whitelisted directory ignored.
+tools/dcu/__pycache__/
+!tests/kernels/test_gfx906_packed_silu_fp16.py
+!tests/platforms/test_hygon_dtk.py

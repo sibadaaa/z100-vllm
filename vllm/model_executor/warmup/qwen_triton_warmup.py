@@ -22,6 +22,8 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 
@@ -272,6 +274,69 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     )
 
 
+def _warm_chunked_gdn_prefill_kernels(
+    device: torch.device,
+    config: _QwenGDNWarmupConfig,
+) -> None:
+    """Compile and autotune the FLA chunked GDN prefill chain.
+
+    ``VLLM_GFX906_GDN_CHUNKED_PREFILL`` routes every gfx906 prefill step through
+    this chain (cumsum, KKT, solve_tril, wy_fast, delta_h, chunk_o). Those
+    kernels autotune per shape, so without a warmup the first prefill request
+    pays the whole cost -- measured 43 s of TTFT on a 512-token prompt versus
+    1.2 s once warm. Shapes mirror ``GatedDeltaNetAttention._forward_core``:
+    fp16 q/k/v, fp32 g/beta, fp32 [N,Hv,K,V] state.
+    """
+    from vllm.model_executor.layers.fla.ops.chunk import chunk_gated_delta_rule
+    from vllm.model_executor.layers.mamba.gdn_linear_attn import (
+        _gfx906_gdn_chunked_prefill_enabled,
+    )
+
+    if not _gfx906_gdn_chunked_prefill_enabled():
+        return
+
+    for length in (512, 2048):
+        q = torch.empty(
+            (1, length, config.h, config.k), dtype=config.conv_dtype, device=device
+        )
+        k = torch.empty_like(q)
+        v = torch.empty(
+            (1, length, config.hv, config.v), dtype=config.conv_dtype, device=device
+        )
+        g = torch.zeros((1, length, config.hv), dtype=torch.float32, device=device)
+        beta = torch.zeros((1, length, config.hv), dtype=torch.float32, device=device)
+        state = torch.zeros(
+            (1, config.hv, config.k, config.v),
+            dtype=config.state_dtype,
+            device=device,
+        )
+        cu_seqlens = torch.tensor([0, length], dtype=torch.int32, device=device)
+        try:
+            chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+            )
+        except Exception:
+            logger.warning(
+                "Chunked GDN prefill warmup (T=%d) failed; the first prefill "
+                "request may block on autotuning.",
+                length,
+                exc_info=True,
+            )
+        finally:
+            del q, k, v, g, beta, state, cu_seqlens
+
+    torch.accelerator.empty_cache()
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.accelerator.synchronize(device)
@@ -305,4 +370,6 @@ def qwen_triton_warmup(
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+    # No-op unless VLLM_GFX906_GDN_CHUNKED_PREFILL routes prefill to fla chunk.
+    _warm_chunked_gdn_prefill_kernels(device, gdn_config)
     _synchronize_device(device)

@@ -1,0 +1,59 @@
+{
+ "meta": {
+  "tag": "",
+  "backend": "nccl",
+  "world_size": 4,
+  "device_names": [
+   "Z100L",
+   "Z100L",
+   "Z100L",
+   "Z100L"
+  ],
+  "torch": "2.11.0",
+  "torch_version_hip": "6.3.26113",
+  "hostname": "bcce03530ee0",
+  "started_at": "2026-10-25T08:25:16+0800",
+  "finished_at": "2026-10-25T08:25:31+0800",
+  "iters": 140,
+  "warmup": 10,
+  "samples": 50,
+  "tol_bf16": 0.02,
+  "all_pass": true,
+  "env": {
+   "MASTER_PORT": "29613"
+  }
+ },
+ "sizes": [
+  {
+   "label": "81920B",
+   "elements": 40960,
+   "payload_bytes": 81920,
+   "iters": 140,
+   "samples": 50,
+   "mean_us": 101.28375428614942,
+   "p50_us": 89.97881428902993,
+   "p99_us": 147.4581571463724,
+   "min_us": 88.27172142835998,
+   "max_us": 147.4581571463724,
+   "std_us": 17.26080693342031,
+   "cv_pct": 17.04202915371269,
+   "payload_gbs": 0.8088167799206728,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  }
+ ]
+}

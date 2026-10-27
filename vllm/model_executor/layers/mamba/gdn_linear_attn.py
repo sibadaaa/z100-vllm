@@ -60,7 +60,7 @@ from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from transformers import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -97,6 +97,21 @@ def _is_gfx906_rocm() -> bool:
         and capability.major == 9
         and capability.minor == 0
     )
+
+
+def _gfx906_gdn_chunked_prefill_enabled() -> bool:
+    """A/B switch (default OFF): route gfx906 GDN true-prefill through the FLA
+    chunked kernels instead of the fused sigmoid-gating prefill kernel. The
+    Triton chunked chain is a 2.1-2.3x faster prefill on gfx906 for long
+    contexts, but it was bypassed at layer level when it was miscompiled there.
+    Ignored off gfx906.
+    """
+    return os.environ.get("VLLM_GFX906_GDN_CHUNKED_PREFILL", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def fi_chunk_gated_delta_rule(
@@ -144,7 +159,15 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
-@CustomOp.register("chunk_gated_delta_rule")
+# Fork-specific GDN implementation (gfx906 packed decode, chunked-prefill A/B
+# switches, MTP update).  The upstream re-sync also brought
+# mamba/gdn/qwen_gdn_linear_attn.py, which registers the canonical
+# "chunk_gated_delta_rule" name, and both modules are imported on the qwen3_5
+# path (this one via models/qwen3_5.py, the upstream one via the gdn_attn
+# backend) -> duplicate CustomOp registration crashed serve init.  This class is
+# instantiated directly (self.chunk_gated_delta_rule = ChunkGatedDeltaRule()),
+# so it does not need the canonical registry name.
+@CustomOp.register("chunk_gated_delta_rule_z100")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
         super().__init__()
@@ -991,7 +1014,10 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             assert prefill_query_start_loc is not None
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            if _is_gfx906_rocm():
+            use_gfx906_chunked_prefill = (
+                _is_gfx906_rocm() and _gfx906_gdn_chunked_prefill_enabled()
+            )
+            if _is_gfx906_rocm() and not use_gfx906_chunked_prefill:
                 if spec_sequence_masks is not None:
                     a_non_spec = a.index_select(0, non_spec_token_indx)
                     b_non_spec = b.index_select(0, non_spec_token_indx)
@@ -1027,6 +1053,39 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     use_qk_l2norm_in_kernel=False,
                 )
                 if self._uses_transposed_temporal_state():
+                    last_recurrent_state = last_recurrent_state.transpose(-1, -2)
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
+            elif use_gfx906_chunked_prefill:
+                # gfx906 A/B arm: same contract as the non-gfx906 branch below,
+                # but with the cache-layout conversions this fork actually uses.
+                #  * fla chunk takes token-first q/k/v/g/beta with head_first=False
+                #    (chunk.py:304-331, :424-426); the caller consumes [1,T,H,V]
+                #    (:1079-1082, MTP merge path).
+                #  * operator state is [N,H,K,V] (chunk_delta_h.py:210,429) while
+                #    the persistent cache is [slots,H,V,K]
+                #    (mamba_utils.py:295-299), so read *and* write are converted
+                #    (cf. qwen3_next.py:_gdn_recurrent_state_to_cache).
+                assert g_non_spec is not None
+                assert beta_non_spec is not None
+                initial_state = ssm_state[prefill_state_indices].contiguous()
+                if not self._uses_transposed_temporal_state():
+                    initial_state = initial_state.transpose(-1, -2).contiguous()
+                initial_state[~prefill_has_initial_state, ...] = 0
+                core_attn_out_non_spec, last_recurrent_state = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=prefill_query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=False,
+                )
+                if not self._uses_transposed_temporal_state():
                     last_recurrent_state = last_recurrent_state.transpose(-1, -2)
                 ssm_state[prefill_state_indices] = last_recurrent_state.to(
                     ssm_state.dtype

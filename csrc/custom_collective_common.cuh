@@ -58,6 +58,11 @@ using FlagType = uint32_t;
 struct Signal {
   alignas(128) FlagType start[kMaxBlocks][kMaxCustomCollectiveRanks];
   alignas(128) FlagType end[kMaxBlocks][kMaxCustomCollectiveRanks];
+  // S33 WP2: dedicated cells for the push kernel's mid barrier. The volatile
+  // exact-equality handshake below is the only cross-device sync flavor that
+  // behaves on gfx906 (the scoped-atomic end barrier does not order peer
+  // pushes against local reads there).
+  alignas(128) FlagType mid[kMaxBlocks][kMaxCustomCollectiveRanks];
   alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
 };
 
@@ -216,21 +221,6 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }
 
-template <int ngpus>
-DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
-                                      int rank) {
-  __syncthreads();
-  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-  if (threadIdx.x < ngpus) {
-    auto peer_counter_ptr = &sg.signals[threadIdx.x]->start[blockIdx.x][rank];
-    auto self_counter_ptr = &self_sg->start[blockIdx.x][threadIdx.x];
-    st_flag_release(peer_counter_ptr, flag);
-    while (ld_flag_acquire(self_counter_ptr) != flag);
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
-}
-
 // This function is meant to be used as the second or the final
 // synchronization barrier in the all reduce kernel. If it's the final
 // synchronization barrier, we don't need to make any visibility guarantees
@@ -279,22 +269,6 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }
 
-template <int ngpus>
-DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
-                                      int rank) {
-  __syncthreads();
-  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-  if (threadIdx.x < ngpus) {
-    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-                            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                  __ATOMIC_ACQUIRE,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
-}
-
 template <int ngpus, bool final_sync = false>
 DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
   __syncthreads();
@@ -317,10 +291,42 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }
 
+// S33 WP2: volatile flag helpers for the ROCm branch (the CUDA branch has
+// asm versions); C++ volatile derefs compile to glc accesses on GCN.
+static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
+  *(volatile FlagType*)flag_addr = flag;
+}
+
+static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
+  return *(volatile FlagType*)flag_addr;
+}
+
+// S33 WP2: mid barrier for the push kernel -- volatile exact-equality
+// handshake on the dedicated Signal::mid cells (the only cross-device flavor
+// that behaves on gfx906; the scoped-atomic end barrier does not order peer
+// pushes against local reads there).
+template <int ngpus>
+DINLINE void barrier_mid_volatile(const RankSignals& sg, Signal* self_sg,
+                                  int rank) {
+  __syncthreads();
+  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  if (threadIdx.x < ngpus) {
+    st_flag_volatile(&sg.signals[threadIdx.x]->mid[blockIdx.x][rank], flag);
+    while (ld_flag_volatile(&self_sg->mid[blockIdx.x][threadIdx.x]) != flag)
+      ;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
+
 #endif
 
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P* ptrs[], int idx) {
+  // S33 WP2 note: volatile member-wise loads were tried here for the pull
+  // kernels; on gfx906 they neither fixed cross-device staleness nor are
+  // needed by the push kernel (whose reduce reads LOCAL regions). Keep the
+  // upstream plain loads.
   A tmp = upcast(ptrs[0][idx]);
 #pragma unroll
   for (int i = 1; i < ngpus; i++) {

@@ -22,7 +22,9 @@ from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.qwen3 import (
     TOOL_CALL_END,
     TOOL_CALL_START,
+    Qwen3Parser,
     qwen3_config,
+    repair_loose_opener,
 )
 
 
@@ -272,6 +274,53 @@ class TestNonStreaming:
         assert args == {
             "questions": '[{"question": "Pick a color",'
             ' "multiSelect": false, "answer": null}]',
+        }
+
+    @pytest.mark.parametrize(
+        "unclosed_func",
+        ["<function=function_name", "<function=function_name>"],
+    )
+    def test_regression_issue_58227(self, parser, mock_request, unclosed_func):
+        """Regression issue 58227
+        Check cases:
+        * <function=...<tool_call>
+        * <function=abc>...<function=
+        """
+        text = (
+            f"Use <tool_call>\n{unclosed_func}\n"
+            "Wait, let me call the real tool via <tool_call>:\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert result.tool_calls[-1].function.name == "get_weather"
+        assert json.loads(result.tool_calls[-1].function.arguments) == {
+            "city": "Tokyo",
+        }
+
+    def test_tool_call_tag_is_ok_inside_parameter(self, parser, mock_request):
+        """Regression issue 58227
+        Check that <tool_call> tag is ok inside parameter value
+        """
+        text = (
+            "<tool_call>\n"
+            "<function=write_file>\n"
+            "<parameter=content>Document <tool_call> usage</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "write_file"
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "content": "Document <tool_call> usage",
         }
 
 
@@ -634,6 +683,69 @@ class TestStreaming:
 
         assert "Bash" in names
         assert "Read" in names
+
+    @pytest.mark.parametrize(
+        "unclosed_func",
+        ["<function=function_name", "<function=function_name>"],
+    )
+    def test_streaming_regression_issue_58227(
+        self, parser, mock_request, unclosed_func
+    ):
+        """Regression issue 58227
+        Check cases:
+        * <function=...<tool_call>
+        * <function=abc>...<function=
+        """
+        chunks = [
+            "Use <tool_call>\n",
+            f"{unclosed_func}\n",
+            "Wait, let me call the real tool via ",
+            "<tool_call>",
+            ":\n",
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        calls_by_index: dict[int, dict[str, str]] = {}
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    entry = calls_by_index.setdefault(
+                        tc.index, {"name": "", "arguments": ""}
+                    )
+                    if tc.function:
+                        if tc.function.name:
+                            entry["name"] += tc.function.name
+                        if tc.function.arguments:
+                            entry["arguments"] += tc.function.arguments
+
+        last_call = calls_by_index[max(calls_by_index)]
+        assert last_call["name"] == "get_weather"
+        assert json.loads(last_call["arguments"]) == {"city": "Tokyo"}
+
+    def test_streaming_tool_call_tag_is_ok_inside_parameter(self, parser, mock_request):
+        """Regression issue 58227
+        Check that <tool_call> tag is ok inside parameter value
+        """
+        chunks = [
+            "<tool_call>\n",
+            "<function=write_file>\n",
+            "<parameter=content>Document ",
+            "<tool_call>",
+            " usage</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "write_file"
+        assert json.loads(collect_tool_arguments(results)) == {
+            "content": "Document <tool_call> usage",
+        }
 
 
 class TestArgConverter:
@@ -1175,3 +1287,246 @@ class TestNestedSchemaCoercion:
         assert questions[0]["question"] == "Pick a color"
         assert questions[0]["multiSelect"] is False
         assert questions[0]["answer"] is None
+
+
+class TestLooseToolOpeners:
+    """Quantized checkpoints sometimes open a tool call with the bare name
+    (``<tool_call>\\n<bash>``) instead of ``<function=bash>``. The requested
+    tool names make the intent unambiguous, so the parser repairs it instead
+    of silently dropping the whole call."""
+
+    @pytest.fixture
+    def tools(self):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        return [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            )
+            for name in ("bash", "web_fetch")
+        ]
+
+    @pytest.fixture
+    def loose_parser(self, mock_tokenizer, tools):
+        return Qwen3Parser(
+            mock_tokenizer,
+            tools,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+    def test_repair_helper_leaves_canonical_openers_alone(self):
+        region = "\n<function=bash>\n<parameter=x>1</parameter>\n</function>"
+        assert repair_loose_opener(region, frozenset({"bash"})) == region
+
+    def test_repair_helper_ignores_unknown_names(self):
+        region = "\n<unknown_tool>\n"
+        assert repair_loose_opener(region, frozenset({"bash"})) == region
+
+    def test_repair_helper_rewrites_requested_name(self):
+        region = "\n<bash>\n"
+        assert (
+            repair_loose_opener(region, frozenset({"bash"}))
+            == "\n<function=bash>\n"
+        )
+
+    def test_non_streaming_loose_opener(self, loose_parser, mock_request):
+        text = (
+            "Let me check that.\n\n"
+            "<tool_call>\n"
+            "<bash>\n"
+            "<parameter=command>\n"
+            "ls -la /tmp\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = loose_parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "bash"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"command": "ls -la /tmp"}
+        assert "Let me check that." in (result.content or "")
+
+    def test_non_streaming_canonical_opener_still_works(
+        self, loose_parser, mock_request
+    ):
+        text = (
+            "<tool_call>\n"
+            "<function=web_fetch>\n"
+            "<parameter=url>https://example.com</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = loose_parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert result.tool_calls[0].function.name == "web_fetch"
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "url": "https://example.com"
+        }
+
+    def test_streaming_loose_opener_split_mid_name(
+        self, loose_parser, mock_request
+    ):
+        """``<b`` + ``ash`` + ``>`` arrives as separate deltas."""
+        chunks = [
+            "Working on it.\n",
+            "<tool_call>",
+            "\n",
+            "<b",
+            "ash",
+            ">",
+            "\n",
+            "<parameter=command>",
+            "\n",
+            "ls -la /tmp",
+            "\n",
+            "</parameter>",
+            "\n",
+            "</function>",
+            "\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(loose_parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "bash"
+        args_text = collect_tool_arguments(results)
+        assert json.loads(args_text) == {"command": "ls -la /tmp"}
+        assert collect_content(results).strip().startswith("Working on it.")
+
+    def test_streaming_loose_opener_single_chunk(self, loose_parser, mock_request):
+        chunks = [
+            "<tool_call>\n<web_fetch>\n",
+            "<parameter=url>https://example.com</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(loose_parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "web_fetch"
+        assert json.loads(collect_tool_arguments(results)) == {
+            "url": "https://example.com"
+        }
+
+    def test_streaming_loose_opener_char_by_char(self, loose_parser, mock_request):
+        full_text = (
+            "Sure.\n"
+            "<tool_call>\n"
+            "<bash>\n"
+            "<parameter=command>echo hi</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        results = simulate_tool_streaming(
+            loose_parser, mock_request, list(full_text)
+        )
+
+        assert collect_function_name(results) == "bash"
+        assert json.loads(collect_tool_arguments(results)) == {"command": "echo hi"}
+        assert collect_content(results).strip().startswith("Sure.")
+
+    def test_unrequested_name_is_not_repaired(self, loose_parser, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<other_tool>\n"
+            "<parameter=x>1</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = loose_parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+
+    def test_plain_text_is_untouched(
+        self, mock_tokenizer, tools, mock_request
+    ):
+        parser = Qwen3Parser(
+            mock_tokenizer,
+            tools,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        text = "Use the docs. 5 < 6, and <br> stays literal."
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.content == text
+
+    def test_non_streaming_two_loose_openers(self, loose_parser, mock_request):
+        text = (
+            "<tool_call>\n<bash>\n<parameter=command>ls</parameter>\n"
+            "</function>\n</tool_call>"
+            "<tool_call>\n<web_fetch>\n"
+            "<parameter=url>https://example.com</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        result = loose_parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert [tc.function.name for tc in result.tool_calls] == [
+            "bash",
+            "web_fetch",
+        ]
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "command": "ls"
+        }
+        assert json.loads(result.tool_calls[1].function.arguments) == {
+            "url": "https://example.com"
+        }
+
+    def test_streaming_two_loose_openers(self, loose_parser, mock_request):
+        chunks = [
+            "<tool_call>\n<bash>\n<parameter=command>ls</parameter>\n"
+            "</function>\n</tool_call>",
+            "<tool_call>\n<web_fetch>\n"
+            "<parameter=url>https://example.com</parameter>\n"
+            "</function>\n</tool_call>",
+        ]
+        results = simulate_tool_streaming(loose_parser, mock_request, chunks)
+
+        names = []
+        per_index: dict[int, str] = {}
+        for delta, _ in results:
+            if not (delta and delta.tool_calls):
+                continue
+            for tc in delta.tool_calls:
+                if tc.function and tc.function.name:
+                    names.append(tc.function.name)
+                if tc.function and tc.function.arguments:
+                    per_index[tc.index] = (
+                        per_index.get(tc.index, "") + tc.function.arguments
+                    )
+        assert names == ["bash", "web_fetch"]
+        assert json.loads(per_index[0]) == {"command": "ls"}
+        assert json.loads(per_index[1]) == {"url": "https://example.com"}
+
+
+@pytest.mark.parametrize("value", ["\n北京 &amp;\n", "null", "42", "", "a\nb"])
+@pytest.mark.parametrize("chunk_size", [1, 7, 1000])
+def test_mimo_preserves_verbatim_parameter_values(
+    mock_tokenizer, mock_request, value, chunk_size
+):
+    from vllm.parser.mimo import MiMoParser
+
+    text = (
+        f"<tool_call><function=run><parameter=text>{value}</parameter>"
+        "</function></tool_call>"
+    )
+    parser = MiMoParser(mock_tokenizer, chat_template_kwargs={"enable_thinking": False})
+    result = parser.extract_tool_calls(text, mock_request)
+    assert json.loads(result.tool_calls[0].function.arguments) == {"text": value}
+    parser = MiMoParser(mock_tokenizer, chat_template_kwargs={"enable_thinking": False})
+    results = simulate_tool_streaming(
+        parser,
+        mock_request,
+        [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)],
+    )
+    assert collect_function_name(results) == "run"
+    assert json.loads(collect_tool_arguments(results)) == {"text": value}

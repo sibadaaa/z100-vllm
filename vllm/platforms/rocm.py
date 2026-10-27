@@ -17,6 +17,15 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from .hygon_dtk import (
+    dcu_custom_ar_enabled,
+    dcu_device_memory_total_bytes,
+    dcu_device_unique_id,
+    gcn_arch,
+    gfx906_bf16_enabled,
+    is_hygon_dtk,
+    normalize_gcn_arch,
+)
 from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
 
 if TYPE_CHECKING:
@@ -24,12 +33,17 @@ if TYPE_CHECKING:
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
+    from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+    from vllm.v1.attention.backends.mla.prefill.selector import (
+        MLAPrefillSelectorConfig,
+    )
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
 logger = init_logger(__name__)
 
 _KV_CACHE_DTYPE_REASON = "kv_cache_dtype not supported"
 _TURBOQUANT_LAYOUT_REASON = "no KV cache layout in common with TURBOQUANT"
+_ULTRAQUANT_LAYOUT_REASON = "no KV cache layout in common with ULTRAQUANT"
 
 try:
     from amdsmi import (
@@ -45,7 +59,10 @@ try:
         amdsmi_topo_get_numa_node_number,
     )
 except ImportError as e:
+    _HAS_AMDSMI = False
     logger.warning("Failed to import from amdsmi with %r", e)
+else:
+    _HAS_AMDSMI = True
 
 try:
     import vllm._C  # noqa: F401
@@ -161,6 +178,10 @@ _sync_hip_cuda_env_vars()
 def with_amdsmi_context(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if not _HAS_AMDSMI:
+            # Hygon DCU (DTK) images may not ship the amdsmi python module;
+            # the wrapped function is expected to fall back on its own.
+            return fn(*args, **kwargs)
         amdsmi_init()
         try:
             return fn(*args, **kwargs)
@@ -193,15 +214,39 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 
 
 def _get_gcn_arch() -> str:
-    """Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
-    Called once at module level; result stored in _GCN_ARCH.
+    """Resolve the GCN arch of device 0.
+
+    On Hygon DCU (DTK) hosts ``amdsmi`` may be missing or report a bogus
+    arch such as ``gfx18446744073709551615``, so the DTK helper validates
+    every source before accepting it. On community ROCm hosts the
+    historical amdsmi-first order is kept. Called once at module load;
+    the result is stored in ``_GCN_ARCH``.
     """
+    if is_hygon_dtk() or envs.VLLM_DCU_GCN_ARCH:
+        arch = gcn_arch()
+        if arch is not None:
+            return arch
+        raise RuntimeError(
+            "Could not determine the GCN arch on this Hygon DCU (DTK) host. "
+            "Set it explicitly, e.g. VLLM_DCU_GCN_ARCH=gfx906."
+        )
+
     try:
-        return _query_gcn_arch_from_amdsmi()
+        raw_arch = _query_gcn_arch_from_amdsmi()
+        arch = normalize_gcn_arch(raw_arch)
+        if arch is not None:
+            return arch
+        logger.warning_once(
+            "amdsmi reported the invalid GCN arch %r; falling back to torch.",
+            raw_arch,
+        )
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-    # Ultimate fallback: use torch.cuda (will initialize CUDA)
-    return torch.cuda.get_device_properties("cuda").gcnArchName
+    # Ultimate fallback: use torch.cuda (will initialize CUDA). An integer
+    # device index is used on purpose: passing the string "cuda" deadlocks
+    # on DTK's torch.
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    return normalize_gcn_arch(arch)
 
 
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
@@ -213,6 +258,7 @@ _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
 _ON_GFX11 = "gfx11" in _GCN_ARCH
 _ON_GFX1100 = "gfx1100" in _GCN_ARCH
 _ON_GFX1151 = "gfx1151" in _GCN_ARCH
+_ON_GFX115X = "gfx115" in _GCN_ARCH
 _ON_GFX12X = any(arch in _GCN_ARCH for arch in ["gfx12"])
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
 _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
@@ -236,12 +282,52 @@ def on_gfx906() -> bool:
 def _rocm_supported_dtypes() -> list[torch.dtype]:
     """Supported dtypes for the current ROCm device.
 
-    gfx906 lacks native bfloat16, so returns fp16/fp32 there; other
-    GFX9 (gfx90a+) additionally include bfloat16.
+    gfx906 (Vega20 / Hygon DCU Z100) has no bf16 instructions at all: the
+    ISA provides neither a bf16 conversion nor a bf16 dot product, so any
+    bf16 math is emulated in software -- and the emulated bf16 GEMM is the
+    slowest of the three precisions (measured 8.2 vs 10.5 TFLOP/s fp32 at
+    4096^3 on Z100L; fp16 reaches 18.2). The default is therefore
+    fp16-only: bf16 is offered only when the user opts back in with
+    ``VLLM_DCU_BF16=1`` (or ``=auto`` with a passing device probe, see
+    ``vllm.platforms.hygon_dtk``). float16 stays first, so ``--dtype auto``
+    keeps preferring the natively accelerated dtype.
+
+    Both stacks are covered: the probe runs torch ops only, and on the
+    ROCm 10.1 stack real-model bf16 execution was verified correct (Qwen3-0.6B
+    and Qwen3.5-4B greedy token streams identical to fp16, finite logprobs; see
+    docs/result/z100-rocm101-acceptance.md).  Note the earlier bf16 NaN report
+    was a misattribution of the Z100-SKU runtime fault (F24): it reproduces on
+    cards 2/3 whatever the dtype, while cards 0/1 run bf16 correctly.
     """
     if _ON_GFX906:
-        return [torch.float16, torch.float32]
+        dtypes = [torch.float16, torch.float32]
+        if gfx906_bf16_enabled():
+            dtypes.insert(1, torch.bfloat16)
+        return dtypes
     return [torch.float16, torch.bfloat16, torch.float32]
+
+
+def gfx906_coerce_model_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Coerce a requested model dtype for gfx906 (Z100).
+
+    gfx906 has no native bf16 hardware: every bf16 op is emulated in
+    software and the emulated bf16 GEMM is the slowest of the three
+    precisions. Unless the user opts back in with ``VLLM_DCU_BF16``, a
+    bfloat16 request is coerced to float16 at load so every op runs on
+    its fp16 kernel; the weights convert once through fp32 with the
+    standard fp16 inference semantics. Non-bf16 dtypes and non-gfx906
+    platforms pass through unchanged.
+    """
+    if dtype != torch.bfloat16 or not _ON_GFX906:
+        return dtype
+    if gfx906_bf16_enabled():
+        return dtype
+    logger.warning_once(
+        "gfx906 (Z100) has no native bfloat16: coercing the requested "
+        "bfloat16 model dtype to float16 (weights convert at load). Set "
+        "VLLM_DCU_BF16=1 to keep the emulated bf16 datapath instead."
+    )
+    return torch.float16
 
 
 def _set_rocm_nccl_workarounds():
@@ -346,6 +432,10 @@ def on_gfx1151() -> bool:
     return _ON_GFX1151
 
 
+def on_gfx115x() -> bool:
+    return _ON_GFX115X
+
+
 def on_gfx12x() -> bool:
     return _ON_GFX12X and not _ON_CDNA
 
@@ -442,6 +532,17 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
+    #
+    # gfx906 (Vega20 / Hygon Z100) matches on_cdna() because "gfx9" is a
+    # substring of "gfx906", but the kernel in csrc/rocm/attention.cu is
+    # MFMA-only: for arches outside __HIP__GFX9__ its body degrades to
+    # UNREACHABLE_CODE (csrc/rocm/attention.cu:3293-3307), so selecting this
+    # path on gfx906 hits a device-side assertion (verified on hardware, see
+    # docs/result/z100-05-csrc-kernels-result.md). Fall through to the Triton
+    # paged-attention path instead.
+    if on_gfx906():
+        return False
+
     if on_cdna():
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
@@ -537,6 +638,7 @@ def _get_backend_priorities(
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
+    backends.append(AttentionBackendEnum.ULTRAQUANT)
 
     # gfx906 has no MFMA/wave64, so ROCM_ATTN serves GQA decode with the
     # generic 2D paged kernel, ~24x slower than the unified 3D Triton kernel
@@ -553,6 +655,14 @@ def _uses_turboquant(vllm_config: "VllmConfig | None") -> bool:
     cache_config = getattr(vllm_config, "cache_config", None)
     return cache_config is not None and str(cache_config.cache_dtype).startswith(
         "turboquant_"
+    )
+
+
+def _uses_ultraquant(vllm_config: "VllmConfig | None") -> bool:
+    """Whether the run's KV cache dtype is the UltraQuant 4-bit format."""
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return (
+        cache_config is not None and str(cache_config.cache_dtype) == "ultraquant_4bit"
     )
 
 
@@ -574,12 +684,29 @@ def _shares_layout_with_turboquant(backend_class: type["AttentionBackend"]) -> b
     return not set(layouts).isdisjoint(turboquant_layouts)
 
 
+def _shares_layout_with_ultraquant(backend_class: type["AttentionBackend"]) -> bool:
+    """Whether this backend reads a KV cache layout ULTRAQUANT reads too.
+
+    Same constraint as _shares_layout_with_turboquant: an ultraquant_4bit run
+    keeps its boundary layers at the native dtype, and one layout has to serve
+    the whole worker.
+    """
+    layouts = backend_class.supported_kv_cache_layouts()
+    ultraquant_layouts = (
+        AttentionBackendEnum.ULTRAQUANT.get_class().supported_kv_cache_layouts()
+    )
+    if layouts is None or ultraquant_layouts is None:
+        return True
+    return not set(layouts).isdisjoint(ultraquant_layouts)
+
+
 def _get_invalid_reasons(
     backend_class: type["AttentionBackend"],
     device_capability: DeviceCapability,
     attn_selector_config: "AttentionSelectorConfig",
     *,
     is_turboquant_run: bool,
+    is_ultraquant_run: bool = False,
 ) -> list[str]:
     """Why this backend cannot serve the layer, empty when it can."""
     invalid_reasons = backend_class.validate_configuration(
@@ -592,6 +719,12 @@ def _get_invalid_reasons(
         and not _shares_layout_with_turboquant(backend_class)
     ):
         invalid_reasons = [_TURBOQUANT_LAYOUT_REASON]
+    if (
+        not invalid_reasons
+        and is_ultraquant_run
+        and not _shares_layout_with_ultraquant(backend_class)
+    ):
+        invalid_reasons = [_ULTRAQUANT_LAYOUT_REASON]
     return invalid_reasons
 
 
@@ -723,7 +856,7 @@ class RocmPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend: "AttentionBackendEnum",
+        selected_backend: "AttentionBackendEnum | None",
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
@@ -735,13 +868,16 @@ class RocmPlatform(Platform):
             # Keep lazy: vllm.config imports current_platform during initialization.
             from vllm.config import get_current_vllm_config_or_none
 
-            is_turboquant_run = _uses_turboquant(get_current_vllm_config_or_none())
+            vllm_config = get_current_vllm_config_or_none()
+            is_turboquant_run = _uses_turboquant(vllm_config)
+            is_ultraquant_run = _uses_ultraquant(vllm_config)
             try:
                 sel_invalid_reasons = _get_invalid_reasons(
                     selected_backend.get_class(),
                     device_capability,
                     attn_selector_config,
                     is_turboquant_run=is_turboquant_run,
+                    is_ultraquant_run=is_ultraquant_run,
                 )
             except ImportError:
                 sel_invalid_reasons = ["ImportError"]
@@ -751,21 +887,23 @@ class RocmPlatform(Platform):
                     selected_backend.name,
                 )
                 return selected_backend.get_path()
-            # Only tolerate the mismatch when turboquant is in play: boundary
-            # layers keep the native dtype while every other layer needs
-            # TURBOQUANT, so no single --attention-backend can serve every layer.
-            # For any other dtype the selection is genuinely invalid -> fail loud.
+            # Only tolerate the mismatch when turboquant or ultraquant is in play:
+            # boundary layers keep the native dtype while every other layer needs
+            # the packed backend, so no single --attention-backend can serve every
+            # layer. For any other dtype the selection is genuinely invalid -> fail
+            # loud.
             kv_dtype = attn_selector_config.kv_cache_dtype
             layer_is_turboquant = kv_dtype is not None and str(kv_dtype).startswith(
                 "turboquant"
             )
-            is_turboquant_fallback = (
-                is_turboquant_run or layer_is_turboquant
+            is_packed_kv_fallback = (
+                is_turboquant_run or layer_is_turboquant or is_ultraquant_run
             ) and sel_invalid_reasons in (
                 [_KV_CACHE_DTYPE_REASON],
                 [_TURBOQUANT_LAYOUT_REASON],
+                [_ULTRAQUANT_LAYOUT_REASON],
             )
-            if not is_turboquant_fallback:
+            if not is_packed_kv_fallback:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "
                     f"this configuration. Reason: {sel_invalid_reasons}"
@@ -773,10 +911,11 @@ class RocmPlatform(Platform):
             # NOTE: pass a str (not the list) -- info_once hashes its args.
             logger.info_once(
                 "Selected backend %s is incompatible with this layer (%s) of "
-                "the turboquant run; using the auto-selected per-layer backend. "
+                "the %s run; using the auto-selected per-layer backend. "
                 "Reason: %s",
                 selected_backend.name,
                 attn_selector_config.attn_type,
+                "ultraquant" if is_ultraquant_run else "turboquant",
                 str(sel_invalid_reasons),
             )
 
@@ -880,7 +1019,11 @@ class RocmPlatform(Platform):
             is_flash_attn_varlen_func_available,
         )
 
-        if rocm_aiter_ops.is_mha_enabled() and on_cdna():
+        if (
+            rocm_aiter_ops.is_mha_enabled()
+            and on_cdna()
+            and (dtype == torch.float16 or dtype == torch.bfloat16)
+        ):
             logger.info_once("Using AITER Flash Attention backend for ViT model.")
             return AttentionBackendEnum.ROCM_AITER_FA
 
@@ -917,6 +1060,57 @@ class RocmPlatform(Platform):
         return AttentionBackendEnum.TORCH_SDPA
 
     @classmethod
+    def get_mla_prefill_backend_cls(
+        cls,
+        mla_selector_config: "MLAPrefillSelectorConfig",
+    ) -> "type[MLAPrefillBackend]":
+        """On ROCm, prefer the AITER FlashAttention backend, falling back to
+        FlashAttention.
+
+        Raises:
+            ValueError: If neither backend is valid for the configuration.
+
+        """
+        from vllm.v1.attention.backends.mla.prefill.registry import (
+            MLAPrefillBackendEnum,
+        )
+
+        device_capability = cls.get_device_capability()
+        all_invalid_reasons: dict[str, list[str]] = {}
+        for backend_enum in (
+            MLAPrefillBackendEnum.ROCM_AITER_FA,
+            MLAPrefillBackendEnum.FLASH_ATTN,
+        ):
+            try:
+                backend_cls = backend_enum.get_class()
+                invalid_reasons = backend_cls.validate_configuration(
+                    device_capability, mla_selector_config
+                )
+            except ImportError:
+                invalid_reasons = ["ImportError"]
+            if not invalid_reasons:
+                return backend_cls
+            all_invalid_reasons[backend_enum.name] = invalid_reasons
+
+        reasons_str = (
+            "{"
+            + ", ".join(
+                f"{name}: [{', '.join(reasons)}]"
+                for name, reasons in all_invalid_reasons.items()
+            )
+            + "}"
+        )
+        logger.debug_once(
+            "Some MLA prefill backends are not valid with %s. Reasons: %s.",
+            repr(mla_selector_config),
+            reasons_str,
+        )
+        raise ValueError(
+            f"No valid MLA prefill backend found with {mla_selector_config!r}. "
+            f"Reasons: {reasons_str}."
+        )
+
+    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """Set the device for the current platform."""
         torch.cuda.set_device(device)
@@ -944,6 +1138,16 @@ class RocmPlatform(Platform):
     @with_amdsmi_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         """Query if the set of gpus are fully connected by xgmi (1 hop)."""
+        if not _HAS_AMDSMI:
+            # DTK exposes no XGMI topology query. Report False (i.e. "cannot
+            # confirm"), which makes vLLM keep the standard RCCL allreduce
+            # instead of a peer-to-peer custom allreduce.
+            logger.debug_once(
+                "amdsmi unavailable; assuming GPUs are not fully connected. "
+                "Pass --disable-custom-all-reduce if a peer-to-peer allreduce "
+                "hangs on this Hygon DCU host."
+            )
+            return False
         handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
@@ -962,6 +1166,10 @@ class RocmPlatform(Platform):
     @with_amdsmi_context
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
+        if not _HAS_AMDSMI:
+            if is_hygon_dtk():
+                return "Hygon DCU Z100 (gfx906)" if _ON_GFX906 else "Hygon DCU"
+            return torch.cuda.get_device_name(device_id)
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         handle = amdsmi_get_processor_handles()[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
@@ -973,11 +1181,17 @@ class RocmPlatform(Platform):
     @classmethod
     @with_amdsmi_context
     def get_device_uuid(cls, device_id: int = 0) -> str:
+        if not _HAS_AMDSMI:
+            # DTK ships the device UUID in sysfs; prefer it over initializing
+            # a HIP context just to read an identifier. Indexing mirrors the
+            # amdsmi branch below, which also uses the logical device id.
+            return dcu_device_unique_id(device_id) or ""
+        device_uuid = ""
         try:
             device = amdsmi_get_processor_handles()[device_id]
         except AmdSmiException as error:
             logger.error("amdsmi device query failed ", exc_info=error)
-            return ""
+            return dcu_device_unique_id(device_id) or ""
         try:
             device_uuid = amdsmi_get_gpu_device_uuid(device)
         except AmdSmiException as error:
@@ -997,10 +1211,19 @@ class RocmPlatform(Platform):
             return _query_total_memory_from_amdsmi(physical_device_id)
         except Exception as e:
             logger.debug("Failed to get total memory via amdsmi: %s", e)
-            logger.warning_once(
-                "Failed to get total memory via amdsmi, falling back to "
-                "torch.cuda. This will initialize CUDA."
-            )
+        # Hygon DCU (DTK): the sysfs node is context-free as well, so keep the
+        # `fork`-friendly path instead of initializing CUDA through torch.
+        try:
+            physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        except Exception:
+            physical_device_id = device_id
+        total = dcu_device_memory_total_bytes(physical_device_id)
+        if total:
+            return total
+        logger.warning_once(
+            "Failed to get total memory from sysfs, falling back to "
+            "torch.cuda. This will initialize CUDA."
+        )
         return torch.cuda.get_device_properties(device_id).total_memory
 
     @classmethod
@@ -1024,6 +1247,15 @@ class RocmPlatform(Platform):
 
         if use_aiter_fp8_linear and "-quant_fp8" not in compilation_config.custom_ops:
             compilation_config.custom_ops.append("+quant_fp8")
+
+        # Only RMSNorm's custom op reaches rms_norm_batch_invariant. Inductor
+        # lowers the native one to a reduction whose block size it picks by
+        # benchmarking, so the summation order varies with the batch and run.
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and "-rms_norm" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+rms_norm")
 
         if use_aiter_fused_se and "-grouped_topk" in compilation_config.custom_ops:
             logger.warning_once(
@@ -1130,7 +1362,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_cdna() or on_rdna4()
+        return on_cdna() or on_rdna()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
@@ -1147,7 +1379,10 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
+            return True
+        # gfx906 is opt-in only: VLLM_DCU_CUSTOM_AR=1, off by default.
+        return _ON_GFX906 and dcu_custom_ar_enabled()
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
@@ -1156,6 +1391,27 @@ class RocmPlatform(Platform):
     @classmethod
     def is_navi(cls) -> bool:
         return "gfx1" in _GCN_ARCH
+
+    @classmethod
+    def enable_multi_stream_overlap(
+        cls,
+        aux_stream_list: list[torch.cuda.Stream] | None,
+        attn_metadata: object,
+    ) -> bool:
+        """ROCm multi-stream gates: streams and capture region.
+
+        Dict metadata marks piecewise cudagraph, whose eager breaks rebuild
+        the attention inputs on the owning stream. Forking side streams
+        there would rely on runtime HIP event sync, which is unreliable in
+        this overlap on ROCm (event waits can hang), so multi-stream only
+        runs where the fork/join becomes static graph edges: inside capture,
+        or with non-dict metadata (full cudagraph or the profile run), which
+        has no eager breaks.
+        """
+        return aux_stream_list is not None and (
+            torch.cuda.is_current_stream_capturing()
+            or not isinstance(attn_metadata, dict)
+        )
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
@@ -1286,12 +1542,14 @@ class RocmPlatform(Platform):
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         #  Aiter rms norm perform best when CUDA Graph capture is enabled.
-        # TODO(luka/TJ) remove env vars completely
+        # TODO(Rohan138/dllehr-amd/rasmith) Change this to be an inclusive
+        # check instead of exclusive check in the future.
         if (
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
             and not on_rdna4()
+            and not on_gfx90a()  # AITER not built for gfx90a, rmsnorm -> SEGV.
         ):
             rms_norm = ["aiter"] + default
         else:
@@ -1330,3 +1588,18 @@ class RocmPlatform(Platform):
         except Exception as e:
             logger.warning("Failed to get NUMA nodes for GPUs: %s", e)
             return None
+
+
+# Hygon DCU DP4X workaround (F24): install the Triton launch guard before any
+# process can launch a kernel. On DP4X (Z100) boards under an upstream-derived
+# HIP runtime, kernels compiled at the gfx906 VGPR maximum silently
+# mis-execute; the guard forces enough warps to stay below that envelope. It is
+# a no-op on non-Hygon hosts and on the vendor DTK runtime, which is DP4X-aware.
+# See vllm/platforms/hygon_dp4x.py and
+# docs/result/F24-investigation-20261018.md.
+try:
+    from .hygon_dp4x import install_dp4x_triton_guard
+
+    install_dp4x_triton_guard()
+except Exception:  # pragma: no cover - the guard must never break platform init
+    logger.debug("Hygon DCU DP4X guard not installed", exc_info=True)

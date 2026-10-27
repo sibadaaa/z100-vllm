@@ -16,14 +16,26 @@ import vllm.envs as envs
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    PAD_SLOT_ID,
+)
 
 
 _GFX906_MTP_CONV_DEBUG_REPORTED = False
 
-# gfx906 escape hatch: set VLLM_GFX906_TRITON_CAUSAL_CONV1D=0 to keep
-# routing prefill causal-conv1d through the per-sequence PyTorch fallback.
+# gfx906 escape hatch: set VLLM_GFX906_TRITON_CAUSAL_CONV1D=1 to route prefill
+# causal-conv1d through the Triton kernel.  Default OFF (fallback below) because
+# on Qwen3.8-27B W8A8 INT8 serving the Triton path deterministically selects a
+# degenerate generation attractor: thinking loops that never emit content, empty
+# responses and repetition (4/4 engine starts), while the fallback does not
+# (0/4).  The Triton kernel itself is *numerically identical* to the fallback
+# here (12/12 in-engine call replays bit-equal, state included), so the trigger
+# is an indirect side effect (layout/kernel-schedule dependent), not the conv
+# math; see docs/result/z100-15-conv-prefill-quality-result.md.  Cost of the
+# fallback is small: prefill 394 vs 424 t/s @2048 tokens (TP=4, eager).
 ENABLE_GFX906_TRITON_CAUSAL_CONV1D = os.getenv(
-    "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "1"
+    "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "0"
 ).lower() in {"1", "true", "yes", "on"}
 
 # gfx906 launch-safety sync: synchronize the stream right after the Triton
@@ -43,6 +55,101 @@ ENABLE_GFX906_TRITON_CAUSAL_CONV1D_SYNC = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 
 
+def _gfx906_conv_window_read(state: torch.Tensor, window_len: int) -> torch.Tensor:
+    """Return the rolling window inside a conv-state slot.
+
+    The conv state is a FIFO of ``cache_len = width - 1 + num_spec`` tokens.
+    The MTP update kernel reads its window starting at ``num_accepted - 1`` and
+    re-normalises it to the front of the slot
+    (``csrc/mamba/gfx906_decode_kernels.cu:222-284``), so once speculative
+    decoding widens the slot the newest ``width - 1`` tokens live at the FRONT.
+    Without speculation the slot is exactly ``width - 1`` wide and both
+    alignments are identical.
+    """
+    if window_len <= 0:
+        return state[..., :0]
+    cache_len = state.shape[-1]
+    if cache_len > window_len:
+        return state[..., :window_len]
+    return state[..., cache_len - window_len :]
+
+
+def _gfx906_conv_window_write(window: torch.Tensor, cache_len: int) -> torch.Tensor:
+    """Pack the rolling window back into a conv-state slot (see above)."""
+    if window.shape[-1] == cache_len:
+        return window
+    out = torch.zeros(
+        (*window.shape[:-1], cache_len), dtype=window.dtype, device=window.device
+    )
+    out[..., : window.shape[-1]] = window
+    return out
+
+
+def _gfx906_conv_state_rows(
+    conv_states: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    num_seqs: int,
+    state_len: int,
+    pad_slot_id: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Resolve the conv-state row of every sequence with tensor ops only.
+
+    The per-sequence fallback below needs, for each sequence, its cache slot,
+    whether it has prior state, and its token range.  Reading the first two with
+    ``cache_indices[i].item()`` / ``has_initial_state[i].item()`` costs one DtoH
+    sync each, i.e. ~2 per sequence per layer (96+ per step on a 48-layer GDN
+    model) and dominated the gfx906 prefill step.  Gathering the rows up front
+    keeps that metadata on device; only the token boundaries still need host
+    scalars, and those come from the caller's CPU metadata copy.
+
+    Returns:
+        rows: ``[num_seqs, dim, cache_len]`` initial state per sequence, zeroed
+            where the sequence has no initial state.
+        safe_indices: clamped slot index per sequence, or None when
+            ``cache_indices`` is None (row i is then slot i).
+        valid: ``[num_seqs]`` bool, False for pad slots.
+    """
+    if cache_indices is None:
+        rows = conv_states[:num_seqs]
+        safe_indices = None
+        valid = None
+    else:
+        raw_indices = cache_indices[:num_seqs].to(dtype=torch.long)
+        valid = raw_indices != pad_slot_id
+        safe_indices = raw_indices.clamp(0, conv_states.shape[0] - 1)
+        rows = conv_states.index_select(0, safe_indices)
+    if has_initial_state is not None and state_len > 0:
+        keep = has_initial_state[:num_seqs].reshape(
+            (num_seqs,) + (1,) * (conv_states.dim() - 1)
+        )
+        rows = torch.where(keep, rows, rows.new_zeros(()))
+    return rows, safe_indices, valid
+
+
+def _gfx906_conv_state_write(
+    conv_states: torch.Tensor,
+    safe_indices: torch.Tensor | None,
+    valid: torch.Tensor | None,
+    seq_idx: int,
+    updated_state: torch.Tensor,
+) -> None:
+    """Write one sequence's updated conv-state slot back, on device.
+
+    Pad slots keep their current contents, matching the old
+    ``if cache_idx == pad_slot_id: continue`` without a host-side branch.
+    """
+    if safe_indices is None:
+        conv_states[seq_idx].copy_(updated_state)
+        return
+    slot = safe_indices[seq_idx : seq_idx + 1]
+    payload = updated_state.unsqueeze(0)
+    if valid is not None:
+        current = conv_states.index_select(0, slot)
+        payload = torch.where(valid[seq_idx], payload, current)
+    conv_states.index_copy_(0, slot, payload)
+
+
 def _causal_conv1d_gfx906_fallback(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -53,6 +160,7 @@ def _causal_conv1d_gfx906_fallback(
     has_initial_state: torch.Tensor | None,
     activation: str | None,
     pad_slot_id: int,
+    query_start_loc_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
@@ -63,7 +171,6 @@ def _causal_conv1d_gfx906_fallback(
     weight_conv = weight.to(x.dtype).unsqueeze(1).contiguous()
     if bias is not None:
         bias = bias.to(x.dtype)
-    zero_state = torch.zeros((dim, state_len), dtype=x.dtype, device=x.device)
 
     if query_start_loc is None:
         unsqueeze = False
@@ -72,85 +179,111 @@ def _causal_conv1d_gfx906_fallback(
             out = out.unsqueeze(-1)
             unsqueeze = True
         batch = x.shape[0]
+        rows, safe_indices, valid = _gfx906_conv_state_rows(
+            conv_states, cache_indices, has_initial_state, batch, state_len,
+            pad_slot_id,
+        )
         for seq_idx in range(batch):
-            cache_idx = (
-                seq_idx if cache_indices is None else int(cache_indices[seq_idx].item())
-            )
-            if cache_idx == pad_slot_id:
-                continue
-            use_initial_state = has_initial_state is None or bool(
-                has_initial_state[seq_idx].item()
-            )
-            prev_state = (
-                conv_states[cache_idx][:, -state_len:]
-                if state_len > 0 and use_initial_state
-                else zero_state
-            )
+            prev_state = _gfx906_conv_window_read(rows[seq_idx], state_len)
             seq_x = x[seq_idx]
             full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
-            seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
+            # ROCm 10.1 ships no gfx906 CK grouped-conv solver, so MIOpen JITs
+        # group conv kernels at run time and intermittently fails to load them
+        # ("hipErrorInvalidKernelFile" surfacing on the next op).  This fallback
+        # is a correctness path, so use ATen's native conv (im2col+GEMM) and
+        # skip MIOpen entirely.
+        with torch.backends.cudnn.flags(enabled=False):
+            seq_out = F.conv1d(
+                full_x, weight_conv, bias=bias, groups=dim
+            ).squeeze(0)
             if activation in ["silu", "swish"]:
                 seq_out = F.silu(seq_out)
             out[seq_idx].copy_(seq_out)
 
             if cache_state_len > 0:
-                updated_state = full_x.squeeze(0)[:, -cache_state_len:]
-                if updated_state.shape[1] < cache_state_len:
-                    padded_state = torch.zeros(
-                        (dim, cache_state_len),
-                        dtype=updated_state.dtype,
-                        device=updated_state.device,
-                    )
-                    padded_state[:, -updated_state.shape[1] :] = updated_state
-                    updated_state = padded_state
-                conv_states[cache_idx].copy_(updated_state)
+                state_row = full_x.squeeze(0)
+                window = (
+                    state_row[:, -state_len:]
+                    if state_len > 0
+                    else state_row[:, -cache_state_len:]
+                )
+                _gfx906_conv_state_write(
+                    conv_states,
+                    safe_indices,
+                    valid,
+                    seq_idx,
+                    _gfx906_conv_window_write(window, cache_state_len),
+                )
 
+        if valid is not None:
+            # Pad rows are not processed; return zeros rather than the
+            # uninitialised contents of `out`.
+            out.masked_fill_(~valid.reshape((-1,) + (1,) * (out.dim() - 1)), 0)
         if unsqueeze:
             out = out.squeeze(-1)
         return out.to(original_x_dtype)
 
-    for seq_idx in range(query_start_loc.size(0) - 1):
-        start = int(query_start_loc[seq_idx].item())
-        end = int(query_start_loc[seq_idx + 1].item())
+    # Token boundaries are the only host scalars left; the caller passes the CPU
+    # mirror of `query_start_loc` when it has one, which is sync-free.  Without
+    # it each boundary read is a DtoH sync, as before.  The mirror is only
+    # trusted when it has the same length, so a caller that hands over a
+    # different (e.g. unsliced) tensor cannot silently re-index the sequences.
+    query_starts_host = query_start_loc
+    if (
+        query_start_loc_cpu is not None
+        and query_start_loc_cpu.shape[0] == query_start_loc.shape[0]
+    ):
+        query_starts_host = query_start_loc_cpu
+    num_seqs = query_start_loc.size(0) - 1
+    rows, safe_indices, valid = _gfx906_conv_state_rows(
+        conv_states, cache_indices, has_initial_state, num_seqs, state_len,
+        pad_slot_id,
+    )
+
+    for seq_idx in range(num_seqs):
+        start = int(query_starts_host[seq_idx].item())
+        end = int(query_starts_host[seq_idx + 1].item())
         if end <= start:
             continue
 
-        cache_idx = (
-            seq_idx if cache_indices is None else int(cache_indices[seq_idx].item())
-        )
-        if cache_idx == pad_slot_id:
-            continue
-
-        use_initial_state = has_initial_state is None or bool(
-            has_initial_state[seq_idx].item()
-        )
-        prev_state = (
-            conv_states[cache_idx][:, -state_len:]
-            if state_len > 0 and use_initial_state
-            else zero_state
-        )
+        prev_state = _gfx906_conv_window_read(rows[seq_idx], state_len)
         channels_first = x.dim() == 2 and x.shape[0] == dim
         seq_x = x[:, start:end] if channels_first else x[start:end].transpose(0, 1)
         full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
-        seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
+        # ROCm 10.1 ships no gfx906 CK grouped-conv solver, so MIOpen JITs
+        # group conv kernels at run time and intermittently fails to load them
+        # ("hipErrorInvalidKernelFile" surfacing on the next op).  This fallback
+        # is a correctness path, so use ATen's native conv (im2col+GEMM) and
+        # skip MIOpen entirely.
+        with torch.backends.cudnn.flags(enabled=False):
+            seq_out = F.conv1d(
+                full_x, weight_conv, bias=bias, groups=dim
+            ).squeeze(0)
         if activation in ["silu", "swish"]:
             seq_out = F.silu(seq_out)
+        if valid is not None:
+            # Pad rows are not processed; emit zeros instead of a value derived
+            # from a clamped (unrelated) slot.
+            seq_out = torch.where(valid[seq_idx], seq_out, torch.zeros_like(seq_out))
         if channels_first:
             out[:, start:end] = seq_out
         else:
             out[start:end] = seq_out.transpose(0, 1)
 
         if cache_state_len > 0:
-            updated_state = full_x.squeeze(0)[:, -cache_state_len:]
-            if updated_state.shape[1] < cache_state_len:
-                padded_state = torch.zeros(
-                    (dim, cache_state_len),
-                    dtype=updated_state.dtype,
-                    device=updated_state.device,
-                )
-                padded_state[:, -updated_state.shape[1] :] = updated_state
-                updated_state = padded_state
-            conv_states[cache_idx].copy_(updated_state)
+            state_row = full_x.squeeze(0)
+            window = (
+                state_row[:, -state_len:]
+                if state_len > 0
+                else state_row[:, -cache_state_len:]
+            )
+            _gfx906_conv_state_write(
+                conv_states,
+                safe_indices,
+                valid,
+                seq_idx,
+                _gfx906_conv_window_write(window, cache_state_len),
+            )
 
     return out.to(original_x_dtype)
 
@@ -210,7 +343,7 @@ def _causal_conv1d_gfx906_decode_update_fallback(
 
     prev_state = conv_states.index_select(0, safe_indices)
     if conv_state_len > 0:
-        prev_state = prev_state[:, :, -conv_state_len:]
+        prev_state = _gfx906_conv_window_read(prev_state, conv_state_len)
         full_x = torch.cat((prev_state, x), dim=-1)
     else:
         full_x = x
@@ -228,12 +361,10 @@ def _causal_conv1d_gfx906_decode_update_fallback(
     out = torch.where(valid_mask.view(batch, 1, 1), out, torch.zeros_like(out))
 
     if cache_state_len > 0:
-        updated_state = full_x[:, :, -cache_state_len:]
-        if updated_state.shape[-1] < cache_state_len:
-            updated_state = F.pad(
-                updated_state,
-                (cache_state_len - updated_state.shape[-1], 0),
-            )
+        updated_state = _gfx906_conv_window_write(
+            full_x[..., -conv_state_len:] if conv_state_len > 0 else full_x[..., :0],
+            cache_state_len,
+        )
         for seq_idx in range(batch):
             state_idx = safe_indices[seq_idx : seq_idx + 1]
             current_state = conv_states.index_select(0, state_idx)
@@ -256,17 +387,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     w_ptr,  # (dim, width)
     bias_ptr,
     initial_states_ptr,  # conv_states_ptr
-    cache_indices_ptr,  # (batch, n_blocks + padding) The second dimension contains
-    # the block indices relevant for each sequence
-    # plus potential 0-padding at the beginning and at the end
+    cache_indices_ptr,  # (batch,)
     has_initial_states_ptr,
     query_start_loc_ptr,
     batch_ptr,
     token_chunk_offset_ptr,
-    block_idx_first_scheduled_token,  # (batch,)
-    block_idx_last_scheduled_token,  # (batch,)
-    initial_state_idx,  # (batch,)
-    num_computed_tokens,  # (batch,)
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
     # Matrix dimensions
     dim: tl.constexpr,
@@ -282,16 +407,14 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_istate_token: tl.constexpr,
     stride_cache_indices: tl.constexpr,
     stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
-    stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
+    stride_o_token: tl.int64,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
-    IS_APC_ENABLED: tl.constexpr,
-    USE_PAD_SLOT: tl.constexpr,
+    HAS_NULL_BLOCK: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -323,40 +446,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # find the actual sequence length
     seqlen = sequence_end_index - sequence_start_index
 
-    B_size: tl.constexpr = stride_block_m * BLOCK_M
-
-    if IS_APC_ENABLED:
-        # Handle the case if prefix caching is enabled.
-        # In particular, if prefix caching is enabled, the program write additional cache states to "cache_indices_ptr"
-
-        # Get the length of the completed sequence so far and compute the offset.
-        current_first_index = tl.load(block_idx_first_scheduled_token + idx_seq)
-        current_last_index = tl.load(block_idx_last_scheduled_token + idx_seq)
-        sequence_completed_index = tl.load(num_computed_tokens + idx_seq)
-
-        # Compute the offset where the first stride_block_m-aligned first full block is
-        # Value in "token-space"
-        sequence_completed_offset_token = sequence_completed_index % B_size
-        seq_completed_offset = B_size - sequence_completed_offset_token
-        seq_end_offset = (seqlen - seq_completed_offset) % B_size
-        last_full_block_token_index = sequence_end_index - seq_end_offset
-        # If the sequence without the sequence_offset_index is stride_cache_chunk-aligned, then the last full chunk is the second-to-last one
-        if seq_end_offset == 0:
-            last_full_block_token_index = last_full_block_token_index - B_size
-
-        # Get the number of blocks to be filled for the current sequence
-        # If n_block_to_fill = 0, then only the state at the sequence end is stored
-        n_block_to_fill = current_last_index - current_first_index
-
-        # Get the index of the init block
-        conv_state_init_index = tl.load(initial_state_idx + idx_seq)
-    else:
-        n_block_to_fill = 0
-        current_last_index = 0
-        conv_state_init_index = 0
-        current_first_index = 0
-        last_full_block_token_index = 0
-
     token_offset = BLOCK_M * chunk_offset
     segment_len = min(BLOCK_M, seqlen - token_offset)
 
@@ -367,7 +456,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     # cache_idx
     conv_states_input_coord = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
+        conv_state_indices_ptr + idx_seq * stride_cache_indices
     ).to(tl.int64)
 
     if USE_PAD_SLOT:  # noqa
@@ -452,20 +541,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             loaded_x = tl.load(x_ptrs, mask_x, 0.0)
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-            # Compute the offset where the last block should be written in the conv_states
-            conv_states_output_coord = tl.load(
-                conv_state_indices_ptr
-                + idx_seq * stride_cache_indices
-                + current_last_index
-            ).to(tl.int64)
-
             conv_states_ptrs_target = (
-                conv_states_ptr
-                + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
-                + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
-                idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+                conv_states_base[None, :]
+                + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+            )  # [BLOCK_M, BLOCK_N]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -574,52 +653,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             conv_states_ptrs = prior_tokens - 3 * stride_x_token  # [BLOCK_N]
             col0 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
 
-        # Store intermediate states aligned with stride_block_m
-        # The additional states are cached starting from the last stride_block_m.
-        # For example:
-        # If n_block_to_fill = 0, then only the state at the sequence end is cached and the process below is not involved.
-        # If n_block_to_fill > 0, then the states at the sequence end and at the n_block_to_fill-last
-        # stride_block_m are cached.
-        # For example chunk_offset = n_block_to_fill stores the state at last_full_block
-        if (chunk_offset - 1) < n_block_to_fill:
-            # Store the states at the chunk boundaries from the start of the sequence
-            idx_tokens_last = (
-                last_full_block_token_index
-                - (n_block_to_fill - chunk_offset) * B_size
-                - state_len
-            ) + tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-            x_ptrs = (
-                x_ptr
-                + (idx_tokens_last * stride_x_token)[:, None]
-                + (idx_feats * stride_x_dim)[None, :]
-            )  # [BLOCK_M,BLOCK_N,]
-
-            mask_x = (idx_tokens_last >= 0)[:, None] & (idx_feats < dim)[
-                None, :
-            ]  # token-index  # token-index  # feature-index
-            loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-            idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-
-            # cache_idx
-            conv_states_output_coord = tl.load(
-                conv_state_indices_ptr
-                + idx_seq * stride_cache_indices
-                + current_first_index
-                + (chunk_offset - 1)
-            ).to(tl.int64)
-
-            conv_states_ptrs_target = (
-                conv_states_ptr
-                + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
-                + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
-                idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
-
-            mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
-            tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
-            tl.store(conv_states_ptrs_target, loaded_x, mask)
-
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
         mask_bias = idx_feats < dim
@@ -712,13 +745,10 @@ def causal_conv1d_fn(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    block_idx_first_scheduled_token: torch.Tensor | None = None,
-    block_idx_last_scheduled_token: torch.Tensor | None = None,
-    initial_state_idx: torch.Tensor | None = None,
-    num_computed_tokens: torch.Tensor | None = None,
-    block_size_to_align=0,
+    null_block_id: int = NULL_BLOCK_ID,
     metadata=None,
     validate_data=False,
+    query_start_loc_cpu: torch.Tensor | None = None,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -769,6 +799,10 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
+    query_start_loc_cpu: (batch + 1,) int32, optional
+        CPU mirror of `query_start_loc`.  Used by the gfx906 per-sequence
+        fallback to avoid a DtoH sync per sequence boundary per layer; when
+        omitted, a CPU mirror carried by `metadata` is used if present.
     out: same shape as `x`
     """
     if isinstance(activation, bool) and activation:
@@ -791,6 +825,15 @@ def causal_conv1d_fn(
             and getattr(metadata, "nums_dict", None) is not None
         )
         if not ENABLE_GFX906_TRITON_CAUSAL_CONV1D or not metadata_ready:
+            # GDNAttentionMetadata publishes a CPU twin of the same
+            # `non_spec_query_start_loc` this entry point is handed; using it
+            # removes the per-sequence, per-layer boundary DtoH syncs.  The
+            # fallback re-checks the length, so a caller that passes a different
+            # tensor layout cannot silently re-index the sequences.
+            if query_start_loc_cpu is None and metadata is not None:
+                query_start_loc_cpu = getattr(
+                    metadata, "non_spec_query_start_loc_cpu", None
+                )
             return _causal_conv1d_gfx906_fallback(
             x=x,
             weight=weight,
@@ -801,6 +844,7 @@ def causal_conv1d_fn(
             has_initial_state=has_initial_state,
             activation=activation,
             pad_slot_id=pad_slot_id,
+            query_start_loc_cpu=query_start_loc_cpu,
         )
 
     args = None
@@ -883,12 +927,6 @@ def causal_conv1d_fn(
         assert weight.stride(1) == 1
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
-        if block_size_to_align is not None and block_size_to_align > 0:
-            assert (block_size_to_align % BLOCK_M) == 0, (
-                "The mamba block size needs to be divisible by the BLOCK_M"
-            )
-        else:
-            block_size_to_align = BLOCK_M
 
     if metadata is None:
 
@@ -972,10 +1010,6 @@ def causal_conv1d_fn(
         query_start_loc,
         batch_ptr,
         token_chunk_offset_ptr,
-        block_idx_first_scheduled_token,
-        block_idx_last_scheduled_token,
-        initial_state_idx,
-        num_computed_tokens,
         out,
         # Matrix dimensions
         dim,
@@ -992,15 +1026,13 @@ def causal_conv1d_fn(
         stride_cache_indices,
         stride_o_dim,
         stride_o_token,
-        block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
         # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
-        USE_PAD_SLOT=pad_slot_id is not None,
+        HAS_NULL_BLOCK=null_block_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
@@ -1028,8 +1060,6 @@ def _causal_conv1d_update_kernel(
     conv_state_indices_ptr,
     num_accepted_tokens_ptr,
     query_start_loc_ptr,  # (batch + 1)
-    block_idx_last_scheduled_token,  # (batch,)
-    initial_state_idx,  # (batch,)
     o_ptr,  # (batch, dim, seqlen)
     # Matrix dimensions
     batch: int,
@@ -1057,7 +1087,6 @@ def _causal_conv1d_update_kernel(
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    IS_APC_ENABLED: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
@@ -1071,17 +1100,9 @@ def _causal_conv1d_update_kernel(
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    if IS_APC_ENABLED:
-        # Get the state from the initial_state_idx
-        conv_state_init = tl.load(initial_state_idx + idx_seq)
-        current_last_index = tl.load(block_idx_last_scheduled_token + idx_seq)
-    else:
-        conv_state_init = 0
-        current_last_index = 0
-
     # cache_idx
     conv_states_input_coord = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
+        conv_state_indices_ptr + idx_seq * stride_state_indices
     ).to(tl.int64)
 
     if USE_PAD_SLOT:  # noqa
@@ -1190,14 +1211,9 @@ def _causal_conv1d_update_kernel(
 
     new_conv_state = tl.where(mask, conv_state, loaded_x)
 
-    # Get the state from the initial_state_idx
-    # cache_idx
-    conv_states_offset = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
-    ).to(tl.int64)
     conv_state_ptrs_target = (
         conv_state_ptr
-        + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+        + (conv_states_input_coord * stride_conv_state_seq)  # Offset from seq
         + (idx_feats * stride_conv_state_dim)
     )[None, :] + (  # [BLOCK_N,]
         idx_tokens * stride_conv_state_tok
@@ -1350,8 +1366,7 @@ def causal_conv1d_update(
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     pad_slot_id: int = PAD_SLOT_ID,
-    block_idx_last_scheduled_token: torch.Tensor | None = None,
-    initial_state_idx: torch.Tensor | None = None,
+    null_block_id: int = NULL_BLOCK_ID,
     validate_data=False,
 ):
     """
@@ -1369,10 +1384,6 @@ def causal_conv1d_update(
         If not None, the conv_state is a larger tensor along the batch dim,
         and we are selecting the batch coords specified by conv_state_indices.
         Useful for a continuous batching scenario.
-    block_idx_last_scheduled_token: (batch,), dtype int32
-        The pointer into conv_state_indices, where the last cache block to be filled is located.
-    initial_state_idx: (batch,), dtype int32
-        The pointer into conv_state_indices, where the cache block containing the initial state is located.
     num_accepted_tokens: (batch,), dtype int32
         If not None, it indicates the number of accepted tokens for each
         sequence in the batch.
@@ -1428,6 +1439,10 @@ def causal_conv1d_update(
             and x.dtype == weight.dtype
             and conv_state.dtype in (x.dtype, torch.float32)
             and (bias is None or bias.dtype == x.dtype)
+            # S18 bisect switch: VLLM_QWEN35_MTP_CONV_CUSTOM=0 skips the gfx906
+            # MTP conv-update kernel (opt-in A/B only; default keeps current
+            # behaviour) so MTP-vs-non-spec token parity can be attributed.
+            and os.getenv("VLLM_QWEN35_MTP_CONV_CUSTOM", "1") != "0"
         )
         if mtp_custom_eligible:
             try:
@@ -1570,8 +1585,6 @@ def causal_conv1d_update(
         conv_state_indices,
         num_accepted_tokens,
         query_start_loc,
-        block_idx_last_scheduled_token,
-        initial_state_idx,
         out,
         # Matrix dimensions
         batch,
@@ -1599,7 +1612,6 @@ def causal_conv1d_update(
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
         IS_VARLEN=query_start_loc is not None,
-        IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,

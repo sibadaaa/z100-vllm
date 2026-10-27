@@ -22,6 +22,76 @@ __global__ void __launch_bounds__(512, 1)
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
 
+// S33 WP2: push-mode one-shot all-reduce for gfx906.
+//
+// On gfx906 a GPU's PCIe-outbound READ of another GPU's memory does not
+// observe that GPU's L2 dirty lines (the upstream 1stage kernel PULLs peer
+// buffers and reads stale data), while PCIe-inbound WRITES into a GPU are
+// coherent at that GPU's L2 -- which is why the signal-flag handshake always
+// worked. This kernel therefore PUSHes: each rank's staged input (host copy
+// into its own fine-grain buffer region at offset rank*chunk) is volatile-
+// stored into every peer's buffer region for this rank; after a barrier each
+// rank reduces ITS OWN buffer regions with plain local loads (coherent).
+//
+// Buffer layout (per rank, fine-grain buffer of reg_buffer_sz_bytes):
+//   region r = buffer + r * chunk_p elements, chunk_p >= payload P-elems.
+// Accumulation order = rank 0..ngpus-1, identical to the 1stage kernel.
+// S33 WP2: push-mode one-shot all-reduce for gfx906 (single kernel).
+//
+// On gfx906 a GPU's PCIe-outbound READ of another GPU's memory does not
+// observe that GPU's L2 dirty lines (the upstream 1stage kernel PULLs peer
+// buffers and reads stale data), while PCIe-inbound WRITES into a GPU are
+// coherent at that GPU's L2 -- which is why the signal-flag handshake always
+// worked. This kernel therefore PUSHes: it reads the rank's OWN activation
+// (src, plain local load) and writes it into every peer's fine-grain buffer
+// region for this rank; after a barrier each rank reduces ITS OWN buffer
+// regions with plain local loads (coherent).
+//
+// Buffer layout (per rank, fine-grain buffer of reg_buffer_sz_bytes):
+//   region r = buffer + r * chunk_p elements, chunk_p >= payload P-elems.
+// Accumulation order = rank 0..ngpus-1, identical to the 1stage kernel.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_push(RankData* _dp, RankSignals sg, Signal* self_sg,
+                             const T* __restrict__ src, T* __restrict__ result,
+                             int rank, int size, int chunk_p) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+  const P* own_base = (const P*)dp.ptrs[rank];  // my fine-grain buffer
+  const P* src_p = (const P*)src;
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  // push: write my activation slice into every peer's buffer region for my
+  // rank (PCIe-inbound writes are coherent at the target GPU's L2)
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    const P v = src_p[idx];
+    // plain 16 B store: the inbound PCIe write is coherent at the target
+    // GPU's L2 on gfx906, so the peer's own local reduce sees it
+#pragma unroll
+    for (int p = 0; p < ngpus; p++) {
+      if (p == rank) continue;
+      ((P*)((P*)dp.ptrs[p] + (size_t)rank * chunk_p))[idx] = v;
+    }
+  }
+  barrier_mid_volatile<ngpus>(sg, self_sg, rank);
+  // local reduce over MY buffer regions (rank 0..ngpus-1 order, as 1stage):
+  // region p of my buffer holds rank p's contribution (pushed to me); the
+  // diagonal (p == rank) is my own activation, read from src directly (no
+  // rank pushes to itself)
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    A acc = upcast(rank == 0 ? src_p[idx] : own_base[idx]);
+#pragma unroll
+    for (int p = 1; p < ngpus; p++) {
+      packed_assign_add(
+          acc, upcast(rank == p ? src_p[idx] : own_base[(size_t)p * chunk_p + idx]));
+    }
+    ((P*)result)[idx] = downcast<P>(acc);
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename P>
 DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
@@ -234,8 +304,9 @@ class CustomAllreduce {
    * but my guess is that too many SMs will cause contention on NVLink bus.
    */
   template <typename T>
-  void allreduce(cudaStream_t stream, T* input, T* output, int size,
-                 int threads = 512, int block_limit = defaultBlockLimit) {
+  void allreduce(cudaStream_t stream, T* input, const T* src, T* output,
+                 int size, int threads = 512,
+                 int block_limit = defaultBlockLimit, int chunk_p = 0) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -288,10 +359,17 @@ class CustomAllreduce {
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
+#define KLPUSH(ngpus)                                                        \
+  cross_device_reduce_push<T, ngpus><<<blocks, threads, 0, stream>>>(        \
+      ptrs, sg_, self_sg_, src, output, rank_, size, chunk_p);
 #define REDUCE_CASE(ngpus)                              \
   case ngpus: {                                         \
     if (force_1stage) {                                 \
-      KL(ngpus, cross_device_reduce_1stage);            \
+      if (chunk_p > 0) {                                \
+        KLPUSH(ngpus)                                   \
+      } else {                                          \
+        KL(ngpus, cross_device_reduce_1stage);          \
+      }                                                 \
     } else if (force_2stage) {                          \
       KL(ngpus, cross_device_reduce_2stage);            \
     } else {                                            \
@@ -339,6 +417,12 @@ class CustomAllreduce {
   void mnnvl_lamport_reduce_scatter(cudaStream_t stream, T* input, T* output,
                                     void* local_buffer, uint32_t* epochs,
                                     int size, int stage_size_bytes);
+  template <typename T>
+  void mnnvl_multimem_reduce_scatter(cudaStream_t stream,
+                                     const T* multicast_input, T* output,
+                                     Signal* local_signal,
+                                     Signal* multicast_signal, int size,
+                                     int block_limit);
 
   ~CustomAllreduce() {
     for (auto [_, ptr] : ipc_handles_) {

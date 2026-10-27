@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
+from transformers import Qwen3NextConfig
 
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.layers.attention import Attention
@@ -86,12 +87,14 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Qwen3NextConfig
+from transformers import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
@@ -141,7 +144,12 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        reduce_results: bool = True,
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -226,7 +234,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
             n_shared_experts=1 if self.shared_expert is None else None,
+            reduce_results=reduce_results,
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
+            shared_expert_prefix=f"{prefix}.shared_expert",
             shared_expert_gate=self.shared_expert_gate
             if self.shared_expert is None
             else None,
@@ -1310,6 +1320,7 @@ class Qwen3NextAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mrope_positions_factor: int = 4,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1360,6 +1371,7 @@ class Qwen3NextAttention(nn.Module):
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
+            mrope_positions_factor=mrope_positions_factor,
         )
 
         attn_type = (
@@ -1622,7 +1634,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Qwen3NextModel(nn.Module):
+class Qwen3NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1669,7 +1681,7 @@ class Qwen3NextModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1681,11 +1693,20 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # EAGLE-3 / DFlash auxiliary hidden states: index j is the tensor that
+        # enters layer j (layer 0 = the embeddings), matching the convention of
+        # the other EagleModelMixin models.
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for layer_idx, layer in islice(
+            enumerate(self.layers), self.start_layer, self.end_layer
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -1693,6 +1714,13 @@ class Qwen3NextModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            # On gfx906 the GDN/linear-attention path hands back fp32
+            # activations while the rest of the network (and any drafter
+            # projection consuming these tensors) runs in the model dtype.
+            dtype = self.embed_tokens.weight.dtype
+            aux_hidden_states = [t.to(dtype) for t in aux_hidden_states]
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1794,6 +1822,9 @@ class Qwen3NextModel(nn.Module):
 
 
 class QwenNextMixtureOfExperts(MixtureOfExperts):
+    model: Qwen3NextModel
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1858,12 +1889,8 @@ class Qwen3NextForCausalLM(
         config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
-        assert not cache_config.enable_prefix_caching, (
-            "Qwen3Next currently does not support prefix caching"
-        )
         self.quant_config = vllm_config.quant_config
 
         super().__init__()

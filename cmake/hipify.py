@@ -14,6 +14,21 @@ import argparse
 import os
 import shutil
 
+from torch.utils.hipify import cuda_to_hip_mappings as _cuda_macros
+
+# DTK's torch 2.11 wheel stores CUDA_MACROS_MAP values as bare strings where
+# upstream torch (and DTK's torch 2.10) stores 1-tuples. hipify_python.py does
+# `dst = value[0]`, so a bare string degrades to its first character
+# (CUDA_VERSION -> "D") and every hipified use of that macro breaks. Normalize
+# to the upstream tuple shape before hipify_python is imported, because it
+# snapshots the map while it is being imported. The isinstance guard makes this
+# a no-op for the already-correct 2.10 tuples.
+_macros_map = getattr(_cuda_macros, "CUDA_MACROS_MAP", None)
+if _macros_map is not None:
+    for _macro, _value in list(_macros_map.items()):
+        if isinstance(_value, str):
+            _macros_map[_macro] = (_value,)
+
 from torch.utils.hipify.hipify_python import get_hip_file_path, hipify
 
 
@@ -61,11 +76,57 @@ if __name__ == "__main__":
     # The directory might already exist to hold object files so we ignore that.
     shutil.copytree(args.project_dir, args.output_dir, dirs_exist_ok=True)
 
+    def _neutralize_dtk_macros_include() -> None:
+        """Replace DTK's injected ``<ATen/dtk_macros.h>`` include.
+
+        DTK's torch patched ``torch.utils.hipify`` to prepend that include to
+        every hipified C/C++ file (``HIPIFY_HEADER_FILE`` in
+        ``hipify_python.py``). The header itself errors out whenever
+        ``TORCH_TARGET_VERSION`` or ``TORCH_STABLE_ONLY`` is defined, which is
+        exactly the case for the ``*_stable_libtorch`` extensions (stable ABI),
+        so every one of their translation units fails with
+        ``"This file should not be included when either TORCH_STABLE_ONLY or
+        TORCH_TARGET_VERSION is defined."``
+
+        The only thing the include contributes is ``#define __DTK_ARCH__``
+        (DTK's hipify renames ``__CUDA_ARCH__`` to ``__DTK_ARCH__`` in the
+        generated code). Expand it in place, without the header's
+        ``TORCH_TARGET_VERSION`` guard, so the generated tree builds with both
+        stable and regular extensions. Behaviour is otherwise byte-for-byte
+        identical.
+        """
+        marker = "#include <ATen/dtk_macros.h>"
+        replacement = (
+            "// Replaces the #include <ATen/dtk_macros.h> that DTK's patched\n"
+            "// torch.utils.hipify injects; see cmake/hipify.py. The stable-ABI\n"
+            "// extensions define TORCH_TARGET_VERSION, which makes that header\n"
+            "// fail with #error, yet __DTK_ARCH__ itself is still needed.\n"
+            "#if defined(USE_ROCM)\n"
+            "#define __DTK_ARCH__ 520\n"
+            "#define DTK_VERSION 11800\n"
+            "#define DTKRT_VERSION 11080\n"
+            "#endif"
+        )
+        for root, _dirs, files in os.walk(args.output_dir):
+            for name in files:
+                if not name.endswith((".h", ".hpp", ".cuh", ".c", ".cc", ".cpp", ".cu", ".hip")):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    with open(path, encoding="utf-8") as fin:
+                        text = fin.read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if marker not in text:
+                    continue
+                with open(path, "w", encoding="utf-8") as fout:
+                    fout.write(text.replace(marker, replacement))
+
     hipify_result = hipify(
         project_directory=args.project_dir,
         output_directory=args.output_dir,
         # Hipify resolves quoted includes next to the including file first; vLLM
-        # uses paths relative to csrc/ (e.g. "libtorch_stable/torch_utils.h"
+        # uses paths relative to csrc/ (e.g. "torch_utils.h"
         # from quantization/w8a8/fp8/*.cu). Without an include root here, those
         # headers are never found and are not hipified or rewritten in dependents.
         header_include_dirs=["."],
@@ -96,6 +157,10 @@ if __name__ == "__main__":
         hipified_sources.append(hipified_s_abs)
 
     assert len(hipified_sources) == len(args.sources)
+
+    # Must run after the loop above: torch's hipify writes each result lazily,
+    # when the caller first touches hipify_result[...].hipified_path.
+    _neutralize_dtk_macros_include()
 
     # Print hipified source files.
     print("\n".join(hipified_sources))

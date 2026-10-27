@@ -68,8 +68,8 @@ endif()
 # requirements.txt files and should be kept consistent.  The ROCm torch
 # versions are derived from docker/Dockerfile.rocm
 #
-set(TORCH_SUPPORTED_VERSION_CUDA "2.13.0")
-set(TORCH_SUPPORTED_VERSION_ROCM "2.13.0")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.14.0")
+set(TORCH_SUPPORTED_VERSION_ROCM "2.16.0")
 # TORCH_NIGHTLY=1 builds run against unpinned nightly wheels, so the supported-
 # version check would always warn. Only treat it as a nightly build when the
 # value is exactly "1" (the bootstrap exports TORCH_NIGHTLY=0 by default, which
@@ -150,25 +150,21 @@ endif()
 #
 # spinloop extension (pure CXX; must stay above the non-CUDA device branch so
 # CPU builds define the target before the early return)
-# This extension requires SABI 3.11 since it relies on Py_buffer support. Loading
-# failure is handled gracefully on vLLM side for lower Python versions.
-# Skip the target entirely on Python < 3.11 so the build doesn't break.
+# This extension requires SABI 3.11 since it relies on Py_buffer support.
 #
-if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
-  set(VLLM_SPINLOOP_EXT_SRC "csrc/spinloop.cpp")
-  set(SPINLOOP_COMPILE_FLAGS "")
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
-    list(APPEND SPINLOOP_COMPILE_FLAGS "-mmwaitx")
-  endif()
-  define_extension_target(
-    spinloop
-    DESTINATION vllm
-    LANGUAGE CXX
-    SOURCES ${VLLM_SPINLOOP_EXT_SRC}
-    COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
-    USE_SABI 3.11
-    WITH_SOABI)
+set(VLLM_SPINLOOP_EXT_SRC "csrc/spinloop.cpp")
+set(SPINLOOP_COMPILE_FLAGS "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+  list(APPEND SPINLOOP_COMPILE_FLAGS "-mmwaitx")
 endif()
+define_extension_target(
+  spinloop
+  DESTINATION vllm
+  LANGUAGE CXX
+  SOURCES ${VLLM_SPINLOOP_EXT_SRC}
+  COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
+  USE_SABI 3.11
+  WITH_SOABI)
 
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
@@ -256,6 +252,47 @@ endif()
 # The final set of arches is stored in `VLLM_GPU_FLAGS`.
 #
 get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
+
+#
+# Hygon DCU Toolkit (DTK) HIP toolchain workaround.
+#
+# DTK 26.04's clang 18 ships a `<clang>/include/cuda_wrappers/new` wrapper
+# that fails to declare the `__device__` placement new/delete overloads, so
+# every translation unit instantiating `rocprim::uninitialized_array::emplace`
+# (any hipcub `BlockLoad`/`BlockExchange` user) fails with
+# "reference to __host__ function 'operator new' in __host__ __device__
+# function". `csrc/dtk_rocprim_compat.h` re-declares exactly the overloads
+# the upstream ROCm toolchain provides; see that header for the rationale.
+#
+# Gated on the DTK install prefix so CUDA and community ROCm builds are
+# byte-for-byte unaffected: DTK is the only stack that installs under a path
+# matching "dtk" (`ROCM_PATH` comes from setup.py, which resolves it to the
+# detected DTK prefix). `VLLM_DTK_ROCPRIM_COMPAT=0` opts out, and
+# `VLLM_DTK_ROCPRIM_COMPAT=1` forces it on for experiments.
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  set(VLLM_DTK_ROCPRIM_COMPAT "${VLLM_DTK_ROCPRIM_COMPAT}" CACHE STRING
+    "Inject csrc/dtk_rocprim_compat.h (auto: only when ROCM_PATH looks like a Hygon DTK install)")
+  if(VLLM_DTK_ROCPRIM_COMPAT STREQUAL "")
+    if(ROCM_PATH MATCHES "dtk")
+      set(VLLM_DTK_ROCPRIM_COMPAT ON)
+    else()
+      set(VLLM_DTK_ROCPRIM_COMPAT OFF)
+    endif()
+  endif()
+  if(VLLM_DTK_ROCPRIM_COMPAT)
+    set(VLLM_DTK_ROCPRIM_COMPAT_HEADER
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/dtk_rocprim_compat.h")
+    if(NOT EXISTS "${VLLM_DTK_ROCPRIM_COMPAT_HEADER}")
+      message(FATAL_ERROR
+        "VLLM_DTK_ROCPRIM_COMPAT is on but ${VLLM_DTK_ROCPRIM_COMPAT_HEADER} is missing")
+    endif()
+    message(STATUS
+      "DTK rocPRIM placement-new workaround enabled: -include ${VLLM_DTK_ROCPRIM_COMPAT_HEADER}")
+    list(APPEND VLLM_GPU_FLAGS "-include" "${VLLM_DTK_ROCPRIM_COMPAT_HEADER}")
+  else()
+    message(STATUS "DTK rocPRIM placement-new workaround disabled (ROCM_PATH=${ROCM_PATH})")
+  endif()
+endif()
 
 #
 # Set nvcc parallelism.
@@ -369,31 +406,20 @@ endif()
 #
 
 if(VLLM_GPU_LANG STREQUAL "HIP")
-set(VLLM_EXT_SRC
-  "csrc/mamba/mamba_ssm/selective_scan_fwd.cu"
-  "csrc/mamba/gfx906_decode_kernels.cu"
-  "csrc/cache_kernels.cu"
-  "csrc/attention/paged_attention_v1.cu"
-  "csrc/attention/paged_attention_v2.cu"
-  "csrc/attention/merge_attn_states.cu"
-  "csrc/attention/vertical_slash_index.cu"
-  "csrc/pos_encoding_kernels.cu"
-  "csrc/activation_kernels.cu"
-  "csrc/layernorm_kernels.cu"
-  "csrc/fused_qknorm_rope_kernel.cu"
-  "csrc/layernorm_quant_kernels.cu"
-  "csrc/sampler.cu"
-  "csrc/cuda_view.cu"
-  "csrc/quantization/gptq/q_gemm.cu"
-  "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"
-  "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"
-  "csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
-  "csrc/quantization/gguf/gguf_kernel.cu"
-  "csrc/quantization/activation_kernels.cu"
-  "csrc/cuda_utils_kernels.cu"
-  "csrc/custom_all_reduce.cu"
-  "csrc/custom_quickreduce.cu"
-  "csrc/torch_bindings.cpp")
+  set(VLLM_EXT_SRC
+    "csrc/rocm/quickreduce/torch_bindings.cpp"
+    "csrc/rocm/quickreduce/custom_quickreduce.cu")
+
+  # Hygon Z100 / gfx906 emulation kernels and the in-tree GGUF C++ path.
+  # Upstream moved the ROCm kernels into the _C_stable_libtorch extension and
+  # dropped in-tree GGUF (out-of-tree vllm-gguf-plugin); both use the non-stable
+  # torch::Tensor ABI, so they build into the legacy `_C` extension instead.
+  list(APPEND VLLM_EXT_SRC
+    "csrc/mamba/gfx906_decode_kernels.cu"
+    "csrc/rocm/gfx906_layernorm_kernels.cu"
+    "csrc/rocm/gfx906_torch_bindings.cpp"
+    "csrc/quantization/gguf/gguf_kernel.cu"
+    "csrc/quantization/gguf/gguf_torch_bindings.cpp")
 
   message(STATUS "Enabling C extension.")
   define_extension_target(
@@ -403,16 +429,8 @@ set(VLLM_EXT_SRC
     SOURCES ${VLLM_EXT_SRC}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
-    INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
     USE_SABI 3
     WITH_SOABI)
-
-  # If CUTLASS is compiled on NVCC >= 12.5, it by default uses
-  # cudaGetDriverEntryPointByVersion as a wrapper to avoid directly calling the
-  # driver API. This causes problems when linking with earlier versions of CUDA.
-  # Setting this variable sidesteps the issue by calling the driver directly.
-  target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 endif() # _C HIP endif
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
@@ -448,42 +466,39 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   set(VLLM_STABLE_EXT_SRC
-    "csrc/libtorch_stable/torch_bindings.cpp"
-    "csrc/libtorch_stable/cuda_view.cu"
-    "csrc/libtorch_stable/cuda_utils_kernels.cu"
-    "csrc/libtorch_stable/activation_kernels.cu"
-    "csrc/libtorch_stable/ngram_embedding_kernels.cu"
-    "csrc/libtorch_stable/vocab_parallel_embedding_kernels.cu"
-    "csrc/libtorch_stable/quantization/activation_kernels.cu"
-    "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"
-    "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"
-    "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu"
-    "csrc/libtorch_stable/quantization/w8a8/int8/per_token_group_quant.cu"
-    "csrc/libtorch_stable/quantization/gptq/q_gemm.cu"
-    "csrc/libtorch_stable/pos_encoding_kernels.cu"
-    "csrc/libtorch_stable/fused_qknorm_rope_kernel.cu"
-    "csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu"
-    "csrc/libtorch_stable/layernorm_kernels.cu"
-    "csrc/libtorch_stable/layernorm_quant_kernels.cu"
-    "csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
-    "csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-    "csrc/libtorch_stable/attention/merge_attn_states.cu"
-    "csrc/libtorch_stable/sampler.cu"
-    "csrc/libtorch_stable/topk.cu"
-    "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"
-    "csrc/libtorch_stable/cache_kernels.cu"
-    "csrc/libtorch_stable/cache_kernels_fused.cu"
-    "csrc/libtorch_stable/custom_all_gather_reduce_scatter.cu"
-    "csrc/libtorch_stable/custom_all_gather_reduce_scatter_ops.cpp"
-    "csrc/libtorch_stable/custom_all_reduce.cu"
-    "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
-    "csrc/libtorch_stable/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu")
+    "csrc/torch_bindings.cpp"
+    "csrc/cuda_view.cu"
+    "csrc/cuda_utils_kernels.cu"
+    "csrc/activation_kernels.cu"
+    "csrc/ngram_embedding_kernels.cu"
+    "csrc/vocab_parallel_embedding_kernels.cu"
+    "csrc/quantization/activation_kernels.cu"
+    "csrc/quantization/w8a8/int8/scaled_quant.cu"
+    "csrc/quantization/w8a8/fp8/common.cu"
+    "csrc/quantization/w8a8/fp8/per_token_group_quant.cu"
+    "csrc/quantization/gptq/q_gemm.cu"
+    "csrc/pos_encoding_kernels.cu"
+    "csrc/fused_qknorm_rope_kernel.cu"
+    "csrc/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu"
+    "csrc/layernorm_kernels.cu"
+    "csrc/layernorm_quant_kernels.cu"
+    "csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
+    "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "csrc/attention/merge_attn_states.cu"
+    "csrc/sampler.cu"
+    "csrc/topk.cu"
+    "csrc/mamba/selective_scan_fwd.cu"
+    "csrc/cache_kernels.cu"
+    "csrc/cache_kernels_fused.cu"
+    "csrc/custom_all_gather_reduce_scatter.cu"
+    "csrc/custom_all_gather_reduce_scatter_ops.cpp"
+    "csrc/custom_all_reduce.cu"
+    "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
+    "csrc/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu")
 
   if(VLLM_GPU_LANG STREQUAL "CUDA" AND
      DEFINED CMAKE_CUDA_COMPILER_VERSION AND
      CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
-
-    list(APPEND VLLM_STABLE_EXT_SRC "csrc/libtorch_stable/all_reduce_mhc.cu")
 
     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
       cuda_archs_loose_intersection(COOPERATIVE_TOPK_ARCHS
@@ -501,10 +516,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_STABLE_EXT_SRC
-      "csrc/libtorch_stable/hisparse_kernels.cu"
-      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
-      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_kv_gather.cu"
-      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_q_gather.cu")
+      "csrc/hisparse_kernels.cu"
+      "csrc/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
+      "csrc/attention/dcp_utils/dcp_direct_kv_gather.cu"
+      "csrc/attention/dcp_utils/dcp_direct_q_gather.cu")
 
     SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
@@ -539,12 +554,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     FetchContent_MakeAvailable(cutlass)
 
     list(APPEND VLLM_STABLE_EXT_SRC
-      "csrc/libtorch_stable/cutlass_extensions/common.cpp"
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_entry.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_entry.cu"
-      "csrc/libtorch_stable/quantization/awq/gemm_kernels.cu"
-      "csrc/libtorch_stable/minimax_reduce_rms_kernel.cu")
+      "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"
+      "csrc/quantization/fp4/nvfp4_quant_entry.cu"
+      "csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu"
+      "csrc/quantization/awq/gemm_kernels.cu"
+      "csrc/minimax_reduce_rms_kernel.cu")
 
     #
     # Machete kernels
@@ -558,7 +572,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       # preselected input type pairs and schedules.
       # Generate sources:
       set(MACHETE_GEN_SCRIPT
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/machete/generate.py)
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/machete/generate.py)
       file(MD5 ${MACHETE_GEN_SCRIPT} MACHETE_GEN_SCRIPT_HASH)
 
       message(STATUS "Machete generation script hash: ${MACHETE_GEN_SCRIPT_HASH}")
@@ -591,7 +605,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
 
       # Add machete generated sources
-      file(GLOB MACHETE_GEN_SOURCES "csrc/libtorch_stable/quantization/machete/generated/*.cu")
+      file(GLOB MACHETE_GEN_SOURCES "csrc/quantization/machete/generated/*.cu")
       list(APPEND VLLM_STABLE_EXT_SRC ${MACHETE_GEN_SOURCES})
 
       # forward compatible
@@ -600,7 +614,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
         CUDA_ARCHS "${MACHETE_ARCHS}")
 
       list(APPEND VLLM_STABLE_EXT_SRC
-        csrc/libtorch_stable/quantization/machete/machete_pytorch.cu)
+        csrc/quantization/machete/machete_pytorch.cu)
       message(STATUS "Building Machete kernels for archs: ${MACHETE_ARCHS}")
     else()
       if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0
@@ -615,15 +629,36 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
     endif()
 
+    # The fused MiniMax-M3 KV insert quantizes NVFP4 with SM100-family-only
+    # cvt instructions, so its SM10x/11x code is built for the family targets.
+    set(MINIMAX_M3_FUSED_SRC
+      "csrc/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu")
+    list(REMOVE_ITEM VLLM_STABLE_EXT_SRC "${MINIMAX_M3_FUSED_SRC}")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_STABLE_EXT_SRC}"
       CUDA_ARCHS "${CUDA_ARCHS}")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(MINIMAX_M3_FUSED_ARCHS
+        "10.0f;10.7f;11.0f" "${CUDA_ARCHS}")
+    else()
+      cuda_archs_loose_intersection(MINIMAX_M3_FUSED_ARCHS
+        "10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
+    endif()
+    foreach(_ARCH ${CUDA_ARCHS})
+      if(_ARCH VERSION_LESS 10.0 OR _ARCH VERSION_GREATER_EQUAL 12.0)
+        list(APPEND MINIMAX_M3_FUSED_ARCHS "${_ARCH}")
+      endif()
+    endforeach()
+    set_gencode_flags_for_srcs(
+      SRCS "${MINIMAX_M3_FUSED_SRC}"
+      CUDA_ARCHS "${MINIMAX_M3_FUSED_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${MINIMAX_M3_FUSED_SRC}")
 
     if(COOPERATIVE_TOPK_ARCHS)
       list(APPEND VLLM_STABLE_EXT_SRC
-        "csrc/libtorch_stable/cooperative_topk.cu")
+        "csrc/cooperative_topk.cu")
       set_gencode_flags_for_srcs(
-        SRCS "csrc/libtorch_stable/cooperative_topk.cu"
+        SRCS "csrc/cooperative_topk.cu"
         CUDA_ARCHS "${COOPERATIVE_TOPK_ARCHS}")
     endif()
 
@@ -666,7 +701,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       # preselected input type pairs and schedules.
       # Generate sources:
       set(MARLIN_GEN_SCRIPT
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin/generate_kernels.py)
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/marlin/generate_kernels.py)
       file(MD5 ${MARLIN_GEN_SCRIPT} MARLIN_GEN_SCRIPT_HASH)
       list(JOIN CUDA_ARCHS "," CUDA_ARCHS_STR)
       set(MARLIN_GEN_SCRIPT_HASH_AND_ARCH "${MARLIN_GEN_SCRIPT_HASH}(ARCH:${CUDA_ARCHS_STR})")
@@ -701,7 +736,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
 
       if (MARLIN_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_float16.cu")
+        file(GLOB MARLIN_TEMPLATE_KERNEL_SRC "csrc/quantization/marlin/sm80_kernel_*_float16.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_ARCHS}")
@@ -711,7 +746,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
         endif()
         list(APPEND VLLM_STABLE_EXT_SRC ${MARLIN_TEMPLATE_KERNEL_SRC})
 
-        file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_bfloat16.cu")
+        file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC "csrc/quantization/marlin/sm80_kernel_*_bfloat16.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_BF16_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_BF16_ARCHS}")
@@ -723,7 +758,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
 
       if (MARLIN_SM75_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm75_kernel_*.cu")
+        file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC "csrc/quantization/marlin/sm75_kernel_*.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_SM75_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_SM75_ARCHS}")
@@ -735,7 +770,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
 
       if (MARLIN_FP8_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_FP8_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm89_kernel_*.cu")
+        file(GLOB MARLIN_TEMPLATE_FP8_KERNEL_SRC "csrc/quantization/marlin/sm89_kernel_*.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_FP8_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_FP8_ARCHS}")
@@ -747,10 +782,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
 
       set(MARLIN_SRCS
-         "csrc/libtorch_stable/quantization/marlin/marlin.cu"
-         "csrc/libtorch_stable/quantization/marlin/marlin_int4_fp8_preprocess.cu"
-         "csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu"
-         "csrc/libtorch_stable/quantization/marlin/awq_marlin_repack.cu")
+         "csrc/quantization/marlin/marlin.cu"
+         "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
+         "csrc/quantization/marlin/gptq_marlin_repack.cu"
+         "csrc/quantization/marlin/awq_marlin_repack.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_SRCS}"
         CUDA_ARCHS "${MARLIN_OTHER_ARCHS}")
@@ -773,7 +808,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     cuda_archs_loose_intersection(DSV3_FUSED_A_GEMM_ARCHS "9.0a;10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND DSV3_FUSED_A_GEMM_ARCHS)
-    set(DSV3_FUSED_A_GEMM_SRCS "csrc/libtorch_stable/dsv3_fused_a_gemm.cu")
+    set(DSV3_FUSED_A_GEMM_SRCS "csrc/dsv3_fused_a_gemm.cu")
     set_gencode_flags_for_srcs(
       SRCS "${DSV3_FUSED_A_GEMM_SRCS}"
       CUDA_ARCHS "${DSV3_FUSED_A_GEMM_ARCHS}")
@@ -788,8 +823,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   cuda_archs_sm90plus(FP32_ROUTER_GEMM_ARCHS "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND FP32_ROUTER_GEMM_ARCHS)
     set(FP32_ROUTER_GEMM_SRCS
-      "csrc/libtorch_stable/fp32_router_gemm_entry.cu"
-      "csrc/libtorch_stable/fp32_router_gemm.cu")
+      "csrc/fp32_router_gemm_entry.cu"
+      "csrc/fp32_router_gemm.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FP32_ROUTER_GEMM_SRCS}"
       CUDA_ARCHS "${FP32_ROUTER_GEMM_ARCHS}")
@@ -809,11 +844,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   cuda_archs_loose_intersection(SCALED_MM_ARCHS "9.0a;" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND SCALED_MM_ARCHS)
     set(SCALED_MM_SM90_SRCS
-       "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c3x_sm90.cu"
-       "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm90_fp8.cu"
-       "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm90_int8.cu"
-       "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_azp_sm90_int8.cu"
-       "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm90_fp8.cu")
+       "csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm90.cu"
+       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm90_fp8.cu"
+       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm90_int8.cu"
+       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_azp_sm90_int8.cu"
+       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm90_fp8.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SCALED_MM_SM90_SRCS}"
       CUDA_ARCHS "${SCALED_MM_ARCHS}")
@@ -844,9 +879,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
     set(SCALED_MM_SM120_SRCS
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c3x_sm120.cu"
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm120_fp8.cu"
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm120_fp8.cu"
+      "csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm120.cu"
+      "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm120_fp8.cu"
+      "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm120_fp8.cu"
     )
     set_gencode_flags_for_srcs(
       SRCS "${SCALED_MM_SM120_SRCS}"
@@ -878,9 +913,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
     set(SCALED_MM_SM100_SRCS
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c3x_sm100.cu"
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm100_fp8.cu"
-      "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm100_fp8.cu"
+      "csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm100.cu"
+      "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm100_fp8.cu"
+      "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm100_fp8.cu"
     )
     set_gencode_flags_for_srcs(
       SRCS "${SCALED_MM_SM100_SRCS}"
@@ -911,7 +946,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
   if (SCALED_MM_2X_ARCHS)
-    set(SCALED_MM_C2X_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c2x.cu")
+    set(SCALED_MM_C2X_SRCS "csrc/quantization/w8a8/cutlass/scaled_mm_c2x.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SCALED_MM_C2X_SRCS}"
       CUDA_ARCHS "${SCALED_MM_2X_ARCHS}")
@@ -937,7 +972,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # if it's possible to compile MoE kernels that use its output.
   cuda_archs_loose_intersection(SCALED_MM_ARCHS "9.0a" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3 AND SCALED_MM_ARCHS)
-    set(CUTLASS_MOE_SM90_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm90.cu")
+    set(CUTLASS_MOE_SM90_SRCS "csrc/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm90.cu")
     set_gencode_flags_for_srcs(
       SRCS "${CUTLASS_MOE_SM90_SRCS}"
       CUDA_ARCHS "${SCALED_MM_ARCHS}")
@@ -961,7 +996,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
-    set(CUTLASS_MOE_SM100_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm100.cu")
+    set(CUTLASS_MOE_SM100_SRCS "csrc/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm100.cu")
     set_gencode_flags_for_srcs(
       SRCS "${CUTLASS_MOE_SM100_SRCS}"
       CUDA_ARCHS "${SCALED_MM_ARCHS}")
@@ -986,7 +1021,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     cuda_archs_loose_intersection(CUTLASS_MOE_DATA_ARCHS "9.0a;10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3 AND CUTLASS_MOE_DATA_ARCHS)
-    set(CUTLASS_MOE_DATA_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/moe/moe_data.cu")
+    set(CUTLASS_MOE_DATA_SRCS "csrc/quantization/w8a8/cutlass/moe/moe_data.cu")
     set_gencode_flags_for_srcs(
       SRCS "${CUTLASS_MOE_DATA_SRCS}"
       CUDA_ARCHS "${CUTLASS_MOE_DATA_ARCHS}")
@@ -1018,12 +1053,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_SM120_ARCHS)
     set(FP4_SM120_SRCS
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu"
-      "csrc/libtorch_stable/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_experts_quant.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
-      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu")
+      "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
+      "csrc/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
+      "csrc/quantization/fp4/nvfp4_experts_quant.cu"
+      "csrc/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
+      "csrc/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
+      "csrc/nvfp4_kv_cache_kernels.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FP4_SM120_SRCS}"
       CUDA_ARCHS "${FP4_SM120_ARCHS}")
@@ -1044,15 +1079,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_SM100_ARCHS)
     set(FP4_SM100_SRCS
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu"
-      "csrc/libtorch_stable/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_experts_quant.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_kernels.cu"
-      "csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
-      "csrc/libtorch_stable/quantization/fp4/mxfp4_experts_quant.cu"
-      "csrc/libtorch_stable/quantization/fp4/mxfp4_blockwise_moe_kernel.cu"
-      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu"
-      "csrc/libtorch_stable/nvfp4_ds_mla_cache_kernels.cu")
+      "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
+      "csrc/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
+      "csrc/quantization/fp4/nvfp4_experts_quant.cu"
+      "csrc/quantization/fp4/nvfp4_scaled_mm_kernels.cu"
+      "csrc/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
+      "csrc/quantization/fp4/mxfp4_experts_quant.cu"
+      "csrc/quantization/fp4/mxfp4_blockwise_moe_kernel.cu"
+      "csrc/nvfp4_kv_cache_kernels.cu"
+      "csrc/nvfp4_ds_mla_cache_kernels.cu")
     if(NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
       message(STATUS
         "Building mxfp4_experts_quant unsupported stubs because CUDA compiler version is not >= 12.9 (found ${CMAKE_CUDA_COMPILER_VERSION}).")
@@ -1076,9 +1111,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   cuda_archs_loose_intersection(W4A8_ARCHS "9.0a" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND W4A8_ARCHS)
     set(W4A8_SRCS
-       "csrc/libtorch_stable/quantization/cutlass_w4a8/w4a8_mm_entry.cu"
-       "csrc/libtorch_stable/quantization/cutlass_w4a8/w4a8_grouped_mm_entry.cu"
-       "csrc/libtorch_stable/quantization/cutlass_w4a8/w4a8_utils.cu"
+       "csrc/quantization/cutlass_w4a8/w4a8_mm_entry.cu"
+       "csrc/quantization/cutlass_w4a8/w4a8_grouped_mm_entry.cu"
+       "csrc/quantization/cutlass_w4a8/w4a8_utils.cu"
        )
 
     set_gencode_flags_for_srcs(
@@ -1111,7 +1146,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND MLA_ARCHS)
     set(CUTLASS_MLA_SRCS
-      "csrc/libtorch_stable/attention/mla/sm100_cutlass_mla_kernel.cu")
+      "csrc/attention/mla/sm100_cutlass_mla_kernel.cu")
     set_gencode_flags_for_srcs(
       SRCS "${CUTLASS_MLA_SRCS}"
       CUDA_ARCHS "${MLA_ARCHS}")
@@ -1135,7 +1170,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(FUSED_KDA_DECODE_ARCHS)
     set(FUSED_KDA_DECODE_SRC
-      "csrc/libtorch_stable/kimi_k3/fused_kda_decode_kernel.cu")
+      "csrc/kimi_k3/fused_kda_decode_kernel.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FUSED_KDA_DECODE_SRC}"
       CUDA_ARCHS "${FUSED_KDA_DECODE_ARCHS}")
@@ -1147,7 +1182,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(FUSED_GDN_DECODE_ARCHS)
     set(FUSED_GDN_DECODE_SRC
-      "csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu")
+      "csrc/gdn/fused_gdn_decode_kernel.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FUSED_GDN_DECODE_SRC}"
       CUDA_ARCHS "${FUSED_GDN_DECODE_ARCHS}")
@@ -1164,7 +1199,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(KIMI_K3_ATTN_RES_ARCHS)
     set(KIMI_K3_ATTN_RES_SRC
-      "csrc/libtorch_stable/kimi_k3/attn_res_kernel.cu")
+      "csrc/kimi_k3/attn_res_kernel.cu")
     set_gencode_flags_for_srcs(
       SRCS "${KIMI_K3_ATTN_RES_SRC}"
       CUDA_ARCHS "${KIMI_K3_ATTN_RES_ARCHS}")
@@ -1179,7 +1214,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # Hadacore kernels
   cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX" "${CUDA_ARCHS}")
   if(HADACORE_ARCHS)
-    set(HADACORE_SRCS "csrc/libtorch_stable/quantization/hadamard/hadacore/hadamard_transform_cuda.cu")
+    set(HADACORE_SRCS "csrc/quantization/hadamard/hadacore/hadamard_transform_cuda.cu")
     set_gencode_flags_for_srcs(
       SRCS "${HADACORE_SRCS}"
       CUDA_ARCHS "${HADACORE_ARCHS}")
@@ -1203,7 +1238,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     list(FILTER FUSED_KDA_DECODE_HIP_ARCHS INCLUDE REGEX "gfx942|gfx950")
     if(FUSED_KDA_DECODE_HIP_ARCHS)
       set(FUSED_KDA_DECODE_HIP_SRC
-        "csrc/libtorch_stable/kimi_k3/fused_kda_decode_kernel_rocm.cu")
+        "csrc/kimi_k3/fused_kda_decode_kernel_rocm.cu")
       list(APPEND VLLM_STABLE_EXT_SRC "${FUSED_KDA_DECODE_HIP_SRC}")
       message(STATUS
         "Building fused KDA decode for HIP archs: ${FUSED_KDA_DECODE_HIP_ARCHS}")
@@ -1213,7 +1248,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     list(FILTER FUSED_KDA_CHUNK_HIP_ARCHS INCLUDE REGEX "gfx950")
     if(FUSED_KDA_CHUNK_HIP_ARCHS)
       set(FUSED_KDA_CHUNK_HIP_SRC
-        "csrc/libtorch_stable/kimi_k3/fused_kda_chunk_kernel_rocm.cu")
+        "csrc/kimi_k3/fused_kda_chunk_kernel_rocm.cu")
       list(APPEND VLLM_STABLE_EXT_SRC "${FUSED_KDA_CHUNK_HIP_SRC}")
       message(STATUS
         "Building fused KDA chunk for HIP archs: ${FUSED_KDA_CHUNK_HIP_ARCHS}")
@@ -1299,24 +1334,22 @@ endif()
 #
 
 set(VLLM_MOE_EXT_SRC
-  "csrc/libtorch_stable/moe/torch_bindings.cpp"
-  "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu"
-  "csrc/libtorch_stable/moe/topk_softmax_kernels.cu"
-  "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu")
+  "csrc/moe/torch_bindings.cpp"
+  "csrc/moe/moe_align_sum_kernels.cu"
+  "csrc/moe/topk_softmax_kernels.cu"
+  "csrc/moe/topk_softplus_sqrt_kernels.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
-    "csrc/libtorch_stable/moe/moe_wna16.cu"
-    "csrc/libtorch_stable/moe/grouped_topk_kernels.cu")
-elseif(VLLM_GPU_LANG STREQUAL "HIP")
-  # weight-only MoE GEMM serves the GGUF MoE path on gfx906
-  list(APPEND VLLM_MOE_EXT_SRC "csrc/libtorch_stable/moe/moe_wna16.cu")
+    "csrc/moe/moe_wna16.cu"
+    "csrc/moe/grouped_topk_kernels.cu"
+    "csrc/moe/fused_globalize_align_block_size.cu")
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(MOE_PERMUTE_SRC
-      "csrc/libtorch_stable/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu"
-      "csrc/libtorch_stable/moe/moe_permute_unpermute_op.cu")
+      "csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu"
+      "csrc/moe/moe_permute_unpermute_op.cu")
 
   list(APPEND VLLM_MOE_EXT_SRC "${MOE_PERMUTE_SRC}")
 endif()
@@ -1327,7 +1360,7 @@ set_gencode_flags_for_srcs(
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_MOE_WNA16_SRC
-    "csrc/libtorch_stable/moe/moe_wna16.cu")
+    "csrc/moe/moe_wna16.cu")
 
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_MOE_WNA16_SRC}"
@@ -1362,7 +1395,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # preselected input type pairs and schedules.
     # Generate sources:
     set(MOE_MARLIN_GEN_SCRIPT
-      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/moe/marlin_moe_wna16/generate_kernels.py)
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/marlin/generate_kernels.py)
     file(MD5 ${MOE_MARLIN_GEN_SCRIPT} MOE_MARLIN_GEN_SCRIPT_HASH)
     list(JOIN CUDA_ARCHS "," CUDA_ARCHS_STR)
     set(MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH "${MOE_MARLIN_GEN_SCRIPT_HASH}(ARCH:${CUDA_ARCHS_STR})")
@@ -1376,6 +1409,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         COMMAND ${CMAKE_COMMAND} -E env
         PYTHONPATH=$ENV{PYTHONPATH}
           ${Python_EXECUTABLE} ${MOE_MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/marlin_moe_wna16
         RESULT_VARIABLE moe_marlin_generation_result
         OUTPUT_VARIABLE moe_marlin_generation_output
         OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/moe_marlin_generation.log
@@ -1397,7 +1431,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
 
     if (MARLIN_MOE_ARCHS)
-      file(GLOB MARLIN_MOE_SRC "csrc/libtorch_stable/moe/marlin_moe_wna16/sm80_kernel_*.cu")
+      file(GLOB MARLIN_MOE_SRC "csrc/moe/marlin_moe_wna16/sm80_kernel_*.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_MOE_SRC}"
         CUDA_ARCHS "${MARLIN_MOE_ARCHS}")
@@ -1409,7 +1443,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
 
     if (MARLIN_MOE_SM75_ARCHS)
-      file(GLOB MARLIN_MOE_SM75_SRC "csrc/libtorch_stable/moe/marlin_moe_wna16/sm75_kernel_*.cu")
+      file(GLOB MARLIN_MOE_SM75_SRC "csrc/moe/marlin_moe_wna16/sm75_kernel_*.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_MOE_SM75_SRC}"
         CUDA_ARCHS "${MARLIN_MOE_SM75_ARCHS}")
@@ -1421,7 +1455,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
 
     if (MARLIN_MOE_FP8_ARCHS)
-      file(GLOB MARLIN_MOE_FP8_SRC "csrc/libtorch_stable/moe/marlin_moe_wna16/sm89_kernel_*.cu")
+      file(GLOB MARLIN_MOE_FP8_SRC "csrc/moe/marlin_moe_wna16/sm89_kernel_*.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_MOE_FP8_SRC}"
         CUDA_ARCHS "${MARLIN_MOE_FP8_ARCHS}")
@@ -1432,7 +1466,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       list(APPEND VLLM_MOE_EXT_SRC ${MARLIN_MOE_FP8_SRC})
     endif()
 
-    set(MARLIN_MOE_OTHER_SRC "csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu")
+    set(MARLIN_MOE_OTHER_SRC "csrc/moe/marlin_moe_wna16/ops.cu")
     set_gencode_flags_for_srcs(
       SRCS "${MARLIN_MOE_OTHER_SRC}"
       CUDA_ARCHS "${MARLIN_MOE_OTHER_ARCHS}")
@@ -1504,19 +1538,26 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
+    "csrc/rocm/w8a8_sdot4.cu"
+    "csrc/rocm/fp8_emu_gemm.cu"
+    "csrc/rocm/bf16_emu_gemv.cu"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/attention.cu")
   set(VLLM_ROCM_EXT_FLAGS ${VLLM_GPU_FLAGS})
 
   # skinny_gemms*.cu are built on gfx9/gfx11 ISA (MFMA, dot2/dot4, legacy
-  # s_waitcnt asm) that gfx1250 (gfx12) does not provide. Exclude them from the
-  # gfx1250 build and disable their op registrations (VLLM_SKIP_SKINNY_GEMMS);
-  # vLLM falls back to default/Triton GEMM for those ops on gfx1250.
+  # s_waitcnt asm) that neither gfx1250 (gfx12) nor gfx906 (Vega20, GCN5.1,
+  # no MFMA at all) provides. Exclude them from both builds and disable their
+  # op registrations (VLLM_SKIP_SKINNY_GEMMS); vLLM falls back to
+  # default/Triton GEMM for those ops. On gfx906 they compile only because the
+  # MFMA sections sit behind `__HIP__GFX9__`, so the compiled kernels would be
+  # non-MFMA fallbacks that no caller selects - registering them would just
+  # expose ops with no working gfx906 path.
   list(REMOVE_ITEM VLLM_ROCM_EXT_SRC "csrc/rocm/skinny_gemms.cu")
   list(REMOVE_ITEM VLLM_ROCM_EXT_SRC "csrc/rocm/skinny_gemms_int4.cu")
   set(VLLM_SKINNY_ARCHES ${VLLM_GPU_ARCHES})
-  list(FILTER VLLM_SKINNY_ARCHES EXCLUDE REGEX "gfx1250")
+  list(FILTER VLLM_SKINNY_ARCHES EXCLUDE REGEX "gfx1250|gfx906")
   if(VLLM_SKINNY_ARCHES)
     message(STATUS "Building skinny_gemms for archs: ${VLLM_SKINNY_ARCHES}")
     set(VLLM_SKINNY_SRC
@@ -1536,7 +1577,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_rocm_C_skinny PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
     target_link_libraries(_rocm_C_skinny PRIVATE torch)
   else()
-    message(STATUS "Only gfx1250, skipping skinny_gemms")
+    message(STATUS "Only gfx1250/gfx906, skipping skinny_gemms")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 
@@ -1579,6 +1620,18 @@ endif()
 # For CUDA and HIP builds also build the triton_kernels external package.
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     include(cmake/external_projects/triton_kernels.cmake)
+endif()
+
+# DeepGEMM and DeepSelect host code uses C++20 <format>, which libstdc++
+# provides only from GCC 13 onward.
+if (VLLM_GPU_LANG STREQUAL "CUDA"
+    AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
+  message(FATAL_ERROR
+    "GCC >= 13 is required to build vLLM with CUDA (found ${CMAKE_CXX_COMPILER_VERSION}). "
+    "The DeepGEMM and DeepSelect dependencies use C++20 <format> in host code, "
+    "which libstdc++ does not provide before GCC 13. "
+    "See: https://github.com/vllm-project/vllm/issues/58158")
 endif()
 
 # For CUDA we also build and ship some external projects.

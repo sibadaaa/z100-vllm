@@ -1,0 +1,136 @@
+=== s18 AFTER (stream v1, default) so=7e62d7ec
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 10-13 11:41:17 [_aiter_ops.py:174] Could not locate PyTorch's HIP runtime; AITER JIT extensions may fail to resolve HIP symbols.
+rocblaslt warning: No paths matched /opt/dtk/lib/hipblaslt/library/*gfx906*co. Make sure that HIPBLASLT_TENSILE_LIBPATH is set correctly.
+         shape  mode   nt  M       ms   GB/s  x(base)  note
+   1280x5120    gemv   64  1   0.0262    250     1.00  rel_err=0.00e+00
+   1280x5120    gemv   64  2   0.0314    208     1.20  rel_err=0.00e+00
+   1280x5120    gemv   64  3   0.0376    174     1.43  rel_err=0.00e+00
+   1280x5120    gemv   64  4   0.0558    117     2.13  rel_err=0.00e+00
+   1280x5120    gemm    0  1   0.3467     19    13.21  rel_err=0.00e+00
+   1280x5120    gemm    0  2   0.3430     19    13.07  rel_err=0.00e+00
+   1280x5120    gemm    0  3   0.3507     19    13.37  rel_err=0.00e+00
+   1280x5120    gemm    0  4   0.3501     19    13.34  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   3584x5120    gemv   64  1   0.0436    421     1.00  rel_err=0.00e+00
+   3584x5120    gemv   64  2   0.0528    348     1.21  rel_err=0.00e+00
+   3584x5120    gemv   64  3   0.0575    319     1.32  rel_err=0.00e+00
+   3584x5120    gemv   64  4   0.0865    212     1.99  rel_err=0.00e+00
+   3584x5120    gemm    0  1   0.3442     53     7.90  rel_err=0.00e+00
+   3584x5120    gemm    0  2   0.3444     53     7.91  rel_err=0.00e+00
+   3584x5120    gemm    0  3   0.3449     53     7.92  rel_err=0.00e+00
+   3584x5120    gemm    0  4   0.3459     53     7.94  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   4096x5120    gemv   64  1   0.0654    321     1.00  rel_err=0.00e+00
+   4096x5120    gemv   64  2   0.0808    259     1.24  rel_err=0.00e+00
+   4096x5120    gemv   64  3   0.0987    212     1.51  rel_err=0.00e+00
+   4096x5120    gemv   64  4   0.1460    144     2.23  rel_err=0.00e+00
+   4096x5120    gemm    0  1   0.3539     59     5.41  rel_err=0.00e+00
+   4096x5120    gemm    0  2   0.3547     59     5.43  rel_err=0.00e+00
+   4096x5120    gemm    0  3   0.3545     59     5.42  rel_err=0.00e+00
+   4096x5120    gemm    0  4   0.3541     59     5.42  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   5120x5120    gemv   64  1   0.0661    396     1.00  rel_err=0.00e+00
+   5120x5120    gemv   64  2   0.0856    306     1.29  rel_err=0.00e+00
+   5120x5120    gemv   64  3   0.0997    263     1.51  rel_err=0.00e+00
+   5120x5120    gemv   64  4   0.1494    175     2.26  rel_err=0.00e+00
+   5120x5120    gemm    0  1   0.3552     74     5.37  rel_err=0.00e+00
+   5120x5120    gemm    0  2   0.3559     74     5.38  rel_err=0.00e+00
+   5120x5120    gemm    0  3   0.3555     74     5.38  rel_err=0.00e+00
+   5120x5120    gemm    0  4   0.3553     74     5.37  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   8704x5120    gemv   64  1   0.1001    445     1.00  rel_err=0.00e+00
+   8704x5120    gemv   64  2   0.1215    367     1.21  rel_err=0.00e+00
+   8704x5120    gemv   64  3   0.1498    298     1.50  rel_err=0.00e+00
+   8704x5120    gemv   64  4   0.2195    203     2.19  rel_err=0.00e+00
+   8704x5120    gemm    0  1   0.7081     63     7.07  rel_err=0.00e+00
+   8704x5120    gemm    0  2   0.7155     62     7.15  rel_err=0.00e+00
+   8704x5120    gemm    0  3   0.7093     63     7.08  rel_err=0.00e+00
+   8704x5120    gemm    0  4   0.7204     62     7.19  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   4352x5120    gemv   64  1   0.0663    336     1.00  rel_err=0.00e+00
+   4352x5120    gemv   64  2   0.0812    274     1.23  rel_err=0.00e+00
+   4352x5120    gemv   64  3   0.0998    223     1.51  rel_err=0.00e+00
+   4352x5120    gemv   64  4   0.1467    152     2.21  rel_err=0.00e+00
+   4352x5120    gemm    0  1   0.3551     63     5.36  rel_err=0.00e+00
+   4352x5120    gemm    0  2   0.3550     63     5.36  rel_err=0.00e+00
+   4352x5120    gemm    0  3   0.3557     63     5.37  rel_err=0.00e+00
+   4352x5120    gemm    0  4   0.3553     63     5.36  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+[probe] wrote /mnt/game/s18/s18_fp8_block_mprobe.json
+=== s18 BEFORE (STREAM=0 old GEMV)
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 10-13 11:41:53 [_aiter_ops.py:174] Could not locate PyTorch's HIP runtime; AITER JIT extensions may fail to resolve HIP symbols.
+rocblaslt warning: No paths matched /opt/dtk/lib/hipblaslt/library/*gfx906*co. Make sure that HIPBLASLT_TENSILE_LIBPATH is set correctly.
+         shape  mode   nt  M       ms   GB/s  x(base)  note
+   1280x5120    gemv   64  1   0.0932     70     1.00  rel_err=0.00e+00
+   1280x5120    gemv   64  2   0.1742     38     1.87  rel_err=0.00e+00
+   1280x5120    gemv   64  3   0.2365     28     2.54  rel_err=0.00e+00
+   1280x5120    gemv   64  4   0.2996     22     3.22  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   3584x5120    gemv   64  1   0.2273     81     1.00  rel_err=0.00e+00
+   3584x5120    gemv   64  2   0.4917     37     2.16  rel_err=5.96e-05
+   3584x5120    gemv   64  3   0.6999     26     3.08  rel_err=5.96e-05
+   3584x5120    gemv   64  4   0.8852     21     3.89  rel_err=5.96e-05
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   4096x5120    gemv   64  1   0.2406     87     1.00  rel_err=0.00e+00
+   4096x5120    gemv   64  2   0.5250     40     2.18  rel_err=0.00e+00
+   4096x5120    gemv   64  3   0.7469     28     3.10  rel_err=0.00e+00
+   4096x5120    gemv   64  4   0.9494     22     3.95  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   5120x5120    gemv   64  1   0.3024     87     1.00  rel_err=0.00e+00
+   5120x5120    gemv   64  2   0.6657     39     2.20  rel_err=0.00e+00
+   5120x5120    gemv   64  3   0.9557     27     3.16  rel_err=0.00e+00
+   5120x5120    gemv   64  4   1.2052     22     3.99  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   8704x5120    gemv   64  1   0.4934     90     1.00  rel_err=0.00e+00
+   8704x5120    gemv   64  2   1.0886     41     2.21  rel_err=0.00e+00
+   8704x5120    gemv   64  3   1.5478     29     3.14  rel_err=0.00e+00
+   8704x5120    gemv   64  4   1.9587     23     3.97  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+   4352x5120    gemv   64  1   0.2559     87     1.00  rel_err=0.00e+00
+   4352x5120    gemv   64  2   0.5641     40     2.20  rel_err=0.00e+00
+   4352x5120    gemv   64  3   0.8061     28     3.15  rel_err=0.00e+00
+   4352x5120    gemv   64  4   1.0307     22     4.03  rel_err=0.00e+00
+  row-consistency M=1 vs M=1: OK
+  row-consistency M=2 vs M=1: OK
+  row-consistency M=3 vs M=1: OK
+  row-consistency M=4 vs M=1: OK
+[probe] wrote /mnt/game/s18/s18_fp8_block_mprobe.json

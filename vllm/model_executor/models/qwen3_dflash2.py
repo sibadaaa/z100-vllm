@@ -176,6 +176,7 @@ class DFlashGroupedConv(nn.Module):
         block_size: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -195,7 +196,7 @@ class DFlashGroupedConv(nn.Module):
             2 * taps * self.num_groups,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "kernel_projection"),
             return_bias=False,
         )
@@ -254,6 +255,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             # Query tokens per request: the bonus token plus the mask tokens.
             block_size=1 + speculative_config.num_speculative_tokens,
             params_dtype=vllm_config.model_config.dtype,
+            quant_config=quant_config,
         )
         self.attention_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
@@ -406,6 +408,8 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # lm_head is shared with the target and may live in the target's dtype.
+        hidden_states = hidden_states.to(self.lm_head.weight.dtype)
         return self.candidate_logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )

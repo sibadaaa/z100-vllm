@@ -1,0 +1,18 @@
+[Unit]
+Description=Z100 bare-metal vLLM: Qwen3.8-27B-FP8 + DFlash2 k=7, TP=4
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOST=0.0.0.0
+WorkingDirectory=/home/lyh/z100-vllm
+ExecStart=/bin/bash /home/lyh/z100-vllm/tools/dcu/serve_host_dflash2.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+StandardOutput=append:/mnt/game/host-serve/logs/serve-host.log
+StandardError=append:/mnt/game/host-serve/logs/serve-host.log
+
+[Install]
+WantedBy=default.target

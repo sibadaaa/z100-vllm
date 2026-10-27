@@ -312,11 +312,10 @@ class AWQLinearMethod(LinearMethodBase):
             return
 
         bits = self.quant_config.weight_bits
-        empty = torch.empty(0, device=layer.qzeros.device)
 
         # hints: shuffle twice is equal to unshuffle once
-        ops.gptq_shuffle(layer.qzeros, empty, bits)
-        ops.gptq_shuffle(layer.qzeros, empty, bits)
+        ops.gptq_shuffle(layer.qzeros, bits)
+        ops.gptq_shuffle(layer.qzeros, bits)
 
         ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
         layer.qweight.data = layer.qweight.reshape(
@@ -365,7 +364,6 @@ class AWQLinearMethod(LinearMethodBase):
             layer.qweight,
             layer.qzeros,
             scales,
-            torch.empty(0, device=layer.qweight.device),
             True,
             True,
             self.quant_config.weight_bits,

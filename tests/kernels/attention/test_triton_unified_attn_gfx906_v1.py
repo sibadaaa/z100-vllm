@@ -288,3 +288,463 @@ def test_v1_unified_attention_prefill_matches_reference():
         o = torch.einsum("hgt,thd->hgd", p.float(), values[:end].float())
         ref[t] = o.reshape(num_q_heads, head_size)
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@torch.inference_mode()
+def test_v1_unified_attention_bidirectional_sliding_window_matches_reference():
+    """Non-causal sliding windows include nearby future keys across tiles."""
+    torch.manual_seed(11)
+    device = "cuda"
+    dtype = torch.float16
+    num_kv_heads, num_queries_per_kv, head_size = 1, 2, 64
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    q_len, context_len, block_size = 35, 19, 16
+    kv_len = context_len + q_len
+    sliding_window = 5
+    scale = head_size**-0.5
+
+    num_blocks = (kv_len + block_size - 1) // block_size
+    q = torch.randn(q_len, num_q_heads, head_size, device=device, dtype=dtype)
+    k = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=(sliding_window - 1, sliding_window - 1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+
+    keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    ref = torch.empty_like(q)
+    for t in range(q_len):
+        q_pos = context_len + t
+        key_pos = torch.arange(kv_len, device=device)
+        visible = (key_pos - q_pos).abs() < sliding_window
+        q_t = q[t].reshape(num_kv_heads, num_queries_per_kv, head_size)
+        scores = torch.einsum(
+            "hgd,thd->hgt", q_t.float(), keys.float()
+        ) * scale
+        scores = scores.masked_fill(~visible[None, None, :], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        result = torch.einsum("hgt,thd->hgd", probs, values.float())
+        ref[t] = result.reshape(num_q_heads, head_size)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+# ---- speculative-decoding verify steps stay decode-shaped --------------------
+# A k+1-token verify pass (MTP k=2 -> 3 query tokens) used to be classified as
+# prefill because max_seqlen_q > 1, which sent it to the unsplit 2D kernel: at
+# 32k that is 18.9 ms/layer instead of 0.9 ms/layer, on every decode step.
+
+
+def test_small_q_decode_routing_decision():
+    tuned = unified_attn._decode_block_m(256, 6)
+    assert tuned == 8
+    # a 3-token verify pass on the tuned shape is decode-shaped
+    assert unified_attn.gfx906_small_q_decode(3, True, tuned, True)
+    # plain decode is handled by its own branch, not by this predicate
+    assert not unified_attn.gfx906_small_q_decode(1, True, tuned, True)
+    # every verify query length up to the ceiling
+    assert unified_attn.gfx906_small_q_decode(2, True, tuned, True)
+    assert unified_attn.gfx906_small_q_decode(
+        unified_attn.GFX906_VERIFY_MAX_QUERY_LEN, True, tuned, True
+    )
+    # real prefill, missing segment buffers, untuned shapes and other
+    # platforms all keep the historical prefill classification
+    assert not unified_attn.gfx906_small_q_decode(
+        unified_attn.GFX906_VERIFY_MAX_QUERY_LEN + 1, True, tuned, True
+    )
+    assert not unified_attn.gfx906_small_q_decode(3, False, tuned, True)
+    assert not unified_attn.gfx906_small_q_decode(3, True, None, True)
+    assert not unified_attn.gfx906_small_q_decode(3, True, tuned, False)
+
+
+class _KernelSpy:
+    """Records launch grids of a @triton.jit kernel without altering it."""
+
+    def __init__(self, kernel, hits: list):
+        self._kernel = kernel
+        self._hits = hits
+
+    def __getitem__(self, grid):
+        self._hits.append(grid)
+        return self._kernel[grid]
+
+
+def _verify_step_inputs(device, dtype, num_q_tokens, kv_len, block_size=16):
+    num_kv_heads, num_queries_per_kv, head_size = 1, 6, 256
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    num_blocks = (kv_len + block_size - 1) // block_size
+    q = torch.randn(num_q_tokens, num_q_heads, head_size, device=device, dtype=dtype)
+    k = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, num_q_tokens], device=device, dtype=torch.int32)
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+    return q, k, v, out, cu_seqlens_q, seqused_k, block_table
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@pytest.mark.parametrize("num_q_tokens", [2, 3, 5])
+@torch.inference_mode()
+def test_v1_unified_attention_verify_step_uses_split_kv(monkeypatch, num_q_tokens):
+    """A k+1-token verify pass must take the 3D split-KV path, and be exact."""
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    head_size = 256
+    num_kv_heads, num_queries_per_kv = 1, 6
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    kv_len = 4096
+    scale = head_size**-0.5
+    q, k, v, out, cu_seqlens_q, seqused_k, block_table = _verify_step_inputs(
+        device, dtype, num_q_tokens, kv_len
+    )
+
+    hits_3d: list = []
+    hits_2d: list = []
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_3d",
+        _KernelSpy(unified_attn.kernel_unified_attention_3d, hits_3d),
+    )
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_2d",
+        _KernelSpy(unified_attn.kernel_unified_attention_2d, hits_2d),
+    )
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_VERIFY_3D", True)
+
+    num_segments = unified_attn.GFX906_MAX_DECODE_SEGMENTS
+    segm_shape = (num_q_tokens, num_q_heads, num_segments)
+    softmax_segm_output = torch.empty(
+        (*segm_shape, head_size), dtype=torch.float32, device=device
+    )
+    softmax_segm_max = torch.empty(segm_shape, dtype=torch.float32, device=device)
+    softmax_segm_expsum = torch.empty_like(softmax_segm_max)
+
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=num_q_tokens,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+
+    assert len(hits_2d) == 0, f"verify step fell back to the 2D kernel: {hits_2d}"
+    assert len(hits_3d) == 1
+    grid_x, grid_y, grid_z = hits_3d[0]
+    # one query block per token on the GQA6/256 tuned shape (BLOCK_Q == 1)
+    assert grid_x == num_q_tokens
+    assert grid_y == num_kv_heads
+    assert 0 < grid_z <= num_segments
+
+    context = kv_len - num_q_tokens
+    keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    ref = torch.empty_like(q)
+    for t in range(num_q_tokens):
+        end = context + t + 1
+        q_t = q[t].reshape(num_kv_heads, num_queries_per_kv, head_size)
+        s = torch.einsum("hgd,thd->hgt", q_t.float(), keys[:end].float()) * scale
+        p = torch.softmax(s, dim=-1)
+        o = torch.einsum("hgt,thd->hgd", p.float(), values[:end].float())
+        ref[t] = o.reshape(num_q_heads, head_size)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@torch.inference_mode()
+def test_v1_unified_attention_verify_step_kill_switch_restores_2d(monkeypatch):
+    """VLLM_GFX906_ATTN_VERIFY_3D=0 restores the historical 2D routing."""
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    kv_len = 4096
+    num_q_tokens = 3
+    num_q_heads = 6
+    q, k, v, out, cu_seqlens_q, seqused_k, block_table = _verify_step_inputs(
+        device, dtype, num_q_tokens, kv_len
+    )
+
+    hits_3d: list = []
+    hits_2d: list = []
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_3d",
+        _KernelSpy(unified_attn.kernel_unified_attention_3d, hits_3d),
+    )
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_2d",
+        _KernelSpy(unified_attn.kernel_unified_attention_2d, hits_2d),
+    )
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_VERIFY_3D", False)
+
+    num_segments = unified_attn.GFX906_MAX_DECODE_SEGMENTS
+    segm_shape = (num_q_tokens, num_q_heads, num_segments)
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=num_q_tokens,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=256**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=torch.empty(
+            (*segm_shape, 256), dtype=torch.float32, device=device
+        ),
+        softmax_segm_max=torch.empty(segm_shape, dtype=torch.float32, device=device),
+        softmax_segm_expsum=torch.empty(
+            segm_shape, dtype=torch.float32, device=device
+        ),
+    )
+
+    assert len(hits_3d) == 0
+    assert len(hits_2d) == 1
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@torch.inference_mode()
+def test_v1_unified_attention_draft_step_uses_split_kv(monkeypatch):
+    """The DFlash2 draft shape (head 128/GQA4, sliding 2048, M=7) must take
+    the 3D split-KV path and stay exact under the window.
+
+    The graph-A trace showed this shape on the unsplit 2D kernel with grid
+    (2, 2, 1) at 1234 us/call x 5 layers -- the same serial-scan disease the
+    verify-3D fix removed from the target shape.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    head_size = 128
+    num_kv_heads, num_queries_per_kv = 2, 4
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    num_q_tokens = 7
+    kv_len = 4096
+    sliding_window = 2048
+    scale = head_size**-0.5
+    num_blocks = (kv_len + 15) // 16
+    q = torch.randn(
+        num_q_tokens, num_q_heads, head_size, device=device, dtype=dtype
+    )
+    k = torch.randn(
+        num_blocks, 16, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor(
+        [0, num_q_tokens], device=device, dtype=torch.int32
+    )
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+
+    hits_3d: list = []
+    hits_2d: list = []
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_3d",
+        _KernelSpy(unified_attn.kernel_unified_attention_3d, hits_3d),
+    )
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_2d",
+        _KernelSpy(unified_attn.kernel_unified_attention_2d, hits_2d),
+    )
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_VERIFY_3D", True)
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_VERIFY_3D_DRAFT", True)
+
+    num_segments = unified_attn.GFX906_MAX_DECODE_SEGMENTS
+    segm_shape = (num_q_tokens, num_q_heads, num_segments)
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=num_q_tokens,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(sliding_window - 1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=torch.empty(
+            (*segm_shape, head_size), dtype=torch.float32, device=device
+        ),
+        softmax_segm_max=torch.empty(segm_shape, dtype=torch.float32, device=device),
+        softmax_segm_expsum=torch.empty(
+            segm_shape, dtype=torch.float32, device=device
+        ),
+    )
+
+    assert len(hits_2d) == 0, f"draft step fell back to the 2D kernel: {hits_2d}"
+    assert len(hits_3d) == 1
+    grid_x, grid_y, grid_z = hits_3d[0]
+    # BLOCK_M=16 -> BLOCK_Q=4 tokens per block -> 2 blocks over 7 tokens
+    assert grid_x == 2
+    assert grid_y == num_kv_heads
+    assert 0 < grid_z <= num_segments
+
+    context = kv_len - num_q_tokens
+    keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    ref = torch.empty_like(q)
+    for t in range(num_q_tokens):
+        pos = context + t
+        lo = max(0, pos - sliding_window + 1)
+        q_t = q[t].reshape(num_kv_heads, num_queries_per_kv, head_size)
+        s = (
+            torch.einsum("hgd,thd->hgt", q_t.float(), keys[lo : pos + 1].float())
+            * scale
+        )
+        p = torch.softmax(s, dim=-1)
+        o = torch.einsum("hgt,thd->hgd", p.float(), values[lo : pos + 1].float())
+        ref[t] = o.reshape(num_q_heads, head_size)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@torch.inference_mode()
+def test_v1_unified_attention_draft_kill_switch_restores_2d(monkeypatch):
+    """VLLM_GFX906_ATTN_VERIFY_3D_DRAFT=0 restores the draft's 2D routing."""
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    head_size = 128
+    num_kv_heads, num_queries_per_kv = 2, 4
+    num_q_heads = 8
+    num_q_tokens = 7
+    kv_len = 4096
+    num_blocks = (kv_len + 15) // 16
+    q = torch.randn(
+        num_q_tokens, num_q_heads, head_size, device=device, dtype=dtype
+    )
+    k = torch.randn(
+        num_blocks, 16, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor(
+        [0, num_q_tokens], device=device, dtype=torch.int32
+    )
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+
+    hits_3d: list = []
+    hits_2d: list = []
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_3d",
+        _KernelSpy(unified_attn.kernel_unified_attention_3d, hits_3d),
+    )
+    monkeypatch.setattr(
+        unified_attn,
+        "kernel_unified_attention_2d",
+        _KernelSpy(unified_attn.kernel_unified_attention_2d, hits_2d),
+    )
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_VERIFY_3D", True)
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_VERIFY_3D_DRAFT", False)
+
+    num_segments = unified_attn.GFX906_MAX_DECODE_SEGMENTS
+    segm_shape = (num_q_tokens, num_q_heads, num_segments)
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=num_q_tokens,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=head_size**-0.5,
+        causal=True,
+        window_size=(2047, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=torch.empty(
+            (*segm_shape, head_size), dtype=torch.float32, device=device
+        ),
+        softmax_segm_max=torch.empty(segm_shape, dtype=torch.float32, device=device),
+        softmax_segm_expsum=torch.empty(
+            segm_shape, dtype=torch.float32, device=device
+        ),
+    )
+
+    assert len(hits_3d) == 0
+    assert len(hits_2d) == 1
+
+
+def test_decode_block_m_draft_shape():
+    """The draft shape gets a decode block mapping (16 rows = 4 tokens x 4)."""
+    assert unified_attn._decode_block_m(128, 4) == 16

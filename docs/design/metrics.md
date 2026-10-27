@@ -30,6 +30,7 @@ In v1, an extensive set of metrics are exposed via a Prometheus-compatible `/met
 - `vllm:prompt_tokens_total` (Counter) - Total number of prompt tokens processed.
 - `vllm:generation_tokens_total` (Counter) - Total number of generated tokens.
 - `vllm:request_success_total` (Counter) - Number of finished requests (by finish reason).
+- `vllm:admission_rejections_total` (Counter) - Admission attempts rejected by a queue limit, by reason.
 - `vllm:request_prompt_tokens` (Histogram) - Histogram of input prompt token counts.
 - `vllm:request_generation_tokens` (Histogram) - Histogram of generation token counts.
 - `vllm:time_to_first_token_seconds` (Histogram) - Time to first token (TTFT).
@@ -390,6 +391,13 @@ However, `prometheus_client` has
 for [unclear reasons](gh-pr:7279#discussion_r1710417152). We
 simply use a `Gauge` metric set to 1 and
 `multiprocess_mode="mostrecent"` instead.
+
+The label set is the configuration itself, minus the bookkeeping fields that
+only describe how it was constructed (`_block_size_resolved` and the
+`user_specified_*` flags). Since a configuration change yields a different
+label set rather than updating the existing series, the metric is informational;
+see [Reducing Scrape Volume](../usage/metrics.md#reducing-scrape-volume) for how
+to drop it when the configuration is tracked elsewhere.
 
 ### LoRA Metrics
 

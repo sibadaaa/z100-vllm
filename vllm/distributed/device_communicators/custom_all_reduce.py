@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,7 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.hygon_dtk import dcu_custom_ar_enabled
 
 try:
     ops.meta_size()
@@ -31,6 +33,19 @@ except ImportError:
     torch_symm_mem = None
 
 logger = init_logger(__name__)
+
+_ReduceScatterBackend = Literal["legacy", "mnnvl_lamport", "mnnvl_multimem"]
+_MNNVL_MULTIMEM_REDUCE_SCATTER_WORLD_SIZES = (2, 4, 8)
+
+
+_DCU_CUSTOM_AR_ALGOS = ("1stage", "oneshot", "2stage", "twoshot")
+
+
+def _dcu_custom_ar_algo() -> str:
+    # Must match the exact strcmp values in csrc/custom_all_reduce.cuh: no
+    # strip/lower, so a value the C++ dispatch would reject at runtime is
+    # rejected here first and the RCCL all-reduce is kept instead.
+    return os.getenv("VLLM_CUSTOM_ALLREDUCE_ALGO", "")
 
 
 def _has_local_multicast_support(device: torch.device) -> bool:
@@ -53,6 +68,12 @@ def _has_local_multicast_support(device: torch.device) -> bool:
         return False
 
 
+def _all_ranks_true(group: ProcessGroup, local_value: bool) -> bool:
+    group_value = torch.tensor(int(local_value), dtype=torch.int32, device="cpu")
+    dist.all_reduce(group_value, op=dist.ReduceOp.MIN, group=group)
+    return bool(group_value.item())
+
+
 def _group_can_attempt_mnnvl(
     group: ProcessGroup,
     device: torch.device,
@@ -71,17 +92,7 @@ def _group_can_attempt_mnnvl(
         and current_platform.has_device_capability(100, device_index)
         and _has_local_multicast_support(device)
     )
-    group_support = torch.tensor(
-        int(local_support),
-        dtype=torch.int32,
-        device="cpu",
-    )
-    dist.all_reduce(
-        group_support,
-        op=dist.ReduceOp.MIN,
-        group=group,
-    )
-    return bool(group_support.item())
+    return _all_ranks_true(group, local_support)
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -101,11 +112,26 @@ def _can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
+def _supports_mnnvl_multimem_reduce_scatter(
+    device: torch.device, world_size: int
+) -> bool:
+    return (
+        world_size in _MNNVL_MULTIMEM_REDUCE_SCATTER_WORLD_SIZES
+        and device.index is not None
+        and (
+            current_platform.is_device_capability((10, 0), device.index)
+            or current_platform.is_device_capability((10, 3), device.index)
+        )
+        and _has_local_multicast_support(device)
+    )
+
+
 from vllm.distributed.utils import is_weak_contiguous  # noqa: E402
 
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8, 16]
+    batch_invariant = False
     _DEFAULT_ALL_GATHER_MAX_SIZE = 2 * 1024 * 1024
     _DEFAULT_MNNVL_ALL_GATHER_MAX_SIZES = {
         2: 8 * 1024 * 1024,
@@ -116,6 +142,8 @@ class CustomAllreduce:
     }
     _DEFAULT_REDUCE_SCATTER_MAX_SIZE = 16 * 1024 * 1024
     _DEFAULT_MNNVL_REDUCE_SCATTER_MAX_SIZE = 16 * 1024 * 1024
+    _DEFAULT_MNNVL_MULTIMEM_REDUCE_SCATTER_MAX_SIZE = 64 * 1024 * 1024
+    _MNNVL_MULTIMEM_REDUCE_SCATTER_BLOCKS = 8
 
     # max_size: max supported allreduce size
     def __init__(
@@ -127,19 +155,40 @@ class CustomAllreduce:
         max_mnnvl_all_gather_size=None,
         max_reduce_scatter_size=_DEFAULT_REDUCE_SCATTER_MAX_SIZE,
         max_mnnvl_reduce_scatter_size=_DEFAULT_MNNVL_REDUCE_SCATTER_MAX_SIZE,
+        max_mnnvl_multimem_reduce_scatter_size=(
+            _DEFAULT_MNNVL_MULTIMEM_REDUCE_SCATTER_MAX_SIZE
+        ),
         symm_mem_enabled=False,
+        *,
+        register_graph_buffers: bool = True,
     ) -> None:
         """Args:
             group: the process group to work on. If None, it will use the
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bound to f"cuda:{local_rank}".
+            register_graph_buffers: whether graph capture IPC-registers its buffers.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
 
         """
         self._IS_CAPTURING = False
+        # S33 WP2: on gfx906, P2P reads of peer graph-pool activations (plain
+        # cached memory) return stale data -- the PCIe P2P path does not snoop
+        # the producer's L2. Graph capture therefore must NOT hand the
+        # graph-pool tensor to the peer kernels; force the copy-into-
+        # registered-fine-grain-buffer path (registered=False) for captures,
+        # which reads fresh data on the producer and writes uncached memory.
+        if register_graph_buffers and dcu_custom_ar_enabled():
+            logger.warning_once(
+                "VLLM_DCU_CUSTOM_AR=1: capturing graphs with "
+                "register_graph_buffers=False (copy-into-fine-grain-buffer "
+                "path) because gfx906 P2P reads of cached peer memory are "
+                "stale."
+            )
+            register_graph_buffers = False
+        self._capture_registered = register_graph_buffers
         self._ptr = 0
         self.disabled = True
         self.mnnvl_buffer = None
@@ -153,7 +202,15 @@ class CustomAllreduce:
         self.mnnvl_lamport_epochs = None
         self.mnnvl_lamport_ag_epoch_ptr = 0
         self.mnnvl_lamport_rs_epoch_ptr = 0
+        self.mnnvl_multimem_rs_supported = False
+        self.mnnvl_multimem_rs_initialized = False
+        self.mnnvl_multimem_rs_buffer = None
+        self.mnnvl_multimem_rs_handle = None
+        self.mnnvl_multimem_rs_buffer_size = 0
+        self.mnnvl_multimem_rs_local_ptr = 0
+        self.mnnvl_multimem_rs_multicast_ptr = 0
         self.mnnvl_only = False
+        self.batch_invariant = envs.VLLM_BATCH_INVARIANT
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -197,6 +254,9 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+        mnnvl_multimem_rs_supported = _supports_mnnvl_multimem_reduce_scatter(
+            device, world_size
+        )
         if not same_node and not _group_can_attempt_mnnvl(group, device):
             logger.warning(
                 "Custom collectives are disabled because this multi-node "
@@ -234,12 +294,23 @@ class CustomAllreduce:
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if same_node and world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+            if dcu_custom_ar_enabled():
+                # Opt-in for gfx906 PCIe-only groups (WP2). Only warn: the
+                # kernels need VLLM_CUSTOM_ALLREDUCE_ALGO to be forced and
+                # peer P2P across the PCIe switch to actually work.
+                logger.warning(
+                    "Custom allreduce: enabling on a %d-rank PCIe-only group "
+                    "because VLLM_DCU_CUSTOM_AR=1. If this hangs, fall back "
+                    "to RCCL by unsetting the env var.",
+                    world_size,
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -294,6 +365,9 @@ class CustomAllreduce:
         self.max_mnnvl_all_gather_size = max_mnnvl_all_gather_size
         self.max_reduce_scatter_size = max_reduce_scatter_size
         self.max_mnnvl_reduce_scatter_size = max_mnnvl_reduce_scatter_size
+        self.max_mnnvl_multimem_reduce_scatter_size = (
+            max_mnnvl_multimem_reduce_scatter_size
+        )
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
@@ -307,6 +381,11 @@ class CustomAllreduce:
                 max_mnnvl_reduce_scatter_size,
             )
         )
+        if world_size in _MNNVL_MULTIMEM_REDUCE_SCATTER_WORLD_SIZES:
+            self.mnnvl_multimem_rs_supported = _all_ranks_true(
+                self.group,
+                mnnvl_multimem_rs_supported and bool(self.mnnvl_multicast_ptr),
+            )
         if not same_node and not self.mnnvl_multicast_ptr:
             logger.warning(
                 "Custom collectives are disabled because this multi-node "
@@ -368,6 +447,59 @@ class CustomAllreduce:
         except RuntimeError as error:
             logger.debug("MNNVL AG/RS initialization failed: %s", error)
 
+    def _init_mnnvl_multimem_reduce_scatter_buffer(self) -> None:
+        if self.mnnvl_multimem_rs_initialized:
+            return
+        self.mnnvl_multimem_rs_initialized = True
+        if not self.mnnvl_multimem_rs_supported:
+            return
+
+        assert torch_symm_mem is not None
+        buffer = None
+        signal_size = ops.meta_size()
+        try:
+            buffer = torch_symm_mem.empty(
+                signal_size + self.max_mnnvl_multimem_reduce_scatter_size,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+        except RuntimeError as error:
+            logger.debug("MNNVL multimem RS allocation failed: %s", error)
+        if not _all_ranks_true(self.group, buffer is not None):
+            logger.warning_once(
+                "MNNVL multimem reduce-scatter symmetric-memory allocation "
+                "failed on at least one rank; falling back to NCCL.",
+                scope="global",
+            )
+            return
+        assert buffer is not None
+
+        handle = None
+        try:
+            handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
+            if handle is not None:
+                buffer[:signal_size].zero_()
+                torch.accelerator.synchronize()
+        except RuntimeError as error:
+            logger.debug("MNNVL multimem RS rendezvous failed: %s", error)
+        if not _all_ranks_true(
+            self.group,
+            handle is not None and bool(handle.multicast_ptr),
+        ):
+            logger.warning_once(
+                "MNNVL multimem reduce-scatter symmetric-memory rendezvous "
+                "failed on at least one rank; falling back to NCCL.",
+                scope="global",
+            )
+            return
+        assert handle is not None
+
+        self.mnnvl_multimem_rs_buffer = buffer
+        self.mnnvl_multimem_rs_handle = handle
+        self.mnnvl_multimem_rs_buffer_size = self.max_mnnvl_multimem_reduce_scatter_size
+        self.mnnvl_multimem_rs_local_ptr = buffer.data_ptr() + signal_size
+        self.mnnvl_multimem_rs_multicast_ptr = handle.multicast_ptr + signal_size
+
     @contextmanager
     def capture(self):
         """The main responsibility of this context manager is the
@@ -412,9 +544,56 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
+        # gfx906 is opt-in only (RocmPlatform.use_custom_allreduce), so when
+        # this gate is reachable at all VLLM_DCU_CUSTOM_AR=1 is set -- it must
+        # sit *above* the world_size==2 / fully_connected early return below,
+        # which would otherwise let bf16 through on the same broken kernel.
+        # The gfx906 _C build has no bf16 allreduce instantiation: the C++
+        # dispatch throws "custom allreduce only supports float32, float16
+        # and bfloat16" for it (Z100 e2e 2026-10-21). The DFlash draft tower
+        # is bf16, so those tensors keep RCCL; fp16/fp32 use CUSTOM.
+        if dcu_custom_ar_enabled() and inp.dtype == torch.bfloat16:
+            logger.warning_once(
+                "VLLM_DCU_CUSTOM_AR=1: bf16 all-reduce keeps RCCL (gfx906 "
+                "custom-AR build has no bf16 kernel); fp16/fp32 use CUSTOM."
+            )
+            return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
+            return self.batch_invariant or inp_size < self.max_size
+        if dcu_custom_ar_enabled():
+            # WP2 opt-in for PCIe-only multi-rank groups. Without a forced
+            # algorithm the C++ dispatch launches nothing for this topology,
+            # which would return garbage instead of a reduction, and world
+            # sizes outside (2, 4, 6, 8) throw in the C++ dispatch.
+            if self.world_size not in (2, 4, 6, 8):
+                logger.warning_once(
+                    "VLLM_DCU_CUSTOM_AR=1 does not support a %d-rank "
+                    "PCIe-only group (the custom kernels only cover 2/4/6/8 "
+                    "GPUs); keeping the RCCL all-reduce.",
+                    self.world_size,
+                )
+                return False
+            algo = _dcu_custom_ar_algo()
+            # S33 WP2: the DCU push kernel covers oneshot/1stage only; the
+            # pull kernels have no staging copy on this path any more.
+            if algo not in ("oneshot", "1stage"):
+                logger.warning_once(
+                    "VLLM_DCU_CUSTOM_AR=1 needs VLLM_CUSTOM_ALLREDUCE_ALGO="
+                    "oneshot on a PCIe-only multi-rank group; keeping the "
+                    "RCCL all-reduce."
+                )
+                return False
+            # S33 WP2 size gate: only decode-size payloads (<= 64 KiB) take
+            # the custom kernel; larger payloads (prefill) stay on RCCL so
+            # prefill TTFT keeps its baseline behavior (construction
+            # z100-s33-fp8-scope-construction.md WP2). S34 WP2: the gate is
+            # env-tunable (default 64 KiB = unchanged behavior) so concurrent
+            # MTP verify payloads (4 seqs x 3 tok = 120 KiB) can stay on the
+            # push path; kernel-side region chunk is 2 MiB.
+            if inp_size > envs.VLLM_DCU_CUSTOM_AR_MAX_KIB * 1024:
+                return False
             return inp_size < self.max_size
         return False
 
@@ -429,13 +608,27 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
+        chunk_numel = self.max_size // inp.element_size()
+        if inp.numel() <= chunk_numel:
+            self._all_reduce_chunk(inp, out, registered)
+            return out
+        # Storage-order views: the gate only admits one contiguous block.
+        flat_inp = inp.as_strided((inp.numel(),), (1,), inp.storage_offset())
+        flat_out = out.as_strided((out.numel(),), (1,), out.storage_offset())
+        for start in range(0, flat_inp.numel(), chunk_numel):
+            end = start + chunk_numel
+            self._all_reduce_chunk(flat_inp[start:end], flat_out[start:end], registered)
+        return out
+
+    def _all_reduce_chunk(
+        self, inp: torch.Tensor, out: torch.Tensor, registered: bool
+    ) -> None:
         if registered:
             ops.all_reduce(self._ptr, inp, out, 0, 0)
         else:
             ops.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
-        return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
@@ -444,7 +637,7 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                return self.all_reduce(input, registered=self._capture_registered)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
@@ -509,35 +702,80 @@ class CustomAllreduce:
             )
         return out
 
-    def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
+    def _select_reduce_scatter_backend(
+        self, inp: torch.Tensor
+    ) -> _ReduceScatterBackend | None:
         if self.disabled or not current_platform.is_cuda():
-            return False
+            return None
+        # The size gates below would switch backends per batch.
+        if self.batch_invariant:
+            return None
         if self.world_size == 16 and not self.mnnvl_only:
-            return False
+            return None
         inp_size = inp.nbytes
         if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-            return False
+            return None
         if inp.shape[0] % self.world_size != 0:
-            return False
+            return None
         output_size = inp_size // self.world_size
-        max_size = (
-            self.max_mnnvl_reduce_scatter_size
-            if self.mnnvl_multicast_ptr
-            else self.max_reduce_scatter_size
-        )
-        return (
-            0 < inp_size <= max_size
-            and output_size % 16 == 0
-            and is_weak_contiguous(inp)
-            and (self.fully_connected or bool(self.mnnvl_multicast_ptr))
-        )
+        if inp_size <= 0 or output_size % 16 != 0 or not is_weak_contiguous(inp):
+            return None
+
+        if self.mnnvl_multicast_ptr:
+            if inp_size <= self.max_mnnvl_reduce_scatter_size:
+                return "mnnvl_lamport"
+            if (
+                (
+                    self.mnnvl_multimem_rs_multicast_ptr
+                    or (
+                        self.mnnvl_multimem_rs_supported
+                        and not self.mnnvl_multimem_rs_initialized
+                    )
+                )
+                and not envs.VLLM_BATCH_INVARIANT
+                and inp_size <= self.max_mnnvl_multimem_reduce_scatter_size
+            ):
+                return "mnnvl_multimem"
+            return None
+
+        if self.fully_connected and inp_size <= self.max_reduce_scatter_size:
+            return "legacy"
+        return None
+
+    def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        return self._select_reduce_scatter_backend(inp) is not None
+
+    def should_mnnvl_multimem_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        return self._select_reduce_scatter_backend(inp) == "mnnvl_multimem"
 
     def custom_reduce_scatter(self, inp: torch.Tensor) -> torch.Tensor | None:
-        if not self.should_custom_reduce_scatter(inp):
+        backend = self._select_reduce_scatter_backend(inp)
+        if backend is None:
             return None
+        if backend == "mnnvl_multimem" and not self.mnnvl_multimem_rs_multicast_ptr:
+            if self._IS_CAPTURING:
+                return None
+            self._init_mnnvl_multimem_reduce_scatter_buffer()
+            if not self.mnnvl_multimem_rs_multicast_ptr:
+                return None
+
         out_shape = (inp.shape[0] // self.world_size,) + inp.shape[1:]
         out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
-        if self.mnnvl_multicast_ptr:
+        if backend == "mnnvl_multimem":
+            logger.info_once(
+                "Using the low-SM MNNVL multimem reduce-scatter kernel.",
+                scope="global",
+            )
+            ops.mnnvl_multimem_reduce_scatter(
+                self._ptr,
+                inp,
+                out,
+                self.mnnvl_multimem_rs_local_ptr,
+                self.mnnvl_multimem_rs_multicast_ptr,
+                self.mnnvl_multimem_rs_buffer_size,
+                self._MNNVL_MULTIMEM_REDUCE_SCATTER_BLOCKS,
+            )
+        elif backend == "mnnvl_lamport":
             logger.info_once(
                 "Using the MNNVL Lamport reduce-scatter kernel.",
                 scope="global",
@@ -571,6 +809,8 @@ class CustomAllreduce:
             self.mnnvl_handle = None
             self.mnnvl_buffer = None
             self.mnnvl_lamport_epochs = None
+            self.mnnvl_multimem_rs_handle = None
+            self.mnnvl_multimem_rs_buffer = None
 
     def __del__(self):
         self.close()

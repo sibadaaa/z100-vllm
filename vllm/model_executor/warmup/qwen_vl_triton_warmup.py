@@ -72,7 +72,11 @@ def _warm_mrope(runner: "GPUModelRunner", model: torch.nn.Module) -> None:
         (module for module in model.modules() if isinstance(module, MRotaryEmbedding)),
         None,
     )
-    if rope is None:
+    if rope is None or all(
+        getattr(module, "use_fused_qk_norm_rope_gate", False)
+        for module in model.modules()
+        if any(child is rope for child in module.children())
+    ):
         return
 
     model_config = runner.model_config
@@ -107,6 +111,13 @@ def _synchronize_device(device: torch.device) -> None:
 def qwen_vl_triton_warmup(runner: "GPUModelRunner") -> None:
     """Warm Qwen3-VL ViT kernels and M-RoPE for ``SupportsMRoPE`` models."""
     model = runner.get_model()
-    _warm_vision(model, runner.device)
+    # Qwen3-VL is multimodal: importing it pulls torchvision through
+    # transformers' qwen2_vl image processor.  Text-only deployments (e.g. the
+    # ROCm/DCU stack) do not install torchvision, and the ViT warmup is
+    # irrelevant for them, so fail soft instead of failing startup.
+    try:
+        _warm_vision(model, runner.device)
+    except ImportError as exc:
+        logger.info_once("Skipping Qwen3-VL vision warmup (%s).", exc)
     _warm_mrope(runner, model)
     _synchronize_device(runner.device)

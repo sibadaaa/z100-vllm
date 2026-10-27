@@ -1,0 +1,73 @@
+{
+ "schema": "z100-s29-w4-probe-v1",
+ "date": "2026-10-25",
+ "device": "Z100L gfx906",
+ "builder": "docker exec z100-build-211: /opt/dtk/bin/hipcc -O3 --offload-arch=gfx906",
+ "source": "tools/dcu/gemv_probe.cpp (w4_dot8 variant)",
+ "isa_gate": {
+  "tool": ".s23/probes/isa_gate.py",
+  "result": "PASS",
+  "detail": "1 code object hipv4-amdgcn-amd-amdhsa--gfx906, v_dot8_i32_i4 x480, v_dot8_u32_u4 x0"
+ },
+ "isa_facts": {
+  "v_dot8_i32_i4": "8-lane SIGNED 4-bit x SIGNED 4-bit dot (NOT int8 x int4); pinned by tools/dcu/dot8_numeric_probe.cpp",
+  "consequence": "int8 activations decompose as a = 16*(a>>4) + ((a&15)-8) + 8; needs 2 dot8 per W word (H/L) + 1 sum-w dot8 per W word; per W byte ~4.25 dot8 instructions at M=8"
+ },
+ "measurement": {
+  "N": [
+   5120,
+   8704
+  ],
+  "K": 5120,
+  "M": 8,
+  "iters": 30,
+  "l2_flush": "64 MB memset between iterations, per-iter event timing",
+  "note": "probe ran concurrently with the live vLLM service (4 GPUs at 0.85 util); the in-run fp16 lds_m8 reference measured 388-418 GB/s vs 451 in the original dedicated run -> ~10% environment penalty, does not affect the verdict",
+  "fp16_lds_m8_reference_GBps": {
+   "N8704_SLICE512": 400,
+   "N8704_SLICE1024": 388,
+   "N8704_SLICE512_ROWS16": 418
+  },
+  "w4_dot8_best": {
+   "N": 8704,
+   "config": "ROWS=8 NWARP=8 SLICE=1024 G=128",
+   "raw_nibble_GBps": 27,
+   "fp8_equiv_GBps": 54
+  },
+  "w4_dot8_all_fp8_equiv_GBps": {
+   "N5120": {
+    "r1": 31,
+    "r2": 43,
+    "r4": 49,
+    "r8": 51,
+    "r4_s2048": 47,
+    "r4_g64": 49
+   },
+   "N8704": {
+    "r1": 32,
+    "r2": 45,
+    "r4": 51,
+    "r8": 54,
+    "r4_s2048": 49,
+    "r4_g64": 51
+   }
+  },
+  "numeric_check": {
+   "rel_l2": 0.0,
+   "outliers": 0,
+   "impulse": "m0n0=1.000 (want 1), m1n0=-127.000 (want -127)",
+   "note": "integer-exact at scale=1; expected ~1e-2 rel error appears only vs real W4-quantized weights (step 2, not run)"
+  }
+ },
+ "verdict": {
+  "gate": ">=450 GB/s (fp8-equiv) => go; <300 => stop",
+  "measured_fp8_equiv_GBps": 54,
+  "decision": "STOP (no-go)",
+  "reasoning": [
+   "measured 54 GB/s fp8-equiv is 8x below the go gate and below the fp8 production stream (163 GB/s)",
+   "structural bound: v_dot8 is nibble x nibble, so int8 A needs the H/L split -> >=2 dot8 per W byte at M=8 (+1 sum-w per word); even a zero-overhead 2-dot8/B version extrapolates to ~100-115 GB/s fp8-equiv at the measured per-instruction rate",
+   "the 600-700 GB/s model in W4-RESEARCH section 0.3 assumed dot8 consumes int8 activations directly; that ISA assumption is false on gfx906"
+  ],
+  "next": "W4 project stops at probe step; no quantization investment; W8A8 sdot4 route (v_dot4_i32_i8, int8 A) remains the only dot-based alternative and was already measured at 300 GB/s class in the model"
+ }
+}

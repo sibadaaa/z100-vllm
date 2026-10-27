@@ -1,0 +1,133 @@
+diff --git a/third_party/amd/backend/compiler.py b/third_party/amd/backend/compiler.py
+index 8878023..043bd6e 100644
+--- a/third_party/amd/backend/compiler.py
++++ b/third_party/amd/backend/compiler.py
+@@ -99,6 +99,26 @@ class HIPOptions:
+         return hashlib.sha256(key.encode("utf-8")).hexdigest()
+ 
+ 
++# Hygon Z100 / gfx906 hazard: an SFU (transcendental) instruction that consumes
++# a VGPR written by the immediately preceding VALU instruction can read the
++# stale value for lanes 8-11 of every SIMD16. Reproduced with a six line
++# elementwise kernel on all four Z100 cards, with both the triton 3.4 and the
++# triton 3.6 builds (tl.exp2(m * 2.0) / tl.sqrt(m * 4.0) return the value of
++# the un-consumed VGPR). One wait slot before the SFU op makes the VALU result
++# visible; the sequence itself is unchanged otherwise.
++_SFU_OP_RE = re.compile(r"^\s*v_(?:exp|log|sqrt|rcp|rsq|sin|cos|ldexp)\w*")
++
++
++def insert_sfu_waits(asm: str, nops: int = 2) -> str:
++    out = []
++    for line in asm.splitlines():
++        if _SFU_OP_RE.match(line):
++            out.append("\ts_nop %d" % nops)
++        out.append(line)
++    out.append("")
++    return "\n".join(out)
++
++
+ class HIPBackend(BaseBackend):
+     instrumentation = None
+     supports_native_tensor_specialization = False
+@@ -465,6 +485,8 @@ class HIPBackend(BaseBackend):
+ 
+     @staticmethod
+     def make_hsaco(src, metadata, options):
++        if "gfx906" in options.arch:
++            src = insert_sfu_waits(src)
+         target_features = ''
+         if knobs.compilation.enable_asan:
+             target_features = '+xnack'
+diff --git a/third_party/amd/backend/driver.py b/third_party/amd/backend/driver.py
+index 24a0d84..c1ddff4 100644
+--- a/third_party/amd/backend/driver.py
++++ b/third_party/amd/backend/driver.py
+@@ -12,6 +12,25 @@ from triton.runtime.build import compile_module_from_src
+ 
+ dirname = os.path.dirname(os.path.realpath(__file__))
+ include_dirs = [os.path.join(dirname, "include")]
++# Hygon DTK ships a hipDeviceProp_t that is much smaller than the one described
++# by the vendored HIP headers (792 B with gcnArchName at offset 396, against
++# 1472 B / 1160 for the vendored copy), so hipGetDeviceProperties() writes a
++# different layout than this file reads back. Compile the hip_utils module
++# against the headers of the HIP runtime that actually fills the struct, and
++# keep the vendored headers as a fallback for wheel installs without ROCm
++# headers. The launcher keeps using the vendored headers because it needs
++# HIP_LAUNCH_CONFIG, which stock DTK/ROCm headers may not define.
++_hip_include_dirs = []
++for _hip_root in (os.environ.get("ROCM_PATH"), os.environ.get("HIP_PATH"), "/opt/rocm"):
++    if not _hip_root:
++        continue
++    for _cand in (os.path.join(_hip_root, "hip", "include"), os.path.join(_hip_root, "include")):
++        if os.path.exists(os.path.join(_cand, "hip", "hip_runtime.h")):
++            _hip_include_dirs.append(_cand)
++            break
++    if _hip_include_dirs:
++        break
++include_dirs_utils = _hip_include_dirs + include_dirs
+ PyTDMDescriptor = None
+ 
+ 
+@@ -173,7 +192,7 @@ class HIPUtils(object):
+         # This way we don't need to escape-quote C code curly brackets and we can replace
+         # exactly once.
+         src = src.replace('/*py_libhip_search_path*/', libhip_path, 1)
+-        mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)
++        mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs_utils)
+         self.load_binary = mod.load_binary
+         self.get_device_properties = mod.get_device_properties
+         self.create_tdm_descriptor = mod.create_tdm_descriptor
+diff --git a/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h b/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
+index a689fe4..cb59e46 100644
+--- a/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
++++ b/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
+@@ -12,6 +12,7 @@ enum class ISAFamily {
+   CDNA2,
+   CDNA3,
+   CDNA4,
++  VEGA,
+   RDNA1,
+   RDNA2,
+   RDNA3,
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
+index af7b4b1..a5853ca 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
+@@ -75,6 +75,7 @@ int TargetInfo::getWarpSize() const {
+   case ISAFamily::CDNA2:
+   case ISAFamily::CDNA3:
+   case ISAFamily::CDNA4:
++  case ISAFamily::VEGA:
+     return 64;
+   case ISAFamily::GFX1250:
+     return 32;
+@@ -438,7 +439,7 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
+     buf = createDppReduxOpWithBoundCtrl(valType, buf, 1 + dppCtrlRowShr,
+                                         allRows, allBanks);
+ 
+-    if (isCDNA(getISAFamily())) {
++    if (isCDNA(getISAFamily()) || getISAFamily() == ISAFamily::VEGA) {
+       // row_bcast:15 row_mask:0xa
+       buf = createDppReduxOpWithBoundCtrl(
+           valType, buf, static_cast<uint32_t>(DppCtrl::BCAST15), 0xa, allBanks);
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
+index b79841a..84b3991 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
+@@ -20,6 +20,8 @@ ISAFamily deduceISAFamily(llvm::StringRef arch) {
+     return ISAFamily::CDNA3;
+   case llvm::AMDGPU::GK_GFX90A:
+     return ISAFamily::CDNA2;
++  case llvm::AMDGPU::GK_GFX906:
++    return ISAFamily::VEGA;
+   case llvm::AMDGPU::GK_GFX908:
+     return ISAFamily::CDNA1;
+   default:
+@@ -45,6 +47,7 @@ bool supportsVDot(llvm::StringRef arch) {
+   case AMD::ISAFamily::CDNA2:
+   case AMD::ISAFamily::CDNA3:
+   case AMD::ISAFamily::CDNA4:
++  case AMD::ISAFamily::VEGA:
+   case AMD::ISAFamily::RDNA2:
+   case AMD::ISAFamily::RDNA3:
+   case AMD::ISAFamily::RDNA4:

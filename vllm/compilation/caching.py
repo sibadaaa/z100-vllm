@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import os
 import pickle
+import tokenize
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 from unittest.mock import patch
@@ -602,6 +603,32 @@ def _compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
         "\n".join(hash_content).encode(), usedforsecurity=False
     ).hexdigest()
     return result
+
+
+def _read_traced_file(filepath: str) -> str:
+    """Read a traced file exactly the way ``inspect.getsource`` reads it.
+
+    ``SourceInfo.inlined_sources[*].content`` is produced by torch with
+    ``inspect.getsource(module)``, which goes through ``linecache``: it decodes
+    with ``tokenize.open`` and appends a newline to a final line that has none
+    (``linecache.updatecache``). Comparing that content against a raw
+    ``open(filepath).read()`` makes any traced file whose last line has no
+    trailing newline look modified on every load, so the AOT artifact can never
+    be reloaded. Normalize on the reading side to match.
+    """
+    # Skip files that don't exist (e.g., <string>, <frozen modules>, etc.)
+    if not os.path.isfile(filepath):
+        return ""
+    try:
+        with tokenize.open(filepath) as f:
+            file_contents = f.read()
+    except (OSError, UnicodeDecodeError, SyntaxError, LookupError):
+        # Same fallback as linecache: an unreadable file hashes as empty, which
+        # makes the artifact look stale and forces a safe recompile.
+        return ""
+    if file_contents and not file_contents.endswith("\n"):
+        file_contents += "\n"
+    return file_contents
 
 
 def _compute_code_hash(files: set[str]) -> str:

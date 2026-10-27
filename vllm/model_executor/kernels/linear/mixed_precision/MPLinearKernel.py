@@ -19,6 +19,13 @@ class MPLinearLayerConfig:
     act_type: torch.dtype
     group_size: int
     zero_points: bool
+    # Whether the checkpoint carries activation reordering (GPTQ `desc_act`,
+    # compressed-tensors `actorder=group`). Kernels that only support an
+    # unpermuted activation order use this to decline instead of silently
+    # ignoring a loaded `g_idx`. Defaults to False: every caller in this tree
+    # either rejects group/dynamic activation ordering earlier
+    # (compressed_tensors.py) or never registers a `g_idx` parameter.
+    has_g_idx: bool = False
     out_type: torch.dtype | None = None
 
 
@@ -39,6 +46,7 @@ class MPLinearKernel(ABC):
         w_q_param_name: str,
         w_s_param_name: str,
         w_zp_param_name: str | None = None,
+        w_gidx_param_name: str | None = None,
     ) -> None:
         assert self.can_implement(c)
         self.config = c
@@ -47,6 +55,7 @@ class MPLinearKernel(ABC):
         if c.zero_points:
             assert w_zp_param_name is not None
         self.w_zp_name: str | None = w_zp_param_name
+        self.w_gidx_name: str | None = w_gidx_param_name
 
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -85,3 +94,14 @@ class MPLinearKernel(ABC):
             getattr(layer, self.w_s_name),
             getattr(layer, self.w_zp_name or "", None),
         )
+
+    def _get_gidx_param(self, layer: torch.nn.Module) -> torch.Tensor | None:
+        """Return the activation-reorder indices, if this kernel owns one.
+
+        Kept as a separate accessor rather than a fourth element of
+        ``_get_weight_params`` so that kernels written against the 3-tuple
+        contract keep working. Kernels that repack weights themselves (for
+        example the gfx906 GPTQ kernel) set ``w_gidx_name`` during
+        ``process_weights_after_loading``.
+        """
+        return getattr(layer, self.w_gidx_name or "", None)

@@ -26,6 +26,12 @@ annotated-types==0.7.0
     # via pydantic
 anyio==4.13.0
     # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+anyio==4.14.2
+    # via
+    #   -r requirements/test/xpu.in
+    #   anthropic
     #   httpx
     #   starlette
 arctic-inference==0.1.1
@@ -37,11 +43,19 @@ attrs==26.1.0
     #   referencing
 audioread==3.0.1
     # via
+    #   azure-identity
+    #   azure-storage-blob
+azure-identity==1.25.3
+    # via runai-model-streamer-azure
+azure-storage-blob==12.30.1
+    # via runai-model-streamer-azure
+blake3==1.0.9
+    # via -r requirements/test/../common.txt
+blobfile==3.2.0
+    # via
     #   -r requirements/test/xpu.in
-    #   librosa
-blobfile==3.0.0
-    # via -r requirements/test/xpu.in
-bm25s==0.2.13
+    #   gpt-oss
+bm25s==0.3.10
     # via
     #   -r requirements/test/xpu.in
     #   mteb
@@ -71,7 +85,17 @@ colorama==0.4.6
     # via sacrebleu
 coverage==7.13.5
     # via pytest-cov
-dataproperty==1.1.0
+cryptography==50.0.0
+    # via
+    #   -r requirements/test/xpu.in
+    #   azure-identity
+    #   azure-storage-blob
+    #   google-auth
+    #   msal
+    #   pyjwt
+cycler==0.12.1
+    # via matplotlib
+dataproperty==1.1.1
     # via
     #   pytablewriter
     #   tabledata
@@ -114,6 +138,10 @@ filelock==3.25.2
     #   huggingface-hub
     #   modelscope
     #   torch
+fonttools==4.64.0
+    # via
+    #   -r requirements/test/xpu.in
+    #   matplotlib
 frozenlist==1.8.0
     # via
     #   aiohttp
@@ -124,7 +152,36 @@ fsspec==2026.2.0
     #   evaluate
     #   huggingface-hub
     #   torch
-gpt-oss==0.0.8
+ftfy==6.3.1
+    # via
+    #   -r requirements/test/xpu.in
+    #   open-clip-torch
+google-api-core==2.34.0
+    # via
+    #   google-cloud-core
+    #   google-cloud-storage
+google-auth==2.57.0
+    # via
+    #   google-api-core
+    #   google-cloud-core
+    #   google-cloud-storage
+    #   runai-model-streamer-gcs
+google-cloud-core==2.7.0
+    # via google-cloud-storage
+google-cloud-storage==3.13.1
+    # via runai-model-streamer-gcs
+google-crc32c==1.8.0
+    # via
+    #   google-cloud-storage
+    #   google-resumable-media
+google-resumable-media==2.10.2
+    # via google-cloud-storage
+googleapis-common-protos==1.75.1
+    # via
+    #   google-api-core
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+gpt-oss==0.0.9
     # via -r requirements/test/xpu.in
 graphql-core==3.2.8
     # via hypothesis-graphql
@@ -132,21 +189,40 @@ h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-harfile==0.4.0
+h2==4.4.1
+    # via -r requirements/test/xpu.in
+harfile==0.5.0
     # via schemathesis
 hf-xet==1.4.3
     # via huggingface-hub
+hiredis==3.4.1
+    # via tensorizer
+hpack==4.2.0
+    # via
+    #   -r requirements/test/xpu.in
+    #   h2
 html2text==2025.4.15
     # via gpt-oss
 httpcore==1.0.9
     # via httpx
+httpcore2==2.13.1
+    # via httpx2
+httptools==0.8.0
+    # via uvicorn
 httpx==0.28.1
     # via
     #   datasets
     #   huggingface-hub
-    #   schemathesis
-huggingface-hub==1.10.2
+    #   model-hosting-container-standards
+httpx2==2.13.1
     # via
+    #   -r requirements/test/xpu.in
+    #   mcp
+    #   openai
+huggingface-hub==1.31.0
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
     #   accelerate
     #   datasets
     #   evaluate
@@ -154,7 +230,11 @@ huggingface-hub==1.10.2
     #   timm
     #   tokenizers
     #   transformers
-hypothesis==6.151.10
+humanize==4.16.0
+    # via runai-model-streamer
+hyperframe==6.1.0
+    # via h2
+hypothesis==6.165.10
     # via
     #   hypothesis-graphql
     #   hypothesis-jsonschema
@@ -215,6 +295,8 @@ intel-sycl-rt==2025.3.2
 jinja2==3.1.6
     # via
     #   -c requirements/xpu.txt
+    #   fastapi
+    #   gpt-oss
     #   lm-eval
     #   torch
 jiwer==4.0.0
@@ -234,8 +316,16 @@ jsonschema-rs==0.45.0
     # via schemathesis
 jsonschema-specifications==2025.9.1
     # via jsonschema
-junit-xml==1.9
-    # via schemathesis
+jupyter-client==8.10.0
+    # via gpt-oss
+jupyter-core==5.9.1
+    # via jupyter-client
+kiwisolver==1.5.1
+    # via matplotlib
+lark==1.2.2
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
 lazy-loader==0.5
     # via
     #   librosa
@@ -248,14 +338,18 @@ lm-eval==0.4.12
     # via -r requirements/test/xpu.in
 lxml==6.0.2
     # via
+    #   -r requirements/test/xpu.in
     #   blobfile
     #   gpt-oss
     #   sacrebleu
-markdown-it-py==4.0.0
+mako==1.4.3
+    # via -r requirements/test/xpu.in
+markdown-it-py==4.2.0
     # via rich
 markupsafe==3.0.3
     # via
     #   jinja2
+    #   mako
     #   werkzeug
 mbstrdecoder==1.1.4
     # via
@@ -282,9 +376,19 @@ more-itertools==10.8.0
     # via lm-eval
 mpmath==1.3.0
     # via sympy
-msgpack==1.1.2
-    # via librosa
-mteb==2.12.7
+msal==1.38.0
+    # via
+    #   azure-identity
+    #   msal-extensions
+msal-extensions==1.3.1
+    # via azure-identity
+msgpack==1.2.1
+    # via
+    #   -r requirements/test/xpu.in
+    #   librosa
+msgspec==0.21.1
+    # via -r requirements/test/../common.txt
+mteb==2.19.4
     # via -r requirements/test/xpu.in
 multidict==6.7.1
     # via
@@ -295,11 +399,13 @@ multiprocess==0.70.19
     #   datasets
     #   evaluate
 networkx==3.6.1
+    # via torch
+ninja==1.13.0
+    # via -r requirements/test/../common.txt
+nltk==3.10.3
     # via
-    #   scikit-image
-    #   torch
-nltk==3.9.4
-    # via rouge-score
+    #   -r requirements/test/xpu.in
+    #   rouge-score
 num2words==0.5.14
     # via -r requirements/test/xpu.in
 numba==0.65.0
@@ -313,7 +419,7 @@ numpy==2.2.6
     #   bm25s
     #   datasets
     #   evaluate
-    #   imageio
+    #   gpt-oss
     #   librosa
     #   lm-eval
     #   mistral-common
@@ -327,7 +433,6 @@ numpy==2.2.6
     #   scikit-image
     #   scikit-learn
     #   scipy
-    #   sentence-transformers
     #   soundfile
     #   soxr
     #   tifffile
@@ -356,16 +461,74 @@ onemkl-sycl-rng==2025.3.1
     # via torch
 onemkl-sycl-sparse==2025.3.1
     # via torch
-openai-harmony==0.0.8
+open-clip-torch==2.32.0
+    # via -r requirements/test/xpu.in
+openai==3.2.0
     # via
     #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
     #   gpt-oss
 opencv-python-headless==4.13.0.92
     # via
     #   -c requirements/common.txt
     #   albumentations
     #   mistral-common
-packaging==26.0
+opentelemetry-api==1.44.0
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   -r requirements/test/xpu.in
+    #   mcp
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions
+opentelemetry-exporter-otlp==1.44.0
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   -r requirements/test/xpu.in
+opentelemetry-exporter-otlp-proto-common==1.44.0
+    # via
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp-proto-grpc==1.44.0
+    # via opentelemetry-exporter-otlp
+opentelemetry-exporter-otlp-proto-http==1.44.0
+    # via opentelemetry-exporter-otlp
+opentelemetry-proto==1.44.0
+    # via
+    #   opentelemetry-exporter-otlp-proto-common
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-sdk==1.44.0
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   -r requirements/test/xpu.in
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-semantic-conventions-ai
+opentelemetry-semantic-conventions==0.65b0
+    # via
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions-ai
+opentelemetry-semantic-conventions-ai==0.5.1
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   -r requirements/test/xpu.in
+orjson==3.12.0
+    # via -r requirements/test/xpu.in
+oss-harmony==0.0.11
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+outlines-core==0.2.14
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+packaging==26.3
     # via
     #   -c requirements/xpu.txt
     #   accelerate
@@ -384,16 +547,23 @@ pandas==3.0.1
     # via
     #   datasets
     #   evaluate
+    #   gpt-oss
+partial-json-parser==0.2.1.1.post7
+    # via -r requirements/test/../common.txt
 pathvalidate==3.3.1
     # via pytablewriter
 pillow==12.1.1
     # via
-    #   imageio
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   matplotlib
     #   mistral-common
     #   scikit-image
     #   torchvision
-platformdirs==4.9.4
-    # via pooch
+platformdirs==4.11.3
+    # via
+    #   jupyter-core
+    #   pooch
 pluggy==1.6.0
     # via
     #   pytest
@@ -415,11 +585,24 @@ propcache==0.4.1
     #   aiohttp
     #   yarl
 psutil==7.2.2
-    # via accelerate
-py==1.11.0
-    # via pytest-forked
-pyarrow==23.0.1
-    # via datasets
+    # via
+    #   -r requirements/test/../common.txt
+    #   accelerate
+    #   tensorizer
+py-cpuinfo==9.0.0
+    # via -r requirements/test/../common.txt
+pyarrow==25.0.1
+    # via
+    #   -r requirements/test/xpu.in
+    #   datasets
+pyasn1==0.6.4
+    # via
+    #   -r requirements/test/xpu.in
+    #   pyasn1-modules
+pyasn1-modules==0.4.2
+    # via google-auth
+pybase64==1.5.0
+    # via -r requirements/test/../common.txt
 pycountry==26.2.16
     # via pydantic-extra-types
 pycparser==3.0
@@ -434,19 +617,34 @@ pydantic==2.12.5
     #   gpt-oss
     #   mistral-common
     #   mteb
-    #   openai-harmony
+    #   openai
+    #   oss-harmony
     #   pydantic-extra-types
 pydantic-core==2.41.5
     # via pydantic
 pydantic-extra-types==2.11.1
-    # via mistral-common
-pyelftools==0.32
+    # via
+    #   fastapi
+    #   mistral-common
+pydantic-settings==2.15.0
+    # via
+    #   -r requirements/test/xpu.in
+    #   fastapi
+pyelftools==0.33
     # via triton-xpu
 pygments==2.20.0
     # via
+    #   -r requirements/test/xpu.in
     #   pytest
     #   rich
-pyrate-limiter==4.1.0
+pyjwt==2.15.1
+    # via
+    #   -r requirements/test/xpu.in
+    #   mcp
+    #   msal
+pyparsing==3.3.2
+    # via matplotlib
+pyrate-limiter==4.4.0
     # via schemathesis
 pystemmer==3.0.0
     # via
@@ -478,8 +676,22 @@ pytest-timeout==2.3.1
     # via -r requirements/test/xpu.in
 python-dateutil==2.9.0.post0
     # via
+    #   botocore
+    #   jupyter-client
+    #   matplotlib
     #   pandas
     #   typepy
+python-dotenv==1.2.3
+    # via
+    #   pydantic-settings
+    #   uvicorn
+python-json-logger==4.2.0
+    # via -r requirements/test/../common.txt
+python-multipart==0.0.32
+    # via
+    #   -r requirements/test/xpu.in
+    #   fastapi
+    #   mcp
 pytrec-eval-terrier==0.5.10
     # via mteb
 pytz==2026.1.post1
@@ -493,7 +705,15 @@ pyyaml==6.0.3
     #   schemathesis
     #   timm
     #   transformers
-rapidfuzz==3.12.1
+    #   uvicorn
+pyzes==0.1.2
+    # via torch
+pyzmq==27.1.0
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   jupyter-client
+rapidfuzz==3.14.5
     # via
     #   -r requirements/test/xpu.in
     #   jiwer
@@ -562,8 +782,16 @@ scipy==1.17.1
     #   scikit-image
     #   scikit-learn
     #   sentence-transformers
-sentence-transformers==5.3.0
-    # via mteb
+sentence-transformers==5.2.0
+    # via
+    #   -r requirements/test/xpu.in
+    #   mteb
+sentencepiece==0.2.1
+    # via -r requirements/test/../common.txt
+sentry-sdk==2.68.0
+    # via fastapi-cloud-cli
+setproctitle==1.3.7
+    # via -r requirements/test/../common.txt
 setuptools==80.10.2
     # via
     #   -c requirements/common.txt
@@ -639,11 +867,15 @@ tiktoken==0.12.0
     #   gpt-oss
     #   lm-eval
     #   mistral-common
-timm==1.0.17
-    # via -r requirements/test/xpu.in
-tokenizers==0.22.2
+timm==1.0.28
+    # via
+    #   -r requirements/test/xpu.in
+    #   open-clip-torch
+tokenizers==0.23.2
     # via
     #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+    #   cohere
     #   transformers
 torch==2.12.0+xpu
     # via
@@ -657,8 +889,16 @@ torchvision==0.27.0+xpu
     # via timm
 tqdm==4.67.3
     # via
+    #   open-clip-torch
+    #   timm
+tornado==6.5.10
+    # via jupyter-client
+tqdm==4.70.0
+    # via
+    #   -r requirements/test/../common.txt
     #   datasets
     #   evaluate
+    #   gpt-oss
     #   huggingface-hub
     #   lm-eval
     #   modelscope
@@ -667,7 +907,11 @@ tqdm==4.67.3
     #   pqdm
     #   sentence-transformers
     #   transformers
-transformers==5.5.3
+traitlets==5.16.1
+    # via
+    #   jupyter-client
+    #   jupyter-core
+transformers==5.19.0
     # via
     #   -c requirements/common.txt
     #   sentence-transformers
@@ -691,7 +935,7 @@ typing-extensions==4.15.0
     #   chz
     #   fastapi
     #   huggingface-hub
-    #   librosa
+    #   jupyter-client
     #   lm-eval
     #   mistral-common
     #   mteb
@@ -716,17 +960,41 @@ umf==1.0.3
     #   torch
 urllib3==2.6.3
     # via
+    #   -r requirements/test/xpu.in
     #   blobfile
     #   docker
     #   modelscope
     #   requests
-uvicorn==0.42.0
-    # via gpt-oss
-werkzeug==3.1.7
-    # via schemathesis
+    #   sentry-sdk
+    #   types-requests
+uvicorn==0.52.3
+    # via
+    #   fastapi
+    #   fastapi-cli
+    #   fastapi-cloud-cli
+    #   gpt-oss
+    #   mcp
+uvloop==0.22.1
+    # via uvicorn
+watchfiles==1.2.0
+    # via
+    #   -r requirements/test/../common.txt
+    #   uvicorn
+wcwidth==0.8.3
+    # via ftfy
+websockets==17.0.1
+    # via uvicorn
+werkzeug==3.1.8
+    # via
+    #   -r requirements/test/xpu.in
+    #   schemathesis
 word2number==1.1
     # via lm-eval
-xxhash==3.6.0
+xgrammar==0.2.8
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
+xxhash==4.0.1
     # via
     #   datasets
     #   evaluate

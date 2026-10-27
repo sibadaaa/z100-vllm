@@ -2,6 +2,10 @@
 
 #include <torch/all.h>
 
+#include "rocm/bf16_emu_gemv.h"
+#include "rocm/fp8_emu_gemm.h"
+#include "rocm/w8a8_sdot4.h"
+
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 
@@ -50,4 +54,4 @@ void paged_attention(
     int64_t max_seq_len, const std::optional<torch::Tensor>& alibi_slopes,
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
-    const std::string& mfma_type);
+    const std::string& mfma_type, bool use_interleaved_v_cache);

@@ -1,0 +1,24 @@
+# Clear PCIe ACS redirection on the Hygon DCU parent bridges so that peer TLP
+# traffic is forwarded by the PCIe switch instead of being redirected to the
+# root complex.  Measured on this host: cross-DCU copy_ 3.12 GB/s -> ~28 GB/s.
+#
+# Reversible: `ExecStop` restores the snapshot taken by the script on apply.
+#   systemctl stop dcu-p2p-acs     # revert to the stock ACS settings
+#   systemctl start dcu-p2p-acs    # clear ACS again
+#
+# Single-tenant inference host only: ACS is a DMA-isolation feature, so do not
+# enable this on a multi-tenant / VFIO machine.
+[Unit]
+Description=Enable PCIe peer-to-peer DMA between Hygon DCUs (clear ACS)
+After=multi-user.target
+ConditionPathExists=/sys/bus/pci/devices/0000:00:03.1/config
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /home/lyh/z100-vllm/tools/dcu/dcu_p2p_acs.py apply
+ExecStop=/usr/bin/python3 /home/lyh/z100-vllm/tools/dcu/dcu_p2p_acs.py revert
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

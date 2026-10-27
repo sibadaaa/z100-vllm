@@ -14,8 +14,26 @@ IS_ROCM = current_platform.is_rocm()
 """ROCm needs shape normalization before calling some vLLM C kernels."""
 GPGPU_DEVICE = CUDA_ALIKE or current_platform.is_xpu()
 
+
+def _c_layernorm_dtype_supported(x: Tensor) -> bool:
+    """Whether the platform's C RMSNorm kernel accepts ``x``'s dtype.
+
+    gfx906 (Hygon DCU Z100) compiles the C RMSNorm kernels with Half-typed
+    accessors only, so a bf16 or fp32 tensor aborts inside the kernel instead of
+    falling back. Report those as unsupported so the IR dispatcher picks the
+    native implementation (bf16 DFlash drafter behind an fp16 target).
+    """
+    if not IS_ROCM:
+        return True
+    from vllm.platforms.rocm import on_gfx906
+
+    return not on_gfx906() or x.dtype == torch.float16
+
+
 rms_no_var_size = lambda x, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None
+    and (weight is None or weight.dtype == x.dtype)
+    and _c_layernorm_dtype_supported(x)
 )
 """vLLM kernel requires no variance_size override and matching input/weight dtype."""
 
@@ -45,7 +63,9 @@ def rms_norm(
 
 
 rms_add_no_var_size = lambda x, x_residual, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None
+    and (weight is None or weight.dtype == x.dtype)
+    and _c_layernorm_dtype_supported(x)
 )
 """vLLM Kernel does not support variance_size parameter and requires
 matching input/weight dtype."""

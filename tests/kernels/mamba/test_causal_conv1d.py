@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    _causal_conv1d_gfx906_fallback,
+    _gfx906_conv_window_read,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -192,6 +194,329 @@ def test_gfx906_causal_conv1d_mtp_update(
 
     assert torch.allclose(output, expected_output, rtol=2e-2, atol=2e-2)
     assert torch.equal(conv_state, expected_state)
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific conv-state fallback",
+)
+@pytest.mark.parametrize("num_spec", [0, 1, 2])
+def test_gfx906_conv_state_front_alignment(num_spec):
+    """A widened speculative conv slot stores its window at the FRONT.
+
+    The conv state is a `width - 1 + num_spec` FIFO; the MTP update kernel reads
+    the window from `num_accepted - 1` forward and re-normalises it to the front
+    (csrc/mamba/gfx906_decode_kernels.cu:222-284).  Prefill must therefore match
+    that alignment, otherwise the first speculative step drops the newest
+    history token.  Both alignments coincide when num_spec == 0.
+    """
+    torch.manual_seed(13)
+    dim, width, seq = 8, 4, 6
+    cache_len = width - 1 + num_spec
+    x = torch.randn(dim, seq, device="cuda", dtype=torch.float16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.float16)
+    conv_state = torch.zeros(2, dim, cache_len, device="cuda", dtype=torch.float16)
+
+    _causal_conv1d_gfx906_fallback(
+        x,
+        weight,
+        bias,
+        conv_state,
+        torch.tensor([0, seq], device="cuda", dtype=torch.int32),
+        torch.tensor([1], device="cuda", dtype=torch.int32),
+        torch.tensor([False], device="cuda", dtype=torch.bool),
+        "silu",
+        NULL_BLOCK_ID,
+    )
+
+    newest = x[:, -(width - 1) :]
+    assert torch.equal(conv_state[1, :, : width - 1], newest)
+    if cache_len > width - 1:
+        assert conv_state[1, :, width - 1 :].abs().max().item() == 0.0
+    assert torch.equal(
+        _gfx906_conv_window_read(conv_state[1], width - 1), newest
+    )
+
+
+def _gfx906_fallback_ref(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    activation,
+    pad_slot_id,
+):
+    """Independent per-sequence reference for `_causal_conv1d_gfx906_fallback`.
+
+    Re-derives the front-aligned conv-state window from the documented contract
+    instead of calling the module's helpers, so the vectorised metadata path is
+    checked against semantics rather than against itself.
+    """
+    dim, width = weight.shape
+    state_len = width - 1
+    cache_len = conv_states.shape[-1]
+    dtype = conv_states.dtype
+    wc = weight.to(dtype).unsqueeze(1)
+    bc = None if bias is None else bias.to(dtype)
+    states = conv_states.clone()
+
+    if query_start_loc is None:
+        seqs = [x[i] for i in range(x.shape[0])]
+        out = torch.zeros_like(x, dtype=dtype)
+    else:
+        starts = [int(v) for v in query_start_loc.cpu().tolist()]
+        channels_first = x.dim() == 2 and x.shape[0] == dim
+        seqs = [
+            x[:, starts[i] : starts[i + 1]]
+            if channels_first
+            else x[starts[i] : starts[i + 1]].transpose(0, 1)
+            for i in range(len(starts) - 1)
+        ]
+        out = torch.zeros_like(x, dtype=dtype)
+
+    for i, seq_x in enumerate(seqs):
+        slot = i if cache_indices is None else int(cache_indices[i].item())
+        if slot == pad_slot_id:
+            continue
+        use_init = has_initial_state is None or bool(has_initial_state[i].item())
+        if use_init and state_len > 0:
+            row = states[slot]
+            prev = row[..., :state_len] if row.shape[-1] > state_len else row
+        else:
+            prev = torch.zeros((dim, max(state_len, 0)), dtype=dtype, device=x.device)
+        full = torch.cat((prev, seq_x), dim=1).unsqueeze(0)
+        seq_out = F.conv1d(full, wc, bias=bc, groups=dim).squeeze(0)
+        if activation in ("silu", "swish"):
+            seq_out = F.silu(seq_out)
+
+        if query_start_loc is None:
+            out[i] = seq_out
+        else:
+            start, end = starts[i], starts[i + 1]
+            if end <= start:
+                continue
+            if channels_first:
+                out[:, start:end] = seq_out
+            else:
+                out[start:end] = seq_out.transpose(0, 1)
+
+        if cache_len > 0:
+            row = full.squeeze(0)
+            window = row[:, -state_len:] if state_len > 0 else row[:, -cache_len:]
+            padded = torch.zeros((dim, cache_len), dtype=dtype, device=x.device)
+            padded[:, : window.shape[1]] = window
+            states[slot] = padded
+
+    return out, states
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific conv-state fallback",
+)
+@pytest.mark.parametrize("state_len_extra", [0, 2])
+def test_gfx906_fallback_batch_dim_matches_reference(state_len_extra):
+    """The non-varlen `(batch, dim, seqlen)` entry keeps the same semantics.
+
+    This branch has no token boundaries at all, so it must be sync-free, and its
+    state gather/write-back must still match the per-sequence contract (including
+    a pad slot that keeps its slot contents and returns a zero row).
+    """
+    torch.manual_seed(29)
+    dim, width, seq = 5, 4, 3
+    cache_len = width - 1 + state_len_extra
+    x = torch.randn(3, dim, seq, device="cuda", dtype=torch.float16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.float16)
+    conv_state = torch.randn(4, dim, cache_len, device="cuda", dtype=torch.float16)
+    slots = torch.tensor([2, NULL_BLOCK_ID, 0], device="cuda", dtype=torch.int32)
+    has_init = torch.tensor([True, True, False], device="cuda", dtype=torch.bool)
+
+    want_out, want_state = _gfx906_fallback_ref(
+        x, weight, bias, conv_state, None, slots, has_init, "silu", NULL_BLOCK_ID
+    )
+    got_state = conv_state.clone()
+    got_out = _causal_conv1d_gfx906_fallback(
+        x, weight, bias, got_state, None, slots, has_init, "silu", NULL_BLOCK_ID
+    )
+
+    assert torch.equal(got_out, want_out)
+    assert torch.equal(got_state, want_state)
+
+
+def _forbid_device_item(monkeypatch):
+    """Make `.item()` on a device tensor fail, so syncs cannot hide."""
+    real_item = torch.Tensor.item
+    seen: list = []
+
+    def guarded(self):
+        if self.device.type != "cpu" and self.numel() == 1:
+            seen.append(tuple(self.shape))
+            raise AssertionError(f"device .item() on {tuple(self.shape)}")
+        return real_item(self)
+
+    monkeypatch.setattr(torch.Tensor, "item", guarded)
+    return seen
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific conv-state fallback",
+)
+@pytest.mark.parametrize("lengths", [[7], [5, 3], [4, 0, 6]])
+@pytest.mark.parametrize("state_len_extra", [0, 2])
+def test_gfx906_prefill_fallback_matches_reference(lengths, state_len_extra):
+    """The device-vectorised metadata path keeps the old per-sequence semantics.
+
+    Covers: unequal varlen segments, a zero-length (padding) segment, a
+    non-identity slot mapping, a mixture of has_initial_state values, and a
+    widened (speculative) state slot, which must stay front-aligned.
+    """
+    torch.manual_seed(23)
+    dim, width = 6, 4
+    cache_len = width - 1 + state_len_extra
+    total = sum(lengths)
+    x = torch.randn(dim, total, device="cuda", dtype=torch.float16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.float16)
+    conv_state = torch.randn(3, dim, cache_len, device="cuda", dtype=torch.float16)
+    qsl = torch.tensor(
+        [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.tensor([2, 0, 1][: len(lengths)], device="cuda", dtype=torch.int32)
+    has_init = torch.tensor(
+        [i % 2 == 0 for i in range(len(lengths))], device="cuda", dtype=torch.bool
+    )
+
+    want_out, want_state = _gfx906_fallback_ref(
+        x, weight, bias, conv_state, qsl, slots, has_init, "silu", NULL_BLOCK_ID
+    )
+    got_state = conv_state.clone()
+    got_out = _causal_conv1d_gfx906_fallback(
+        x, weight, bias, got_state, qsl, slots, has_init, "silu",
+        NULL_BLOCK_ID, query_start_loc_cpu=qsl.cpu(),
+    )
+
+    assert torch.equal(got_out, want_out)
+    assert torch.equal(got_state, want_state)
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific conv-state fallback",
+)
+def test_gfx906_prefill_fallback_pad_slot_is_not_written():
+    """A pad slot keeps its state and its output row is zero, not garbage."""
+    torch.manual_seed(31)
+    dim, width, cache_len = 5, 3, 4
+    x = torch.randn(dim, 6, device="cuda", dtype=torch.float16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float16)
+    conv_state = torch.randn(3, dim, cache_len, device="cuda", dtype=torch.float16)
+    before = conv_state.clone()
+    qsl = torch.tensor([0, 3, 6], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([1, NULL_BLOCK_ID], device="cuda", dtype=torch.int32)
+    has_init = torch.ones(2, device="cuda", dtype=torch.bool)
+
+    out = _causal_conv1d_gfx906_fallback(
+        x, weight, None, conv_state, qsl, slots, has_init, "silu", NULL_BLOCK_ID,
+        query_start_loc_cpu=qsl.cpu(),
+    )
+
+    # Sequence 0 owns slot 1 and is updated; the pad row must not touch slot 0.
+    assert torch.equal(conv_state[0], before[0])
+    assert out[:, 3:].abs().max().item() == 0.0
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific conv-state fallback",
+)
+def test_gfx906_prefill_fallback_has_no_host_sync(monkeypatch):
+    """The prefill fallback must not read any device scalar on the host.
+
+    Regression guard for the per-sequence `.item()` DtoH syncs (~2 per sequence
+    per layer) that dominated the gfx906 prefill step.
+    """
+    _forbid_device_item(monkeypatch)
+    torch.manual_seed(37)
+    dim, width, cache_len = 6, 4, 3
+    x = torch.randn(dim, 9, device="cuda", dtype=torch.float16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float16)
+    conv_state = torch.randn(2, dim, cache_len, device="cuda", dtype=torch.float16)
+    qsl = torch.tensor([0, 4, 9], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    has_init = torch.tensor([True, False], device="cuda", dtype=torch.bool)
+
+    _causal_conv1d_gfx906_fallback(
+        x, weight, None, conv_state, qsl, slots, has_init, "silu",
+        NULL_BLOCK_ID, query_start_loc_cpu=qsl.cpu(),
+    )
+
+    # The non-varlen entry point has no token boundaries at all, so it needs no
+    # CPU mirror and must also stay sync-free.
+    x2 = torch.randn(2, dim, 5, device="cuda", dtype=torch.float16)
+    _causal_conv1d_gfx906_fallback(
+        x2, weight, None, conv_state.clone(), None, slots, has_init, "silu",
+        NULL_BLOCK_ID,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific conv-state fallback",
+)
+def test_gfx906_prefill_fallback_uses_metadata_cpu_mirror(monkeypatch):
+    """`causal_conv1d_fn` picks the CPU query-start twin off the metadata."""
+    _forbid_device_item(monkeypatch)
+    torch.manual_seed(41)
+    dim, width, cache_len = 6, 4, 3
+    x = torch.randn(dim, 5, device="cuda", dtype=torch.float16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float16)
+    conv_state = torch.randn(1, dim, cache_len, device="cuda", dtype=torch.float16)
+    qsl = torch.tensor([0, 5], device="cuda", dtype=torch.int32)
+
+    class _Meta:
+        # nums_dict None => the Triton path is not ready and the fallback runs.
+        nums_dict = None
+
+        def __init__(self, qsl_cpu):
+            self.non_spec_query_start_loc_cpu = qsl_cpu
+
+    causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        conv_states=conv_state,
+        query_start_loc=qsl,
+        cache_indices=torch.tensor([0], device="cuda", dtype=torch.int32),
+        has_initial_state=torch.tensor([True], device="cuda", dtype=torch.bool),
+        activation="silu",
+        metadata=_Meta(qsl.cpu()),
+    )
 
 
 @pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])

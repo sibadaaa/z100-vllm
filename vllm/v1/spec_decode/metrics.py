@@ -244,24 +244,33 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_draft_tokens = counters[1]
         self.counter_spec_decode_num_accepted_tokens = counters[2]
 
+        # The per-position counters are materialized on the first draft, so a
+        # deployment that enables speculative decoding but never drafts does not
+        # export one zero-valued series per draft position at startup.
         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
             int, list[prometheus_client.Counter]
         ] = {}
+        self.per_engine_labelvalues = per_engine_labelvalues
+        self.per_pos_base_counter: prometheus_client.Counter | None = None
         if not is_diffusion:
             assert speculative_config is not None
-            num_spec_tokens = speculative_config.num_speculative_tokens
-            pos_labelnames = labelnames + ["position"]
-            base_counter = self._counter_cls(
+            self.per_pos_base_counter = self._counter_cls(
                 name="vllm:spec_decode_num_accepted_tokens_per_pos",
                 documentation="Accepted tokens per draft position.",
-                labelnames=pos_labelnames,
+                labelnames=labelnames + ["position"],
             )
-            self.counter_spec_decode_num_accepted_tokens_per_pos = {
-                idx: [
-                    base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)
-                ]
-                for idx, lv in per_engine_labelvalues.items()
-            }
+
+    def _materialize_per_pos_counters(
+        self, engine_idx: int, num_positions: int
+    ) -> None:
+        """Create the counter for each draft position of one engine."""
+        assert self.per_pos_base_counter is not None
+        self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx] = [
+            self.per_pos_base_counter.labels(
+                *self.per_engine_labelvalues[engine_idx], str(pos)
+            )
+            for pos in range(num_positions)
+        ]
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
@@ -275,6 +284,12 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
             spec_decoding_stats.num_accepted_tokens
         )
+        if self.per_pos_base_counter is None:
+            return
+        if engine_idx not in self.counter_spec_decode_num_accepted_tokens_per_pos:
+            self._materialize_per_pos_counters(
+                engine_idx, len(spec_decoding_stats.num_accepted_tokens_per_pos)
+            )
         for pos, counter in enumerate(
             self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
         ):
