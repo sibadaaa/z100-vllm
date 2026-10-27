@@ -49,7 +49,7 @@ MAXLEN="${MAXLEN:-262144}"
 # at 32k TTFT +0.7% and unchanged ITL (M=4096 GEMM efficiency ~= M=8192);
 # 64k/128k long-prefill soak: 0 OOM/retry/preempt.  See
 # docs/result/z100-longctx-vram-optimization-result.md §4/§4.1 and
-# docs/design/z100-longctx-vram-optimization-plan.md §L5.  Set MBT=8192 to
+# docs/design/z100/README.md (removed-docs section; original S24 plan).  Set MBT=8192 to
 # restore the pre-S24 chunk size without a restart of anything else.
 MBT="${MBT:-4096}"
 UTIL="${UTIL:-0.85}"
@@ -106,7 +106,7 @@ export VLLM_DCU_FP8_GEMV_MAX_M="${VLLM_DCU_FP8_GEMV_MAX_M:-8}"
 # (gfx906_fp16_prefill._ROLE_MIN_M) the layer weight is dequantized into one
 # reused fp16 scratch and served by rocBLAS (16.5-17.7 TF/s measured) instead
 # of the W8A16 tile GEMM (~6.5 TF/s); engages only on the W8A16 route in eager
-# mode.  0 restores the all-tile path.  See docs/design/z100-p0-retest-plan.md.
+# mode.  0 restores the all-tile path.  See docs/design/z100/archive/z100-p0-retest-plan.md.
 export VLLM_DCU_FP16_PREFILL="${VLLM_DCU_FP16_PREFILL:-auto}"
 # S23 promotion (2026-10-19): cfg 35 = the BK=64/BN=32 "wide2" decode tile.
 # Measured in-window c=1 step p50 148.58 -> 137.68 ms (-7.34%), output t/s
@@ -199,7 +199,7 @@ ITER_ARGS=()
 # S24 L5: --max-num-seqs window scan (128 = vLLM default, so empty keeps today's
 # behaviour).  Only meaningful for the memory-margin arms; never set in production.
 # 2026-10-21: default 4 (operator call).  The 2026-10-21 restart incident (see
-# docs/design/z100-bf16-to-fp16-entry-coercion.md §7) showed the worker pinned
+# docs/design/z100/platform/z100-bf16-to-fp16-entry-coercion.md §7) showed the worker pinned
 # budget regressing after SIGKILL: the RequestState UVA buffer is
 # (max_num_seqs, max_model_len) int32 pinned, so 4 seqs -> 4 MiB boots
 # reliably where 256 seqs -> 256 MiB failed.  Override with MAX_SEQS=n.

@@ -176,6 +176,12 @@ if TYPE_CHECKING:
     # (default, upstream MI200 behavior), "finegrained" (gfx906 on DTK 26.04)
     # or "default".
     VLLM_DCU_CUSTOM_AR_ALLOC: str = ""
+    # S34 WP2: payload size gate (KiB) for the DCU push-mode one-shot AR.
+    # Default 64 keeps S33 behavior bit-for-bit; raising it lets concurrent
+    # MTP verify payloads (4 seqs x 3 tok x 5120 x fp16 = 120 KiB) stay on
+    # the push path instead of falling back to RCCL. The kernel-side region
+    # chunk is 2 MiB, so 256 is safe from the buffer standpoint.
+    VLLM_DCU_CUSTOM_AR_MAX_KIB: int = 64
     # Master switch for the three gfx906 (Z100) emulation kernels: the W8A8
     # INT8 `v_dot4_i32_i8` kernel, the FP8 emulation kernel and the dense
     # fp16/bf16 decode GEMV (see
@@ -1536,6 +1542,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCU_CUSTOM_AR_ALLOC": lambda: (
         os.getenv("VLLM_DCU_CUSTOM_AR_ALLOC", "").strip()
+    ),
+    # S34 WP2: payload size gate (KiB) for the DCU push-mode one-shot AR
+    # (custom_all_reduce.py). Default 64 keeps S33 behavior bit-for-bit;
+    # raising it lets concurrent MTP verify payloads (4 seqs x 3 tok =
+    # 120 KiB) stay on the push path instead of falling back to RCCL.
+    # Kernel-side region chunk is 2 MiB, so 256 is buffer-safe.
+    "VLLM_DCU_CUSTOM_AR_MAX_KIB": lambda: int(
+        os.getenv("VLLM_DCU_CUSTOM_AR_MAX_KIB", "64")
     ),
     # Master switch for the gfx906 emulation kernels (see the annotation
     # above). Per-kernel switches below override it when set explicitly.

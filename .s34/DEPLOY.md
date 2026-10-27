@@ -50,7 +50,14 @@ journalctl -u z100-vllm-mtp2 -f
 | VLLM_DCU_CUSTOM_AR | 1 | custom AR（PCIe-only 4-rank） |
 | VLLM_DCU_CUSTOM_AR_ALLOC | finegrained | IPC buffer 细粒度分配（gfx906 必需） |
 | VLLM_CUSTOM_ALLREDUCE_ALGO | oneshot | push 模式 one-shot AR |
+| **VLLM_DCU_FP8_GEMV_STREAM_ROWS / _M1** | **4 / 1** | **S34-WP3 GEMV stack（−2.0 ms/步，已采纳）** |
+| **VLLM_DCU_CUSTOM_AR_MAX_KIB** | **128** | **S34-WP2 AR size 门（c4 −4.6 ms/步，已采纳）** |
 | MAX_SEQS / MBT | 4 / 8192 | 与 s33 一致 |
+
+> 以上 S34 增量已写入 `serve_deploy.sh`（systemd 链）与 `.s34/launch_arm.py`
+> （快照复现链）两处，两条启动路径配置一致。终局报告：
+> `docs/result/z100-s34-final.md`；长上下文曲线与 S35 移交项：
+> `docs/result/z100-s34-wp6-longctx.md`。
 
 policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完全一致
 （MTP 只经 CLI 传参，不动任何 VLLM_* 环境旋钮）。

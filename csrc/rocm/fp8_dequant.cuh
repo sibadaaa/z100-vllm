@@ -7,7 +7,7 @@
 // --------------------
 // gfx906 has no fp8 support, so a large-M prefill GEMM that wants to run on
 // rocBLAS has to materialize the current layer's weights as fp16 first
-// (docs/design/z100-w8a16-prefill-fp16-construction.md, decision 2 / §4.5).
+// (docs/design/z100/w8a16/z100-w8a16-prefill-fp16-construction.md, decision 2 / §4.5).
 // This kernel produces that copy:
 //
 //   out[n, k] = fp16( fp32(wq[n, k] widened through `lut`) * ws[n/block_n, k/block_k] )

@@ -588,8 +588,11 @@ class CustomAllreduce:
             # S33 WP2 size gate: only decode-size payloads (<= 64 KiB) take
             # the custom kernel; larger payloads (prefill) stay on RCCL so
             # prefill TTFT keeps its baseline behavior (construction
-            # z100-s33-fp8-scope-construction.md WP2).
-            if inp_size > 64 * 1024:
+            # z100-s33-fp8-scope-construction.md WP2). S34 WP2: the gate is
+            # env-tunable (default 64 KiB = unchanged behavior) so concurrent
+            # MTP verify payloads (4 seqs x 3 tok = 120 KiB) can stay on the
+            # push path; kernel-side region chunk is 2 MiB.
+            if inp_size > envs.VLLM_DCU_CUSTOM_AR_MAX_KIB * 1024:
                 return False
             return inp_size < self.max_size
         return False

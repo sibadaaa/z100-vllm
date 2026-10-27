@@ -2855,8 +2855,8 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
     VLLM_FP8_EMU_GEMM_BLOCK_CASE_X(35, 64, 8, 32, 1, 2);
     // 36..39 (S24 L1): the wide2 kernel family extended to prefill shapes.
     // S24 measured the prefill GEMM at 8.0-8.8 TF/s = 41-43% of the dot2 peak
-    // with the cfg 0 default tile (docs/design/z100-longctx-vram-optimization-
-    // plan.md §1.2), and the M-scan (mscan-dcu3.log) puts cfg 3 ahead of every
+    // with the cfg 0 default tile (the S24 longctx plan, removed; see
+    // docs/design/z100/README.md), and the M-scan (mscan-dcu3.log) puts cfg 3 ahead of every
     // legacy tile at M >= 1024.  These stage BK = 64/128 elements per round to
     // halve the staging rounds, which is the same lever the S23 decode tiles
     // cashed (+15-24%).  Accumulation order is unchanged (k ascending, dot2
@@ -3022,7 +3022,7 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
 // GEMV threshold for the W8A16 M branch.  The W8A8 route splits gemv/gemm on
 // the python side with `_GEMV_MAX_M` (VLLM_DCU_FP8_GEMV_MAX_M); the W8A16
 // entry owns the branch (routing matrix in
-// docs/design/z100-w8a16-prefill-fp16-construction.md §3), so it reads the
+// docs/design/z100/w8a16/z100-w8a16-prefill-fp16-construction.md §3), so it reads the
 // same knob once per process here (invariant 5: never per call) and clamps it
 // to the compiled GEMV range.
 int w8a16_gemv_max_m() {

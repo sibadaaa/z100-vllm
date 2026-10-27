@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, "/home/lyh/z100-vllm/tools/dcu")
 import s20_single_probe as s20  # noqa: E402
 
-DOC = "/home/lyh/z100-vllm/docs/design/z100-dual-prefill-reconciliation-projection.md"
+DOC = "/home/lyh/z100-vllm/docs/design/z100/decode-prefill/z100-dual-prefill-reconciliation-projection.md"
 
 tokenizer, errors = s20.load_tokenizer("/mnt/game/models/Qwen3.8-27B-FP8", "auto")
 assert tokenizer is not None, f"tokenizer load failed: {errors}"
