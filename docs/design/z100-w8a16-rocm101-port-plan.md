@@ -5,6 +5,10 @@
 > - 原 W8A16 设计与 DTK 树实现：`/home/lyh/z100-vllm/docs/design/z100-w8a16-prefill-fp16-construction.md`（数学契约见其 §1，**移植不改变数学**）
 > - DTK host 栈的实测收益（2026-10-23）：TTFT 4937→1595 ms（fp16 物化），decode TPOT 39.9 ms、DFlash2 接受率 50.6%
 > - rocm101 栈现状（无 w8a16）：TTFT 4937 ms / TPOT 37.1 ms / E2E 9652 ms（512/128/c1，`runs/20261023-135729-serve`）
+>
+> **事后调查（2026-10-24）**：本次只带入了 w8a16 三件套；目标树 99.8% 的源文件仍停在 S23，
+> 且 2026-10-23 15:01 的 1595 ms 数据实际来自 DTK。原因与后续 merge 方案见
+> [`docs/result/z100-rocm101-perf-integration-investigation.md`](../result/z100-rocm101-perf-integration-investigation.md)。
 
 ---
 

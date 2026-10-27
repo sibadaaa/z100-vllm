@@ -1,0 +1,1 @@
+{"model":"/mnt/game/models/Qwen3.8-27B-DFlash2-ms","method":"dflash","num_speculative_tokens":4,"dtype":"bfloat16","kv_cache_dtype":"bfloat16"}

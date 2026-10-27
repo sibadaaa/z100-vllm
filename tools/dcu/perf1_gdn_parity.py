@@ -108,6 +108,13 @@ def cmp_state(got, ref):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=6)
+    ap.add_argument(
+        "--t-max",
+        type=int,
+        default=4,
+        help="cover T = 1 + seed %% t_max (default 4, shipped k range; use 8 "
+        "with --seeds 8 to cover the T=8 DFlash2 recipe, WP-P1.4)",
+    )
     args = ap.parse_args()
     os.environ.setdefault("VLLM_GFX906_GDN_MTP_V2_DEBUG", "1")
     print(f"device={torch.cuda.get_device_name(0)}")
@@ -115,7 +122,7 @@ def main():
     cases = 0
     for seed in range(args.seeds):
         requests = 1 + seed % 3
-        t = 1 + seed % 4
+        t = 1 + seed % args.t_max
         bad = seed % 3 == 2
         d = build(seed, requests, t, bad_slots=bad)
         v1_out, v1_state = run_v1(d, d["state"].clone())

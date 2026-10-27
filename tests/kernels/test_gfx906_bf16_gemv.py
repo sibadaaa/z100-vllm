@@ -222,5 +222,60 @@ def test_dense_gemm_dispatch_is_off_by_default(monkeypatch):
     w = (torch.randn(384, 512, device="cuda") * 0.02).to(torch.bfloat16)
 
     routed = rocm_unquantized_gemm_impl(x, w)
-    direct = torch.ops._rocm_C.bf16_emu_gemv(x, w, None, 64, 0, False)
-    assert not torch.equal(routed, direct), "switch off must not use the emu GEMV"
+    # The off path for this shape is the n<=16 Triton branch.  (The old
+    # discriminator -- `routed != torch.ops._rocm_C.bf16_emu_gemv(...)` --
+    # stopped discriminating once both paths accumulated in fp32 and rounded
+    # to the same dtype: the two results became bit-equal at these shapes.)
+    from vllm.model_executor.layers.utils import triton_matmul
+
+    assert torch.equal(routed, triton_matmul(x, w)), (
+        "switch off must take the Triton branch, not the emu GEMV"
+    )
+    assert routed.dtype == x.dtype
+
+
+def test_gemv_gate_allows_narrow_n_at_verify_width():
+    """The A1 rule: N<=64 (in_proj_ba class) is allowed up to the kernel M cap.
+
+    The DFlash2 k=7 verify step calls ``in_proj_ba`` (N=24 per rank) at M=8;
+    before the rule change that shape fell through to ``triton_matmul``
+    (~188 us/call vs 40.7 us measured for the emulated GEMV, see
+    ``tools/dcu/a1_ba_gemv_probe.py``).  M=9 must stay rejected because the
+    kernel caps M at 8 (``kMsMax``), and the wider-N cells keep their old
+    rules.
+    """
+    from vllm.model_executor.layers.utils import _gfx906_gemv_shape_ok
+
+    assert _gfx906_gemv_shape_ok(n_tokens=8, n_out=24, dtype=torch.float16)
+    assert _gfx906_gemv_shape_ok(n_tokens=4, n_out=24, dtype=torch.bfloat16)
+    assert not _gfx906_gemv_shape_ok(n_tokens=9, n_out=24, dtype=torch.float16)
+    # unchanged cells
+    assert not _gfx906_gemv_shape_ok(n_tokens=8, n_out=1280, dtype=torch.float16)
+    assert _gfx906_gemv_shape_ok(n_tokens=2, n_out=62080, dtype=torch.float16)
+    assert not _gfx906_gemv_shape_ok(n_tokens=3, n_out=62080, dtype=torch.float16)
+
+
+def test_dense_gemm_dispatch_reaches_emu_at_ba_verify_shape(monkeypatch):
+    """The dispatch must route in_proj_ba's real M=8 shape to the emu GEMV.
+
+    End-to-end guard for the A1 gate change on the production shape
+    (N=24, K=5120, fp16 -- gfx906 coerces bf16 models to fp16 at load), using
+    the thread count the dispatch picks for this N.
+    """
+    import vllm  # noqa: F401
+    from vllm.model_executor.layers.utils import (
+        _gfx906_gemv_threads,
+        rocm_unquantized_gemm_impl,
+    )
+
+    monkeypatch.setenv("VLLM_DCU_USE_BF16_GEMV", "1")
+    torch.manual_seed(0)
+    x = (torch.randn(8, 5120, device="cuda") * 0.5).to(torch.float16)
+    w = (torch.randn(24, 5120, device="cuda") * 0.02).to(torch.float16)
+
+    routed = rocm_unquantized_gemm_impl(x, w)
+    direct = torch.ops._rocm_C.bf16_emu_gemv(
+        x, w, None, _gfx906_gemv_threads(w.shape[0]), 0, False
+    )
+    assert torch.equal(routed, direct), "M=8 narrow-N dispatch missed the emu GEMV"
+    assert routed.dtype == torch.float16

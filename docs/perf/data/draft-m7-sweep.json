@@ -1,0 +1,99 @@
+{
+  "device": "Z100L",
+  "m": 7,
+  "rows": [
+    {
+      "op": "draft.qkv",
+      "n": 1536,
+      "k": 5120,
+      "calls_per_round": 5,
+      "w_mb": 15.72864,
+      "triton_us": 266.0736656188965,
+      "emu_us": 156.5152359008789,
+      "rocblas_us": 119.63361740112305,
+      "best": "rocblas",
+      "best_us": 119.63361740112305,
+      "best_gbs": 131.47341308975876
+    },
+    {
+      "op": "draft.o",
+      "n": 1024,
+      "k": 5120,
+      "calls_per_round": 5,
+      "w_mb": 10.48576,
+      "triton_us": 247.0992660522461,
+      "emu_us": 122.7120304107666,
+      "rocblas_us": 55.422420501708984,
+      "best": "rocblas",
+      "best_us": 55.422420501708984,
+      "best_gbs": 189.19707773637685
+    },
+    {
+      "op": "draft.gateup",
+      "n": 8704,
+      "k": 5120,
+      "calls_per_round": 5,
+      "w_mb": 89.12896,
+      "triton_us": 463.8289260864258,
+      "emu_us": 693.4993743896484,
+      "rocblas_us": 433.96167755126953,
+      "best": "rocblas",
+      "best_us": 433.96167755126953,
+      "best_gbs": 205.3844028415851
+    },
+    {
+      "op": "draft.down",
+      "n": 1280,
+      "k": 17408,
+      "calls_per_round": 5,
+      "w_mb": 44.56448,
+      "triton_us": 878.3234405517578,
+      "emu_us": 475.98731994628906,
+      "rocblas_us": 155.99522590637207,
+      "best": "rocblas",
+      "best_us": 155.99522590637207,
+      "best_gbs": 285.6784862553902
+    },
+    {
+      "op": "draft.lm_head",
+      "n": 62080,
+      "k": 5120,
+      "calls_per_round": 1,
+      "w_mb": 635.6992,
+      "triton_us": 2348.405965169271,
+      "emu_us": 4677.964274088541,
+      "rocblas_us": 4548.689778645834,
+      "best": "triton",
+      "best_us": 2348.405965169271,
+      "best_gbs": 270.6939129896902
+    },
+    {
+      "op": "selector.hidden_proj",
+      "n": 256,
+      "k": 5120,
+      "calls_per_round": 1,
+      "w_mb": 2.62144,
+      "triton_us": 213.2928466796875,
+      "emu_us": 40.98240852355957,
+      "rocblas_us": 29.85919952392578,
+      "best": "rocblas",
+      "best_us": 29.85919952392578,
+      "best_gbs": 87.79337831543258
+    },
+    {
+      "op": "conv.kernel_proj",
+      "n": 1280,
+      "k": 5120,
+      "calls_per_round": 2,
+      "w_mb": 13.1072,
+      "triton_us": 259.01926040649414,
+      "emu_us": 142.41283416748047,
+      "rocblas_us": 60.670409202575684,
+      "best": "rocblas",
+      "best_us": 60.670409202575684,
+      "best_gbs": 216.03941974803018
+    }
+  ],
+  "total_current_ms": 12.356363824208579,
+  "total_best_ms": 6.324670689900716
+}

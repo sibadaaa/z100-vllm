@@ -174,6 +174,20 @@ class CustomAllreduce:
 
         """
         self._IS_CAPTURING = False
+        # S33 WP2: on gfx906, P2P reads of peer graph-pool activations (plain
+        # cached memory) return stale data -- the PCIe P2P path does not snoop
+        # the producer's L2. Graph capture therefore must NOT hand the
+        # graph-pool tensor to the peer kernels; force the copy-into-
+        # registered-fine-grain-buffer path (registered=False) for captures,
+        # which reads fresh data on the producer and writes uncached memory.
+        if register_graph_buffers and dcu_custom_ar_enabled():
+            logger.warning_once(
+                "VLLM_DCU_CUSTOM_AR=1: capturing graphs with "
+                "register_graph_buffers=False (copy-into-fine-grain-buffer "
+                "path) because gfx906 P2P reads of cached peer memory are "
+                "stale."
+            )
+            register_graph_buffers = False
         self._capture_registered = register_graph_buffers
         self._ptr = 0
         self.disabled = True
@@ -562,13 +576,20 @@ class CustomAllreduce:
                 )
                 return False
             algo = _dcu_custom_ar_algo()
-            if algo not in _DCU_CUSTOM_AR_ALGOS:
+            # S33 WP2: the DCU push kernel covers oneshot/1stage only; the
+            # pull kernels have no staging copy on this path any more.
+            if algo not in ("oneshot", "1stage"):
                 logger.warning_once(
                     "VLLM_DCU_CUSTOM_AR=1 needs VLLM_CUSTOM_ALLREDUCE_ALGO="
-                    "2stage on a PCIe-only multi-rank group (exact values: "
-                    "1stage, oneshot, 2stage, twoshot); keeping the RCCL "
-                    "all-reduce."
+                    "oneshot on a PCIe-only multi-rank group; keeping the "
+                    "RCCL all-reduce."
                 )
+                return False
+            # S33 WP2 size gate: only decode-size payloads (<= 64 KiB) take
+            # the custom kernel; larger payloads (prefill) stay on RCCL so
+            # prefill TTFT keeps its baseline behavior (construction
+            # z100-s33-fp8-scope-construction.md WP2).
+            if inp_size > 64 * 1024:
                 return False
             return inp_size < self.max_size
         return False

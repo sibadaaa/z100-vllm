@@ -521,12 +521,41 @@ def _gfx906_gemv_shape_ok(n_tokens: int, n_out: int, dtype: torch.dtype) -> bool
     * the unquantized ``lm_head`` (N=62080, K=5120) wins at M<=2 (M=1: 902.8 vs
       1589.8 us; M=2: 1412.0 vs 1588.1), ties at M=3 (1876.0 vs 1856.5) and
       loses at M=4 (2416.5 vs 1873.6), so the wide-N allowance stops at M=2.
+
+    A1 (2026-10-25, ``tools/dcu/a1_ba_gemv_probe.py``): the k=7 verify step
+    runs ``in_proj_ba`` at M=8, which fell through to ``triton_matmul``
+    (188.4 us at N=24, ~10.4 ms/step over 48 layers).  The emulated GEMV
+    (nt=128) measured 10.2/16.7/25.8/31.9/32.4/36.5/40.7 us for M=1..8 at the
+    same shape, i.e. 4.6-11.6x over Triton and a tie with rocBLAS at M=8
+    (42.3 us); fp16 rel err 2.5e-4 of |max|, identical to rocBLAS/Triton
+    (fp16 output quantization dominates).  Narrow N (<=64, the ``in_proj_ba``
+    class) is therefore allowed up to M=8, which is also the kernel's M cap
+    (``kMsMax``).  Wider N keeps the old rule.
     """
+    if n_out <= 64:
+        return n_tokens <= _gfx906_gemv_narrow_max_m()
     if n_out <= 1280:
         return n_tokens <= 4
     if n_tokens <= 2:
         return True
     return False
+
+
+@functools.lru_cache(maxsize=1)
+def _gfx906_gemv_narrow_max_m() -> int:
+    """A/B override for the narrow-N GEMV rule (A1, 2026-10-25).
+
+    Default 8 = the A1 rule (kernel cap ``kMsMax``); setting
+    ``VLLM_DCU_GEMV_NARROW_MAX_M=4`` restores the pre-A1 behaviour without a
+    code change, the same pattern as the other gfx906 A/B knobs.  Cached
+    because the service reads it once per arm restart.
+    """
+    raw = os.environ.get("VLLM_DCU_GEMV_NARROW_MAX_M", "").strip()
+    try:
+        n = int(raw) if raw else 8
+    except ValueError:
+        n = 8
+    return max(0, min(n, 8))
 
 
 def _gfx906_dense_gemv_enabled() -> bool:

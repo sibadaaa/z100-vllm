@@ -595,25 +595,38 @@ void launch_gemv_block(int M, int N, int K4, int nt, int64_t w_stride, int nkb,
 // barrier, not DRAM.
 //
 // This kernel is shaped like the probe's `k_stream_rows`, which did reach
-// 621.7 GB/s at exactly this geometry (grid = N/64, 512 threads/block):
+// 621.7 GB/s at exactly this geometry (grid = N/64, 512 threads/block), and
+// since GEMV-OPT-20261025.md P0 like the probe's `gemv_lds` (451 GB/s at
+// M=8 with A in LDS slices):
 //
 //   * one block per `rows` rows of W, one warp per row at a time;
 //   * 64 lanes stride K in uint4 (16 fp8 byte) steps, so every W load is a
 //     single fully-coalesced 1 KiB request per warp;
-//   * no K-carried dependency: each row restarts the accumulator chain, and a
-//     depth-1 prefetch keeps the next row-chunk's load in flight while the
-//     current one is widened and dotted;
+//   * no K-carried dependency: each row restarts the accumulator chain, and
+//     the K walk is sliced so the W chunk a lane loads next is independent of
+//     the chunk it is dotting (the old per-row PREF pipeline retired with the
+//     slice structure -- the probe's lds_* geometry ran without one);
 //   * `rows` divides `block_n`, so every row of the block reads the same
 //     `w_s[nb, :]` row and the per-block_k scales can be folded once per block
 //     into LDS as `a_s[m, kb] * w_s[nb, kb]` (identical arithmetic to
 //     `fp8_emu_gemv_block_kernel`: `acc[m] += loc[m] * s[m]`);
-//   * A is widened once per block into LDS, so the M*K LUT lookups are paid
-//     once per block instead of once per row of W.
+//   * A is widened into LDS in K-slices (`kStreamSlice` fp16 per row, staged
+//     once per slice and reused by every row of the block), so the M*K LUT
+//     lookups are paid once per block instead of once per row of W while the
+//     staging buffer stays a fixed ~16 KiB instead of growing with M*K -- the
+//     old whole-A tile (82 KiB at M=8/K=5120) exceeded the 44 KiB gate and
+//     pushed M >= 5 onto the tiled GEMM, which is what
+//     docs/perf/GEMV-OPT-20261025.md P0 fixes.
 constexpr int kStreamChunk = 16;  // fp8 elements owned by one lane per step
-// Upper bound for the streaming path's dynamic LDS: A (M*K fp16) + folded
-// scales.  The real gate is min(this, device LDS per block - 1 KiB), queried
-// once from the device, so a smaller-LDS part degrades to the old GEMV instead
-// of failing the launch.
+// A slice length in fp8 elements: 1024 = 64 uint4 = exactly one W chunk per
+// lane per (slice, row), i.e. 1 KiB of W per row per slice -- the geometry the
+// `gemv_probe` lds_* sweep measured 451 GB/s with at M=8 (fp16 stand-in
+// weights, docs/perf/GEMV-OPT-20261025.md §1.2).
+constexpr int kStreamSlice = 1024;
+// Upper bound for the streaming path's dynamic LDS: the A slice
+// (MS * kStreamSlice fp16) + folded scales.  The real gate is min(this, device
+// LDS per block - 1 KiB), queried once from the device, so a smaller-LDS part
+// degrades to the tiled GEMM instead of failing the launch.
 constexpr size_t kStreamSmemCap = (size_t)44 * 1024;
 
 size_t stream_smem_limit() {
@@ -631,9 +644,9 @@ size_t stream_smem_limit() {
   return lim;
 }
 
-template <int MS, int PREF, typename T>
+template <int MS, int RW, typename T>
 __global__ void fp8_emu_gemv_stream_block_kernel(
-    const uint8_t* __restrict__ a,      // [M, K]
+    const uint8_t* __restrict__ a,      // [M, K] fp8 (a16 == 0) or fp16 (a16)
     const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
     const float* __restrict__ a_s,      // [M, nkb]
     const float* __restrict__ w_s,      // [cdiv(N, block_n), nkb]
@@ -643,14 +656,23 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
     const int M, const int N, const int K, const int64_t w_stride,
     const int rows, const int nkb, const int block_n, const int cpb,
     const int a16) {
-  // `sA` is accessed as uint4 by the MAC reader and (W8A16) written as
-  // uint4, so the dynamic LDS base must be 16 B aligned; the declaration
-  // alone only guarantees 4 B (the 512 B static LUT currently puts it at a
-  // 16 B boundary by layout accident -- make it explicit).
+  // Dynamic LDS layout: the [MS][kStreamSlice] fp16 A slice first (on the
+  // __align__(16) dynamic base, so both the uint4 staging and the uint4 MAC
+  // reads stay 16 B aligned), then the [M][nkb] folded scales.  The scales are
+  // staged once per block: M*nkb*4 bytes (1.3 KiB at the production
+  // block_k = 128), independent of the slice loop.
   extern __shared__ __align__(16) uint32_t dyn[];
-  __half* sA = reinterpret_cast<__half*>(dyn);                     // [M][K]
-  float* sscale = reinterpret_cast<float*>(sA + (int64_t)M * K);   // [M][nkb]
+  __half* sA = reinterpret_cast<__half*>(dyn);  // [MS][kStreamSlice]
+  float* sscale =
+      reinterpret_cast<float*>(sA + (int64_t)MS * kStreamSlice);  // [M][nkb]
   __shared__ __half sl[256];
+
+  constexpr int kSliceChunks = kStreamSlice / kStreamChunk;  // W uint4 / slice
+  constexpr int kSliceDw = kStreamSlice / 4;   // fp8 dwords per slice row
+  constexpr int kSliceV8 = kStreamSlice / 8;   // fp16 uint4 per slice row (a16)
+  static_assert(kSliceChunks == 64,
+                "one W uint4 per lane per (row, slice): the prefetch pipeline "
+                "below relies on it");
 
   const int t = threadIdx.x;
   const int nt = blockDim.x;
@@ -660,29 +682,23 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
   const int K4 = K >> 2;
 
   fp8_lut_stage(sl, lut, nt);
-  __syncthreads();
+  __syncthreads();  // also orders the LUT store above
 
-  {  // A -> LDS.  On the W8A16 route (a16) A is already fp16, so this is a
-     // plain 16 B copy; otherwise each fp8 dword is widened once per block.
-    uint32_t* sA32 = reinterpret_cast<uint32_t*>(sA);
-    if (a16 != 0) {
-      const uint4* __restrict__ av = reinterpret_cast<const uint4*>(a);
-      uint4* __restrict__ sv = reinterpret_cast<uint4*>(sA);
-      const int64_t tot = ((int64_t)M * K) >> 3;  // 8 fp16 per uint4
-      for (int64_t i = t; i < tot; i += nt) sv[i] = av[i];
-    } else {
-      const uint32_t* __restrict__ a32 = reinterpret_cast<const uint32_t*>(a);
-      const int64_t tot = (int64_t)M * K4;
-      for (int64_t i = t; i < tot; i += nt) {
-        uint32_t lo, hi;
-        fp8x4_to_f16x2x2(sl, a32[i], lo, hi);
-        sA32[2 * i] = lo;
-        sA32[2 * i + 1] = hi;
-      }
-    }
+  const int n0 = blockIdx.x * rows;
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
+
+  // One accumulator bank per owned row: the slice-outer walk keeps all RW
+  // rows of the warp in flight simultaneously, so their partial sums cannot
+  // share registers (the row-outer old kernel restarted acc[] per row).
+  float acc[RW][MS];
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) {
+#pragma unroll
+    for (int m = 0; m < MS; ++m) acc[rr][m] = 0.0f;
   }
+
   {  // Folded per-block_k scales: rows divides block_n, so one w_s row.
-    const int nb = (int)(((int64_t)blockIdx.x * rows) / block_n);
+    const int nb = (int)(((int64_t)n0) / block_n);
     const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
     const int tot = M * nkb;
     for (int i = t; i < tot; i += nt) {
@@ -691,83 +707,147 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
       sscale[i] = (a16 != 0) ? wsr[kb] : a_s[(int64_t)m * nkb + kb] * wsr[kb];
     }
   }
-  __syncthreads();
 
-  const int n0 = blockIdx.x * rows;
-  const int k4v = K4 >> 2;  // 16-byte vectors per row of W
-  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
-
-  for (int r = warp; r < rows; r += nwarp) {
-    const int row = n0 + r;
-    if (row >= N) break;
-    const uint4* __restrict__ wp = wv + (((int64_t)row * w_stride) >> 4);
-
-    float acc[MS];
+  const uint32_t* __restrict__ a32 = reinterpret_cast<const uint32_t*>(a);
+  // W chunk pipeline: the chunk a lane will dot in slice s is loaded two
+  // slices ahead into rotating registers.  The slice loop cannot hoist the
+  // global loads across its __syncthreads() on its own, so without this the
+  // ~600-cycle DRAM latency sits exposed behind the staging barrier of every
+  // slice (M=1 gateup: 441 -> 494 GB/s with the pipeline).  The slice loop is
+  // peeled by two below so the buffer subscript is a literal -- a runtime
+  // `pf[pre & 1]` spills to scratch and measured ~2x slower than no pipeline
+  // at all (M=1: 241 GB/s).  kSliceChunks == 64 makes the (row, chunk) ->
+  // lane mapping 1:1, so one uint4 per register slot per row is exact.
+  uint4 pf[2][RW];
 #pragma unroll
-    for (int m = 0; m < MS; ++m) acc[m] = 0.0f;
-
-    // Uniform trip count for the whole wavefront (the cross-lane reduction
-    // below must not sit behind a divergent branch); out-of-range lanes carry a
-    // zeroed chunk and a clamped index, so they contribute exactly 0.
-    //
-    // PREF chunks of W are kept in flight: the DRAM latency (~600 cycles) is
-    // several times the issue cost of one chunk (~50 instructions), so one
-    // in-flight load per warp exposes most of it.  PREF is a template knob so
-    // the depth can be A/B'd without a rebuild (VLLM_DCU_FP8_GEMV_PREF).
-    const int niter = (k4v + 63) >> 6;
-    int i = lane;
-    uint4 buf[PREF];
+  for (int pre = 0; pre < 2; ++pre) {
+    const int sp = pre * kStreamSlice;
 #pragma unroll
-    for (int q = 0; q < PREF; ++q) {
-      const int ii = i + q * 64;
-      buf[q] = make_uint4(0u, 0u, 0u, 0u);
-      if (ii < k4v) buf[q] = wp[ii];
-    }
-    for (int j = 0; j < niter; ++j) {
-      const uint4 vv = buf[0];
-      const int inext = i + PREF * 64;
-      uint4 vn = make_uint4(0u, 0u, 0u, 0u);
-      if (j + PREF < niter && inext < k4v) vn = wp[inext];
-#pragma unroll
-      for (int q = 0; q + 1 < PREF; ++q) buf[q] = buf[q + 1];
-      buf[PREF - 1] = vn;
-
-      uint32_t p[8];
-      fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);
-      fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);
-      fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);
-      fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);
-
-      const int ic = min(i, k4v - 1);  // clamped for padded lanes
-      const int kb = ic / cpb;
-#pragma unroll
-      for (int m = 0; m < MS; ++m) {
-        if (m < M) {
-          const uint4* __restrict__ ap = reinterpret_cast<const uint4*>(
-              sA + (int64_t)m * K + ic * kStreamChunk);
-          const uint4 xa = ap[0];
-          const uint4 xb = ap[1];
-          float loc = 0.0f;
-          loc = dot2(p[0], xa.x, loc);
-          loc = dot2(p[1], xa.y, loc);
-          loc = dot2(p[2], xa.z, loc);
-          loc = dot2(p[3], xa.w, loc);
-          loc = dot2(p[4], xb.x, loc);
-          loc = dot2(p[5], xb.y, loc);
-          loc = dot2(p[6], xb.z, loc);
-          loc = dot2(p[7], xb.w, loc);
-          acc[m] += loc * sscale[m * nkb + kb];
-        }
+    for (int rr = 0; rr < RW; ++rr) {
+      const int row = n0 + warp + rr * nwarp;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (row < N && sp + lane * kStreamChunk < K) {
+        v = wv[(((int64_t)row * w_stride) >> 4) + (sp >> 4) + lane];
       }
-      i += 64;
+      pf[pre][rr] = v;
     }
+  }
 
-    // Cross-lane reduction; lane 0 owns the row.  Executed by the whole
-    // wavefront (the K loop above reconverges at its exit).
+  // One slice body: stage A[s0..], consume pf[B] (slice s0's chunks), refill
+  // pf[B] with slice REFILL's chunks.  Both __syncthreads() sit at slice
+  // granularity, outside every warp-divergent branch, so the out-of-range
+  // rows of the last block only skip compute.
+#define VLLM_FP8_STREAM_SLICE(S0, B, REFILL)                                 \
+  do {                                                                       \
+    const int s0_ = (S0);                                                    \
+    const int sl_el_ = min(kStreamSlice, K - s0_);                           \
+    const int chunks_ = min(kSliceChunks, sl_el_ >> 4);                      \
+    if (a16 != 0) {  /* W8A16: A is already fp16, only copy it. */           \
+      const uint4* __restrict__ av = reinterpret_cast<const uint4*>(a);      \
+      uint4* __restrict__ sv = reinterpret_cast<uint4*>(sA);                 \
+      const int full_ = sl_el_ >> 3;                                         \
+      for (int i = t; i < M * kSliceV8; i += nt) {                           \
+        const int m = i / kSliceV8;                                          \
+        const int v = i - m * kSliceV8;                                      \
+        uint4 val = make_uint4(0u, 0u, 0u, 0u);                              \
+        if (v < full_) val = av[m * (K >> 3) + (s0_ >> 3) + v];              \
+        sv[m * kSliceV8 + v] = val;                                          \
+      }                                                                      \
+    } else {  /* each fp8 dword widens once per block, as before. */         \
+      const int full_ = sl_el_ >> 2;                                         \
+      uint32_t* __restrict__ sv = reinterpret_cast<uint32_t*>(sA);           \
+      for (int i = t; i < M * kSliceDw; i += nt) {                           \
+        const int m = i / kSliceDw;                                          \
+        const int d = i - m * kSliceDw;                                      \
+        uint32_t lo = 0, hi = 0;                                             \
+        if (d < full_) {                                                     \
+          fp8x4_to_f16x2x2(sl, a32[(int64_t)m * K4 + (s0_ >> 2) + d], lo, hi); \
+        }                                                                    \
+        uint32_t* dst = sv + m * (kStreamSlice >> 1) + 2 * d;                \
+        dst[0] = lo;                                                         \
+        dst[1] = hi;                                                         \
+      }                                                                      \
+    }                                                                        \
+    __syncthreads();                                                         \
+    _Pragma("unroll")                                                        \
+    for (int rr = 0; rr < RW; ++rr) {                                        \
+      const int row = n0 + warp + rr * nwarp;                                \
+      const uint4 vv = pf[B][rr];                                            \
+      /* Refill this buffer for slice REFILL (its next use).  The load is */ \
+      /* independent of sA, so it issues before this slice's compute. */     \
+      uint4 vn = make_uint4(0u, 0u, 0u, 0u);                                 \
+      const int s2_ = (REFILL);                                              \
+      if (s2_ < K && row < N) {                                              \
+        const int chunks2 = min(kSliceChunks, (K - s2_) >> 4);               \
+        if (lane < chunks2) {                                                \
+          vn = wv[(((int64_t)row * w_stride) >> 4) + (s2_ >> 4) + lane];     \
+        }                                                                    \
+      }                                                                      \
+      pf[B][rr] = vn;                                                        \
+      if (row < N && lane < chunks_) {  /* no barrier behind it */           \
+        uint32_t p[8];                                                       \
+        fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);                              \
+        fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);                              \
+        fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);                              \
+        fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);                              \
+        const int kb = ((s0_ >> 4) + lane) / cpb;                            \
+        /* P1: the widened chunk feeds the rows in groups of four, so one */ \
+        /* chunk's 8 W registers cover the whole M range instead of one */   \
+        /* accumulator group per pass (the M >= 5 instantiation runs the */  \
+        /* two groups back to back on the same p[]). */                      \
+        _Pragma("unroll")                                                    \
+        for (int g = 0; g < (MS + 3) / 4; ++g) {                             \
+          _Pragma("unroll")                                                  \
+          for (int m = 4 * g; m < (4 * g + 4 < MS ? 4 * g + 4 : MS); ++m) {  \
+            if (m < M) {                                                     \
+              const uint4* __restrict__ ap =                                 \
+                  reinterpret_cast<const uint4*>(                            \
+                      sA + (int64_t)m * kStreamSlice +                       \
+                      lane * kStreamChunk);                                  \
+              const uint4 xa = ap[0];                                        \
+              const uint4 xb = ap[1];                                        \
+              float loc = 0.0f;                                              \
+              loc = dot2(p[0], xa.x, loc);                                   \
+              loc = dot2(p[1], xa.y, loc);                                   \
+              loc = dot2(p[2], xa.z, loc);                                   \
+              loc = dot2(p[3], xa.w, loc);                                   \
+              loc = dot2(p[4], xb.x, loc);                                   \
+              loc = dot2(p[5], xb.y, loc);                                   \
+              loc = dot2(p[6], xb.z, loc);                                   \
+              loc = dot2(p[7], xb.w, loc);                                   \
+              acc[rr][m] += loc * sscale[m * nkb + kb];                      \
+            }                                                                \
+          }                                                                  \
+        }                                                                    \
+      }                                                                      \
+    }                                                                        \
+    __syncthreads();                                                         \
+  } while (0)
+
+  // K walk, peeled by two slices so pf's buffer index is a literal.  Invariant
+  // on entry to a body: pf[B] holds slice (S0) iff (S0 / kStreamSlice) % 2 == B.
+  int s0 = 0;
+  for (; s0 + 2 * kStreamSlice <= K; s0 += 2 * kStreamSlice) {
+    VLLM_FP8_STREAM_SLICE(s0, 0, s0 + 2 * kStreamSlice);
+    VLLM_FP8_STREAM_SLICE(s0 + kStreamSlice, 1, s0 + 3 * kStreamSlice);
+  }
+  if (s0 < K) {
+    VLLM_FP8_STREAM_SLICE(s0, 0, s0 + 2 * kStreamSlice);
+    s0 += kStreamSlice;
+    if (s0 < K) VLLM_FP8_STREAM_SLICE(s0, 1, s0 + 2 * kStreamSlice);
+  }
+#undef VLLM_FP8_STREAM_SLICE
+
+  // Cross-lane reduction; lane 0 owns the row.  The K walk reconverged above,
+  // and `row >= N` is warp-uniform.
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) {
+    const int row = n0 + warp + rr * nwarp;
+    if (row >= N) continue;
 #pragma unroll
     for (int m = 0; m < MS; ++m) {
       if (m < M) {
-        float v = acc[m];
+        float v = acc[rr][m];
 #pragma unroll
         for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
         if (lane == 0) {
@@ -780,17 +860,641 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
   }
 }
 
-template <int MS, int PREF, typename T>
+// Highest MS instantiation `dispatch_gemv_stream` will use for this M.  The
+// slice buffer is sized by the template parameter, so the host-side LDS gate
+// has to match it.
+int stream_ms_for(int M) {
+  if (M <= 1) return 1;
+  if (M <= 2) return 2;
+  if (M <= 4) return 4;
+  return kMsMax;
+}
+
+// ---------------------------------------------------------------------------
+// S30c WP2-N level 2: M == 1 specialization of the streaming decode kernel.
+// ---------------------------------------------------------------------------
+// Same slice/pipeline geometry as `fp8_emu_gemv_stream_block_kernel`, with the
+// M dimension stripped: A is one row (the W8A16 route's fp16 activation), the
+// folded-scale table is [nkb] (no [M][nkb] 2-D staging or a_s multiply), the
+// MAC loop carries one accumulator per owned row (no [MS] bank, no `m < M`
+// predication, no per-M register groups), and the A-stage loop copies a
+// single 2 KiB fp16 slice.  Frees the registers the [RW][MS] accumulator bank
+// used and removes the M-dim LDS indexing from the inner dot loop.
+// Gate: VLLM_DCU_FP8_GEMV_M1 (default 0; W8A16 dispatch, M == 1 only).
+template <int RW, typename T>
+__global__ void fp8_emu_gemv_stream_m1_kernel(
+    const uint8_t* __restrict__ a,      // [1, K] fp16 (W8A16 route)
+    const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
+    const float* __restrict__ w_s,      // [cdiv(N, block_n), nkb]
+    const __half* __restrict__ lut,     // [256]
+    const T* __restrict__ bias,         // [N] | null
+    T* __restrict__ out,                // [1, N]
+    const int N, const int K, const int64_t w_stride, const int rows,
+    const int nkb, const int block_n, const int cpb) {
+  extern __shared__ __align__(16) uint32_t dyn[];
+  __half* sA = reinterpret_cast<__half*>(dyn);  // [kStreamSlice]
+  __shared__ __half sl[256];
+
+  constexpr int kSliceChunks = kStreamSlice / kStreamChunk;  // W uint4 / slice
+  constexpr int kSliceV8 = kStreamSlice / 8;                 // fp16 uint4/slice
+  static_assert(kSliceChunks == 64,
+                "one W uint4 per lane per (row, slice): the prefetch pipeline "
+                "below relies on it");
+
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const int lane = t & 63;
+  const int warp = t >> 6;
+  const int nwarp = nt >> 6;
+
+  fp8_lut_stage(sl, lut, nt);
+  __syncthreads();
+
+  const int n0 = blockIdx.x * rows;
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
+
+  float acc[RW];
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) acc[rr] = 0.0f;
+
+  {  // Folded per-block_k scales: rows divides block_n, so one w_s row.
+    const int nb = (int)(((int64_t)n0) / block_n);
+    const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
+    float* sscale = reinterpret_cast<float*>(sA + kStreamSlice);  // [nkb]
+    for (int kb = t; kb < nkb; kb += nt) sscale[kb] = wsr[kb];
+  }
+
+  const uint4* __restrict__ av = reinterpret_cast<const uint4*>(a);
+  uint4* __restrict__ sv = reinterpret_cast<uint4*>(sA);
+
+  // W chunk pipeline, identical to variant 1 (two slices ahead, literal
+  // buffer subscript via the peel-by-two slice loop).
+  uint4 pf[2][RW];
+#pragma unroll
+  for (int pre = 0; pre < 2; ++pre) {
+    const int sp = pre * kStreamSlice;
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+      const int row = n0 + warp + rr * nwarp;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (row < N && sp + lane * kStreamChunk < K) {
+        v = wv[(((int64_t)row * w_stride) >> 4) + (sp >> 4) + lane];
+      }
+      pf[pre][rr] = v;
+    }
+  }
+
+#define VLLM_FP8_STREAM_M1_SLICE(S0, B, REFILL)                              \
+  do {                                                                       \
+    const int s0_ = (S0);                                                    \
+    const int sl_el_ = min(kStreamSlice, K - s0_);                           \
+    const int chunks_ = min(kSliceChunks, sl_el_ >> 4);                      \
+    /* A is one fp16 row: copy this slice's uint4s, no M loop. */            \
+    const int full_ = sl_el_ >> 3;                                           \
+    for (int v = t; v < kSliceV8; v += nt) {                                 \
+      uint4 val = make_uint4(0u, 0u, 0u, 0u);                                \
+      if (v < full_) val = av[(s0_ >> 3) + v];                               \
+      sv[v] = val;                                                           \
+    }                                                                        \
+    __syncthreads();                                                         \
+    _Pragma("unroll")                                                        \
+    for (int rr = 0; rr < RW; ++rr) {                                        \
+      const int row = n0 + warp + rr * nwarp;                                \
+      const uint4 vv = pf[B][rr];                                            \
+      uint4 vn = make_uint4(0u, 0u, 0u, 0u);                                 \
+      const int s2_ = (REFILL);                                              \
+      if (s2_ < K && row < N) {                                              \
+        const int chunks2 = min(kSliceChunks, (K - s2_) >> 4);               \
+        if (lane < chunks2) {                                                \
+          vn = wv[(((int64_t)row * w_stride) >> 4) + (s2_ >> 4) + lane];     \
+        }                                                                    \
+      }                                                                      \
+      pf[B][rr] = vn;                                                        \
+      if (row < N && lane < chunks_) {                                       \
+        uint32_t p[8];                                                       \
+        fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);                              \
+        fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);                              \
+        fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);                              \
+        fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);                              \
+        const int kb = ((s0_ >> 4) + lane) / cpb;                            \
+        const uint4* __restrict__ ap =                                       \
+            reinterpret_cast<const uint4*>(sA + lane * kStreamChunk);        \
+        const uint4 xa = ap[0];                                              \
+        const uint4 xb = ap[1];                                              \
+        float loc = 0.0f;                                                    \
+        loc = dot2(p[0], xa.x, loc);                                         \
+        loc = dot2(p[1], xa.y, loc);                                         \
+        loc = dot2(p[2], xa.z, loc);                                         \
+        loc = dot2(p[3], xa.w, loc);                                         \
+        loc = dot2(p[4], xb.x, loc);                                         \
+        loc = dot2(p[5], xb.y, loc);                                         \
+        loc = dot2(p[6], xb.z, loc);                                         \
+        loc = dot2(p[7], xb.w, loc);                                         \
+        acc[rr] += loc * reinterpret_cast<const float*>(                     \
+                       sA + kStreamSlice)[kb];                               \
+      }                                                                      \
+    }                                                                        \
+    __syncthreads();                                                         \
+  } while (0)
+
+  int s0 = 0;
+  for (; s0 + 2 * kStreamSlice <= K; s0 += 2 * kStreamSlice) {
+    VLLM_FP8_STREAM_M1_SLICE(s0, 0, s0 + 2 * kStreamSlice);
+    VLLM_FP8_STREAM_M1_SLICE(s0 + kStreamSlice, 1, s0 + 3 * kStreamSlice);
+  }
+  if (s0 < K) {
+    VLLM_FP8_STREAM_M1_SLICE(s0, 0, s0 + 2 * kStreamSlice);
+    s0 += kStreamSlice;
+    if (s0 < K) VLLM_FP8_STREAM_M1_SLICE(s0, 1, s0 + 2 * kStreamSlice);
+  }
+#undef VLLM_FP8_STREAM_M1_SLICE
+
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) {
+    const int row = n0 + warp + rr * nwarp;
+    if (row >= N) continue;
+    float v = acc[rr];
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
+    if (lane == 0) {
+      T o = static_cast<T>(v);
+      if (bias != nullptr) o += static_cast<T>(bias[row]);
+      out[row] = o;
+    }
+  }
+}
+
+template <int RW, typename T>
+void launch_gemv_stream_m1(int N, int K, int64_t w_stride, int rows, int nt,
+                           int nkb, int block_n, int cpb, const uint8_t* A,
+                           const uint8_t* W, const float* w_s,
+                           const __half* lut, const T* bias, T* C,
+                           hipStream_t stream) {
+  // One A slice (fp16) + the [nkb] folded scales.
+  const size_t smem = (size_t)kStreamSlice * sizeof(__half) +
+                      (size_t)nkb * sizeof(float);
+  dim3 grid((N + rows - 1) / rows);
+  dim3 block(nt);
+  fp8_emu_gemv_stream_m1_kernel<RW, T><<<grid, block, smem, stream>>>(
+      A, W, w_s, lut, bias, C, N, K, w_stride, rows, nkb, block_n, cpb);
+}
+
+// M == 1 dispatch of the m1 kernel; rows/nt come from `stream_block_select`
+// (the P2 rows override keeps working), so RW mirrors dispatch_gemv_stream.
+template <typename T>
+void dispatch_gemv_stream_m1(int N, int K, int64_t w_stride, int rows, int nt,
+                             int nkb, int block_n, int cpb, const uint8_t* A,
+                             const uint8_t* W, const float* w_s,
+                             const __half* lut, const T* bias, T* C,
+                             hipStream_t stream) {
+  const int rw = rows / (nt >> 6);
+  if (rw <= 1) {
+    launch_gemv_stream_m1<1, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  } else if (rw == 2) {
+    launch_gemv_stream_m1<2, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  } else if (rw <= 4) {
+    launch_gemv_stream_m1<4, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  } else {
+    launch_gemv_stream_m1<8, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  }
+}
+
+// S30c WP2-N level-2 gate (default 0; flipped to 1 after parity).
+int stream_m1_enabled() {
+  static const bool on = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_M1");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+// ---------------------------------------------------------------------------
+// S33 WP1: whole-A M == 1 GEMV (numeric bit-identical to the production path).
+// ---------------------------------------------------------------------------
+// Stages the ENTIRE fp16 activation row (K * 2 B = 10 KB at the production
+// K = 5120) plus the folded [nkb] scales into dynamic LDS once, then walks the
+// K slices with zero __syncthreads() inside the loop (the m1 kernel pays two
+// barriers per 1024-element slice for its A restaging).  Slice/lane/chunk
+// traversal order, the widened-chunk dot2 chain, the kb folding and the
+// acc += order are line-for-line those of fp8_emu_gemv_stream_m1_kernel, and
+// the A values fed to the MACs are the same fp16 bits (a plain copy either
+// way), so the results are bit-identical to the production kernel (WP1 判据 B:
+// microbench max|delta| identical to the current path, 0-difference level).
+// The W prefetch ring is deepened to 3 buffers -- there is no staging barrier
+// left to hide the global loads behind (the m1 kernel prefetches 2 slices
+// ahead across its per-slice barriers).
+//
+// Shape gate: the whole-A row must stay small enough that the grid still
+// fills the CUs -- down (K = 17408 -> 34 KB row -> 1 block/CU) is excluded and
+// stays on the production path (design D2).  qkv/o/GDN-in/GDN-out/gateup
+// (K = 5120 -> 10.4 KB LDS) keep 4-5 blocks per CU.
+//
+// Gate: VLLM_DCU_FP8_GEMV_WA (default 0; W8A16 dispatch, M == 1 only).
+constexpr size_t kWholeaMaxLds = (size_t)12 * 1024;
+
+bool wholea_shape_ok(int K, int nkb) {
+  const size_t smem = (size_t)K * sizeof(__half) + (size_t)nkb * sizeof(float);
+  return smem <= kWholeaMaxLds && smem <= stream_smem_limit();
+}
+
+int wholea_enabled() {
+  static const bool on = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_WA");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+template <int RW, typename T>
+__global__ void fp8_emu_gemv_wholea_m1_kernel(
+    const uint8_t* __restrict__ a,      // [1, K] fp16 (W8A16 route)
+    const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
+    const float* __restrict__ w_s,      // [cdiv(N, block_n), nkb]
+    const __half* __restrict__ lut,     // [256]
+    const T* __restrict__ bias,         // [N] | null
+    T* __restrict__ out,                // [1, N]
+    const int N, const int K, const int64_t w_stride, const int rows,
+    const int nkb, const int block_n, const int cpb) {
+  extern __shared__ __align__(16) uint32_t dyn[];
+  __half* sA = reinterpret_cast<__half*>(dyn);         // [K] whole A row
+  float* sscale = reinterpret_cast<float*>(sA + K);    // [nkb]
+  __shared__ __half sl[256];
+
+  constexpr int kSliceChunks = kStreamSlice / kStreamChunk;  // W uint4 / slice
+  constexpr int kPf = 3;  // W prefetch ring depth (no staging barrier left)
+  static_assert(kSliceChunks == 64,
+                "one W uint4 per lane per (row, slice): the traversal order "
+                "below relies on it");
+
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const int lane = t & 63;
+  const int warp = t >> 6;
+  const int nwarp = nt >> 6;
+
+  // One-time staging: LUT + whole A row + folded scales, then ONE barrier.
+  fp8_lut_stage(sl, lut, nt);
+  {
+    const uint4* __restrict__ av = reinterpret_cast<const uint4*>(a);
+    uint4* __restrict__ sv = reinterpret_cast<uint4*>(sA);
+    const int kv = K >> 3;  // fp16 uint4s in the row (stream gate: K % 16 == 0)
+    for (int v = t; v < kv; v += nt) sv[v] = av[v];
+    const int n0 = blockIdx.x * rows;
+    const int nb = (int)(((int64_t)n0) / block_n);
+    const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
+    for (int kb = t; kb < nkb; kb += nt) sscale[kb] = wsr[kb];
+  }
+  __syncthreads();  // the only barrier after staging
+
+  const int n0 = blockIdx.x * rows;
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
+
+  float acc[RW];
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) acc[rr] = 0.0f;
+
+  // W chunk pipeline, kPf slices ahead; literal buffer subscripts come from
+  // the peel-by-kPf slice loop below (the m1 kernel's peel-by-two trick).
+  uint4 pf[kPf][RW];
+#pragma unroll
+  for (int pre = 0; pre < kPf; ++pre) {
+    const int sp = pre * kStreamSlice;
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+      const int row = n0 + warp + rr * nwarp;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (row < N && sp + lane * kStreamChunk < K) {
+        v = wv[(((int64_t)row * w_stride) >> 4) + (sp >> 4) + lane];
+      }
+      pf[pre][rr] = v;
+    }
+  }
+
+  // One slice body: consume pf[B] (slice S0's chunks), refill pf[B] with slice
+  // REFILL.  Identical arithmetic to VLLM_FP8_STREAM_M1_SLICE -- the only
+  // difference is where the A fp16 values come from (staged whole row).
+#define VLLM_FP8_WHOLEA_M1_SLICE(S0, B, REFILL)                              \
+  do {                                                                       \
+    const int s0_ = (S0);                                                    \
+    const int chunks_ = min(kSliceChunks, (K - s0_) >> 4);                   \
+    _Pragma("unroll")                                                        \
+    for (int rr = 0; rr < RW; ++rr) {                                        \
+      const int row = n0 + warp + rr * nwarp;                                \
+      const uint4 vv = pf[B][rr];                                            \
+      uint4 vn = make_uint4(0u, 0u, 0u, 0u);                                 \
+      const int s2_ = (REFILL);                                              \
+      if (s2_ < K && row < N) {                                              \
+        const int chunks2 = min(kSliceChunks, (K - s2_) >> 4);               \
+        if (lane < chunks2) {                                                \
+          vn = wv[(((int64_t)row * w_stride) >> 4) + (s2_ >> 4) + lane];     \
+        }                                                                    \
+      }                                                                      \
+      pf[B][rr] = vn;                                                        \
+      if (row < N && lane < chunks_) {                                       \
+        uint32_t p[8];                                                       \
+        fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);                              \
+        fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);                              \
+        fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);                              \
+        fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);                              \
+        const int kb = ((s0_ >> 4) + lane) / cpb;                            \
+        /* Whole-row LDS is absolute: this slice's A chunk sits at s0_. */   \
+        const uint4* __restrict__ ap =                                       \
+            reinterpret_cast<const uint4*>(sA + s0_ + lane * kStreamChunk);  \
+        const uint4 xa = ap[0];                                              \
+        const uint4 xb = ap[1];                                              \
+        float loc = 0.0f;                                                    \
+        loc = dot2(p[0], xa.x, loc);                                         \
+        loc = dot2(p[1], xa.y, loc);                                         \
+        loc = dot2(p[2], xa.z, loc);                                         \
+        loc = dot2(p[3], xa.w, loc);                                         \
+        loc = dot2(p[4], xb.x, loc);                                         \
+        loc = dot2(p[5], xb.y, loc);                                         \
+        loc = dot2(p[6], xb.z, loc);                                         \
+        loc = dot2(p[7], xb.w, loc);                                         \
+        acc[rr] += loc * sscale[kb];                                         \
+      }                                                                      \
+    }                                                                        \
+  } while (0)
+
+  // K walk, peeled by kPf slices so pf's buffer index is a literal.  Invariant
+  // on entry to a body: pf[B] holds slice S0 iff (S0 / kStreamSlice) % kPf==B.
+  int s0 = 0;
+  for (; s0 + kPf * kStreamSlice <= K; s0 += kPf * kStreamSlice) {
+    VLLM_FP8_WHOLEA_M1_SLICE(s0, 0, s0 + kPf * kStreamSlice);
+    VLLM_FP8_WHOLEA_M1_SLICE(s0 + kStreamSlice, 1,
+                             s0 + (kPf + 1) * kStreamSlice);
+    VLLM_FP8_WHOLEA_M1_SLICE(s0 + 2 * kStreamSlice, 2,
+                             s0 + (kPf + 2) * kStreamSlice);
+  }
+  if (s0 < K) {
+    VLLM_FP8_WHOLEA_M1_SLICE(s0, 0, s0 + kPf * kStreamSlice);
+    s0 += kStreamSlice;
+    if (s0 < K) {
+      VLLM_FP8_WHOLEA_M1_SLICE(s0, 1, s0 + kPf * kStreamSlice);
+      s0 += kStreamSlice;
+      if (s0 < K) VLLM_FP8_WHOLEA_M1_SLICE(s0, 2, s0 + kPf * kStreamSlice);
+    }
+  }
+#undef VLLM_FP8_WHOLEA_M1_SLICE
+
+  // Cross-lane reduction; lane 0 owns the row.  Identical to the m1 kernel.
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) {
+    const int row = n0 + warp + rr * nwarp;
+    if (row >= N) continue;
+    float v = acc[rr];
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
+    if (lane == 0) {
+      T o = static_cast<T>(v);
+      if (bias != nullptr) o += static_cast<T>(bias[row]);
+      out[row] = o;
+    }
+  }
+}
+
+// S33 WP1 fix attempt: L2-direct variant of the whole-A kernel.  The LDS
+// variant's A reads are structurally 4-way bank-conflicted (32 B lane stride,
+// 16 B-aligned b128); reading the whole A row straight from GLOBAL (L2-hot
+// across the grid, perfectly coalesced 2 KB per 64-lane wave) removes the LDS
+// traffic entirely.  Same values, same slice/lane/chunk order, same dot2
+// chain -> bit-identical results.  LDS now holds only the folded scales.
+// Gate: VLLM_DCU_FP8_GEMV_WA_L2=1 (with VLLM_DCU_FP8_GEMV_WA=1).
+static bool wholea_l2_enabled() {
+  static const bool on = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_WA_L2");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+template <int RW, typename T>
+__global__ void fp8_emu_gemv_wholea_l2_m1_kernel(
+    const uint8_t* __restrict__ a,      // [1, K] fp16 (W8A16 route)
+    const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
+    const float* __restrict__ w_s,      // [cdiv(N, block_n), nkb]
+    const __half* __restrict__ lut,     // [256]
+    const T* __restrict__ bias,         // [N] | null
+    T* __restrict__ out,                // [1, N]
+    const int N, const int K, const int64_t w_stride, const int rows,
+    const int nkb, const int block_n, const int cpb) {
+  extern __shared__ __align__(16) uint32_t dyn[];
+  float* sscale = reinterpret_cast<float*>(dyn);  // [nkb]
+  __shared__ __half sl[256];
+
+  constexpr int kSliceChunks = kStreamSlice / kStreamChunk;  // W uint4 / slice
+  constexpr int kPf = 3;
+  static_assert(kSliceChunks == 64,
+                "one W uint4 per lane per (row, slice): the traversal order "
+                "below relies on it");
+
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const int lane = t & 63;
+  const int warp = t >> 6;
+  const int nwarp = nt >> 6;
+
+  // One-time staging: LUT + folded scales, then ONE barrier.
+  fp8_lut_stage(sl, lut, nt);
+  {
+    const int n0 = blockIdx.x * rows;
+    const int nb = (int)(((int64_t)n0) / block_n);
+    const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
+    for (int kb = t; kb < nkb; kb += nt) sscale[kb] = wsr[kb];
+  }
+  __syncthreads();  // the only barrier after staging
+
+  const int n0 = blockIdx.x * rows;
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(w);
+
+  float acc[RW];
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) acc[rr] = 0.0f;
+
+  // W chunk pipeline, kPf slices ahead (literal subscripts via the peel).
+  uint4 pf[kPf][RW];
+#pragma unroll
+  for (int pre = 0; pre < kPf; ++pre) {
+    const int sp = pre * kStreamSlice;
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+      const int row = n0 + warp + rr * nwarp;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (row < N && sp + lane * kStreamChunk < K) {
+        v = wv[(((int64_t)row * w_stride) >> 4) + (sp >> 4) + lane];
+      }
+      pf[pre][rr] = v;
+    }
+  }
+
+  // One slice body: identical arithmetic to VLLM_FP8_WHOLEA_M1_SLICE, except
+  // the A fp16 values come straight from global (L2-hot) instead of LDS.
+#define VLLM_FP8_WHOLEA_L2_M1_SLICE(S0, B, REFILL)                           \
+  do {                                                                       \
+    const int s0_ = (S0);                                                    \
+    const int chunks_ = min(kSliceChunks, (K - s0_) >> 4);                   \
+    _Pragma("unroll")                                                        \
+    for (int rr = 0; rr < RW; ++rr) {                                        \
+      const int row = n0 + warp + rr * nwarp;                                \
+      const uint4 vv = pf[B][rr];                                            \
+      uint4 vn = make_uint4(0u, 0u, 0u, 0u);                                 \
+      const int s2_ = (REFILL);                                              \
+      if (s2_ < K && row < N) {                                              \
+        const int chunks2 = min(kSliceChunks, (K - s2_) >> 4);               \
+        if (lane < chunks2) {                                                \
+          vn = wv[(((int64_t)row * w_stride) >> 4) + (s2_ >> 4) + lane];     \
+        }                                                                    \
+      }                                                                      \
+      pf[B][rr] = vn;                                                        \
+      if (row < N && lane < chunks_) {                                       \
+        uint32_t p[8];                                                       \
+        fp8x4_to_f16x2x2(sl, vv.x, p[0], p[1]);                              \
+        fp8x4_to_f16x2x2(sl, vv.y, p[2], p[3]);                              \
+        fp8x4_to_f16x2x2(sl, vv.z, p[4], p[5]);                              \
+        fp8x4_to_f16x2x2(sl, vv.w, p[6], p[7]);                              \
+        const int kb = ((s0_ >> 4) + lane) / cpb;                            \
+        /* A chunk read straight from global (L2-hot, coalesced) */          \
+        const uint4* __restrict__ ap =                                       \
+            reinterpret_cast<const uint4*>(a) + (s0_ >> 3) + lane * 2;       \
+        const uint4 xa = ap[0];                                              \
+        const uint4 xb = ap[1];                                              \
+        float loc = 0.0f;                                                    \
+        loc = dot2(p[0], xa.x, loc);                                         \
+        loc = dot2(p[1], xa.y, loc);                                         \
+        loc = dot2(p[2], xa.z, loc);                                         \
+        loc = dot2(p[3], xa.w, loc);                                         \
+        loc = dot2(p[4], xb.x, loc);                                         \
+        loc = dot2(p[5], xb.y, loc);                                         \
+        loc = dot2(p[6], xb.z, loc);                                         \
+        loc = dot2(p[7], xb.w, loc);                                         \
+        acc[rr] += loc * sscale[kb];                                         \
+      }                                                                      \
+    }                                                                        \
+  } while (0)
+
+  int s0 = 0;
+  for (; s0 + kPf * kStreamSlice <= K; s0 += kPf * kStreamSlice) {
+    VLLM_FP8_WHOLEA_L2_M1_SLICE(s0, 0, s0 + kPf * kStreamSlice);
+    VLLM_FP8_WHOLEA_L2_M1_SLICE(s0 + kStreamSlice, 1,
+                                s0 + (kPf + 1) * kStreamSlice);
+    VLLM_FP8_WHOLEA_L2_M1_SLICE(s0 + 2 * kStreamSlice, 2,
+                                s0 + (kPf + 2) * kStreamSlice);
+  }
+  if (s0 < K) {
+    VLLM_FP8_WHOLEA_L2_M1_SLICE(s0, 0, s0 + kPf * kStreamSlice);
+    s0 += kStreamSlice;
+    if (s0 < K) {
+      VLLM_FP8_WHOLEA_L2_M1_SLICE(s0, 1, s0 + kPf * kStreamSlice);
+      s0 += kStreamSlice;
+      if (s0 < K) VLLM_FP8_WHOLEA_L2_M1_SLICE(s0, 2, s0 + kPf * kStreamSlice);
+    }
+  }
+#undef VLLM_FP8_WHOLEA_L2_M1_SLICE
+
+#pragma unroll
+  for (int rr = 0; rr < RW; ++rr) {
+    const int row = n0 + warp + rr * nwarp;
+    if (row >= N) continue;
+    float v = acc[rr];
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
+    if (lane == 0) {
+      T o = static_cast<T>(v);
+      if (bias != nullptr) o += static_cast<T>(bias[row]);
+      out[row] = o;
+    }
+  }
+}
+
+template <int RW, typename T>
+void launch_gemv_wholea_l2_m1(int N, int K, int64_t w_stride, int rows, int nt,
+                              int nkb, int block_n, int cpb, const uint8_t* A,
+                              const uint8_t* W, const float* w_s,
+                              const __half* lut, const T* bias, T* C,
+                              hipStream_t stream) {
+  const size_t smem = (size_t)nkb * sizeof(float);
+  dim3 grid((N + rows - 1) / rows);
+  dim3 block(nt);
+  fp8_emu_gemv_wholea_l2_m1_kernel<RW, T><<<grid, block, smem, stream>>>(
+      A, W, w_s, lut, bias, C, N, K, w_stride, rows, nkb, block_n, cpb);
+}
+
+template <typename T>
+void dispatch_gemv_wholea_l2_m1(int N, int K, int64_t w_stride, int rows,
+                                int nt, int nkb, int block_n, int cpb,
+                                const uint8_t* A, const uint8_t* W,
+                                const float* w_s, const __half* lut,
+                                const T* bias, T* C, hipStream_t stream) {
+  const int rw = rows / (nt >> 6);
+  if (rw <= 1) {
+    launch_gemv_wholea_l2_m1<1, T>(N, K, w_stride, rows, nt, nkb, block_n,
+                                   cpb, A, W, w_s, lut, bias, C, stream);
+  } else if (rw == 2) {
+    launch_gemv_wholea_l2_m1<2, T>(N, K, w_stride, rows, nt, nkb, block_n,
+                                   cpb, A, W, w_s, lut, bias, C, stream);
+  } else if (rw <= 4) {
+    launch_gemv_wholea_l2_m1<4, T>(N, K, w_stride, rows, nt, nkb, block_n,
+                                   cpb, A, W, w_s, lut, bias, C, stream);
+  } else {
+    launch_gemv_wholea_l2_m1<8, T>(N, K, w_stride, rows, nt, nkb, block_n,
+                                   cpb, A, W, w_s, lut, bias, C, stream);
+  }
+}
+
+template <int RW, typename T>
+void launch_gemv_wholea_m1(int N, int K, int64_t w_stride, int rows, int nt,
+                           int nkb, int block_n, int cpb, const uint8_t* A,
+                           const uint8_t* W, const float* w_s,
+                           const __half* lut, const T* bias, T* C,
+                           hipStream_t stream) {
+  // Whole fp16 A row + the [nkb] folded scales.
+  const size_t smem = (size_t)K * sizeof(__half) + (size_t)nkb * sizeof(float);
+  dim3 grid((N + rows - 1) / rows);
+  dim3 block(nt);
+  fp8_emu_gemv_wholea_m1_kernel<RW, T><<<grid, block, smem, stream>>>(
+      A, W, w_s, lut, bias, C, N, K, w_stride, rows, nkb, block_n, cpb);
+}
+
+// M == 1 dispatch of the whole-A kernel; rows/nt come from
+// `stream_block_select` (the P2 rows override keeps working), so RW mirrors
+// dispatch_gemv_stream_m1.
+template <typename T>
+void dispatch_gemv_wholea_m1(int N, int K, int64_t w_stride, int rows, int nt,
+                             int nkb, int block_n, int cpb, const uint8_t* A,
+                             const uint8_t* W, const float* w_s,
+                             const __half* lut, const T* bias, T* C,
+                             hipStream_t stream) {
+  const int rw = rows / (nt >> 6);
+  if (rw <= 1) {
+    launch_gemv_wholea_m1<1, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  } else if (rw == 2) {
+    launch_gemv_wholea_m1<2, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  } else if (rw <= 4) {
+    launch_gemv_wholea_m1<4, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  } else {
+    launch_gemv_wholea_m1<8, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
+                                W, w_s, lut, bias, C, stream);
+  }
+}
+
+template <int MS, int RW, typename T>
 void launch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows, int nt,
                         int nkb, int block_n, int cpb, bool a16,
                         const uint8_t* A, const uint8_t* W, const float* a_s,
                         const float* w_s, const __half* lut, const T* bias,
                         T* C, hipStream_t stream) {
-  const size_t smem = (size_t)M * K * sizeof(__half) +
+  const size_t smem = (size_t)MS * kStreamSlice * sizeof(__half) +
                       (size_t)M * nkb * sizeof(float);
   dim3 grid((N + rows - 1) / rows);
   dim3 block(nt);
-  fp8_emu_gemv_stream_block_kernel<MS, PREF, T><<<grid, block, smem, stream>>>(
+  fp8_emu_gemv_stream_block_kernel<MS, RW, T><<<grid, block, smem, stream>>>(
       A, W, a_s, w_s, lut, bias, C, M, N, K, w_stride, rows, nkb, block_n,
       cpb, a16 ? 1 : 0);
 }
@@ -816,14 +1520,33 @@ int stream_max_m() {
   return lim;
 }
 
+// P2 A/B knob: rows per block for the streaming kernel, overriding the auto
+// rule in `stream_block_select` (0 = auto).  The slice kernel has no per-row
+// software pipeline left, so the old prefetch knob
+// (VLLM_DCU_FP8_GEMV_PREF, PREF=1/3) retired with it.
+int stream_rows_override() {
+  static const int v = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_STREAM_ROWS");
+    if (e == nullptr) return 0;
+    const int x = std::atoi(e);
+    return (x == 4 || x == 8 || x == 16 || x == 32 || x == 64) ? x : 0;
+  }();
+  return v;
+}
+
 // Streaming path available *and* its geometry chosen.  Returns 0 = none,
 // 1 = variant 1, 2 = variant 2.
 //
 // Variant 1: `rows` divides `block_n` (so a block never straddles a w_s row)
-// and is small enough that the grid still fills the 60 CUs; 512 threads is the
-// block size the probe measured 621 GB/s with.
-// Variant 2 additionally needs exactly 8 warps x RW=8 rows and a block_n that
-// rows=64 divides (its per-warp row ownership is fixed at launch).
+// and the grid still fills the 60 CUs; 512 threads is the block size the
+// probe measured 621 GB/s with.  Its LDS budget is one A slice
+// (`stream_ms_for(M)` * kStreamSlice fp16) plus the folded scales, so M = 8
+// no longer falls out of the path at K = 5120 (the old whole-A tile was
+// M*K*2 = 82 KiB there -- GEMV-OPT-20261025.md P0).
+// Variant 2 additionally stages the *whole* A tile in registers-then-LDS, so
+// its gate is still the full M*K*2 budget, and needs exactly 8 warps x RW=8
+// rows and a block_n that rows=64 divides (its per-warp row ownership is
+// fixed at launch).
 int stream_block_select(int M, int N, int K, int64_t w_stride, int nkb,
                         int block_n, int block_k, int want, int& rows,
                         int& nt) {
@@ -835,31 +1558,41 @@ int stream_block_select(int M, int N, int K, int64_t w_stride, int nkb,
   if ((w_stride % kStreamChunk) != 0) return 0;
   if (block_k < kStreamChunk || (block_k % kStreamChunk) != 0) return 0;
   if (block_n < 8 || (block_n % 8) != 0) return 0;
-  const size_t smem = (size_t)M * K * sizeof(__half) +
-                      (size_t)M * nkb * sizeof(float);
+  const bool want2 = (want == 2 && M <= 4 && (block_n % 64) == 0);
+  const size_t smem =
+      (want2 ? (size_t)M * K * sizeof(__half)
+             : (size_t)stream_ms_for(M) * kStreamSlice * sizeof(__half)) +
+      (size_t)M * nkb * sizeof(float);
   if (smem > stream_smem_limit()) return 0;
-  if (want == 2 && M <= 4 && (block_n % 64) == 0) {
+  if (want2) {
     rows = 64;
     nt = 512;
     return 2;
   }
+  // P2 A/B knob (no rebuild): fixed rows per block; must divide block_n so a
+  // block never straddles a w_s row.  Block size follows rows (one warp per
+  // 8 rows, capped at 512 threads), so rows/nwarp is exact for the kernel's
+  // per-warp W pipeline.
+  const int rows_ov = stream_rows_override();
+  if (rows_ov != 0 && (block_n % rows_ov) == 0) {
+    rows = rows_ov;
+    nt = rows_ov >= 8 ? 512 : rows_ov * 64;
+    return 1;
+  }
   // Load balance beats A-restaging: the perf1 s1 table shows 420-445 GB/s once
   // the grid has ~112+ blocks (N=3584/8704) but only 250-400 GB/s at 64-80
   // blocks (N=1280/4096/5120), because ceil(blocks/60) waves leave CUs idle at
-  // the tail.  Target >= kStreamMinBlocks row-groups, floored at rows=8 so the
-  // per-block A staging stays amortised (it is L2-resident: rows are re-read,
-  // not re-streamed from DRAM).
-  // Measured variant (NOT shipped): 100 puts every production N in the
-  // 112-160 row-group sweet spot (N=3584 back to 43.3/58.9/87.4 us at
-  // M=1/3/4) while keeping the -16..-20% on 4352/4096/5120, at the cost of
-  // a rebuild + full re-verification; left for the next build window.
+  // the tail.  rows=8 (one row per warp at 512 threads, the geometry the
+  // gemv_probe lds_* sweep ran 451 GB/s with at M=8) puts every production N
+  // at 160+ blocks (N=1280 -> 160, N=8704 -> 1088); rows=4 only when 8 would
+  // still leave fewer than kStreamMinBlocks.  The staging cost this re-tunes
+  // is L2-resident: A rows are re-read per block, not re-streamed from DRAM.
   constexpr int kStreamMinBlocks = 120;
-  rows = 64;
-  while (rows > 8 && ((block_n % rows) != 0 ||
-                      (N + rows - 1) / rows < kStreamMinBlocks))
-    rows >>= 1;
-  if ((block_n % rows) != 0) return 0;
-  nt = 512;
+  rows = 8;
+  if ((N + rows - 1) / rows < kStreamMinBlocks && (block_n % 4) == 0 &&
+      (N + 3) / 4 >= kStreamMinBlocks)
+    rows = 4;
+  nt = rows >= 8 ? 512 : rows * 64;
   return 1;
 }
 
@@ -875,44 +1608,46 @@ int stream_block_mode() {
   return mode;
 }
 
-
-// Depth of the W software pipeline; 3 keeps 3 KiB per warp in flight, which is
-// what covers the ~600-cycle DRAM latency at 512 threads/block.  A/B knob, no
-// rebuild needed.
-int stream_prefetch() {
-  static const int p = []() {
-    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_PREF");
-    if (e == nullptr) return 3;
-    return std::atoi(e) == 1 ? 1 : 3;
-  }();
-  return p;
-}
-
 template <typename T>
 void dispatch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows,
                           int nt, int nkb, int block_n, int cpb, bool a16,
-                          int pref, const uint8_t* A, const uint8_t* W,
+                          const uint8_t* A, const uint8_t* W,
                           const float* a_s, const float* w_s,
                           const __half* lut, const T* bias, T* C,
                           hipStream_t stream) {
-#define VLLM_FP8_EMU_GEMV_STREAM_CASE(MS, PREF)                             \
+  // Rows per warp of the W pipeline: the selector pairs `rows` with a block
+  // size of min(512, rows*64), so RW is exact and >= 1.
+  const int rw = rows / (nt >> 6);
+#define VLLM_FP8_EMU_GEMV_STREAM_RW(MS)                                     \
   do {                                                                      \
-    launch_gemv_stream<MS, PREF, T>(M, N, K, w_stride, rows, nt, nkb,       \
-                                    block_n, cpb, a16, A, W, a_s, w_s, lut,  \
-                                    bias, C, stream);                       \
+    if (rw <= 1) {                                                          \
+      launch_gemv_stream<MS, 1, T>(M, N, K, w_stride, rows, nt, nkb,        \
+                                   block_n, cpb, a16, A, W, a_s, w_s, lut,  \
+                                   bias, C, stream);                        \
+      return;                                                               \
+    }                                                                       \
+    if (rw == 2) {                                                          \
+      launch_gemv_stream<MS, 2, T>(M, N, K, w_stride, rows, nt, nkb,        \
+                                   block_n, cpb, a16, A, W, a_s, w_s, lut,  \
+                                   bias, C, stream);                        \
+      return;                                                               \
+    }                                                                       \
+    if (rw <= 4) {                                                          \
+      launch_gemv_stream<MS, 4, T>(M, N, K, w_stride, rows, nt, nkb,        \
+                                   block_n, cpb, a16, A, W, a_s, w_s, lut,  \
+                                   bias, C, stream);                        \
+      return;                                                               \
+    }                                                                       \
+    launch_gemv_stream<MS, 8, T>(M, N, K, w_stride, rows, nt, nkb,          \
+                                 block_n, cpb, a16, A, W, a_s, w_s, lut,    \
+                                 bias, C, stream);                          \
     return;                                                                 \
   } while (0)
-#define VLLM_FP8_EMU_GEMV_STREAM_MS(MS)                                     \
-  do {                                                                      \
-    if (pref == 1) VLLM_FP8_EMU_GEMV_STREAM_CASE(MS, 1);                    \
-    VLLM_FP8_EMU_GEMV_STREAM_CASE(MS, 3);                                   \
-  } while (0)
-  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM_MS(1);
-  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM_MS(2);
-  if (M <= 4) VLLM_FP8_EMU_GEMV_STREAM_MS(4);
-  VLLM_FP8_EMU_GEMV_STREAM_MS(kMsMax);
-#undef VLLM_FP8_EMU_GEMV_STREAM_MS
-#undef VLLM_FP8_EMU_GEMV_STREAM_CASE
+  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM_RW(1);
+  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM_RW(2);
+  if (M <= 4) VLLM_FP8_EMU_GEMV_STREAM_RW(4);
+  VLLM_FP8_EMU_GEMV_STREAM_RW(kMsMax);
+#undef VLLM_FP8_EMU_GEMV_STREAM_RW
 }
 
 // ---------------------------------------------------------------------------
@@ -2196,13 +2931,15 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
            : 0;
   const bool use_stream = (s_mode != 0);
 
-  // Shape-aware decode policy (perf1 s1 table, K=5120): M=1..4 -> streaming
-  // GEMV; M=5..8 -> streaming GEMV only when its LDS budget fits (M*K*2 <=
-  // device LDS), otherwise the tiled GEMM, which is 3-10x faster than the old
-  // GEMV there (M=8: GEMM 245-419 us vs old GEMV 704-3628 us).  cfg 5
-  // (32x64 TM2TN4, 256 threads) wins for N <= 5120 and cfg 10 (same tile at 4
-  // blocks/CU) for wide N; the crossover sits between the measured 5120 and
-  // 8704 points.  Prefill (M > 8) never enters this function.
+  // Shape-aware decode policy (perf1 s1 table, K=5120): the streaming GEMV
+  // covers M = 1..8 whenever its slice-based LDS budget fits (one A slice +
+  // folded scales; GEMV-OPT-20261025.md P0 lifted the old whole-A-tile gate
+  // that pushed M >= 5 onto the tiled GEMM), otherwise the tiled GEMM, which
+  // is 3-10x faster than the old GEMV was (M=8: GEMM 245-419 us vs old GEMV
+  // 704-3628 us).  cfg 5 (32x64 TM2TN4, 256 threads) wins for N <= 5120 and
+  // cfg 10 (same tile at 4 blocks/CU) for wide N; the crossover sits between
+  // the measured 5120 and 8704 points.  Prefill (M > 8) never enters this
+  // function.
   const int decode_cfg = decode_gemm_cfg(N);
   const bool gemv_use_gemm = gemv && !use_stream && M > 4 &&
                              (block_k % kFBk) == 0;
@@ -2243,8 +2980,7 @@ void run_block(const torch::Tensor& a, const torch::Tensor& w,
           dispatch_gemv_stream<T>(M, N, K, w_stride, s_rows, s_nt, nkb,      \
                                   (int)block_n,                              \
                                   (int)(block_k / kStreamChunk), false,      \
-                                  stream_prefetch(), A, W, a_s_p, w_s_p,     \
-                                  lut_p,                                     \
+                                  A, W, a_s_p, w_s_p, lut_p,                 \
                                   reinterpret_cast<const AT*>(bias_ptr),     \
                                   reinterpret_cast<AT*>(out.data_ptr()),     \
                                   stream);                                   \
@@ -2433,7 +3169,35 @@ void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
   do {                                                                       \
     if (gemv && !gemv_use_gemm) {                                            \
       if (use_stream) {                                                      \
-        if (s_mode == 2) {                                                   \
+        if (M == 1 && (stream_m1_enabled() || wholea_enabled())) {           \
+          if (wholea_enabled() && wholea_shape_ok(K, nkb)) {                 \
+            if (wholea_l2_enabled()) {                                       \
+              dispatch_gemv_wholea_l2_m1<T>(                                 \
+                  N, K, w_stride, s_rows, s_nt, nkb, (int)block_n,           \
+                  (int)(block_k / kStreamChunk), A, W, w_s_p, lut_p,         \
+                  reinterpret_cast<const AT*>(bias_ptr),                     \
+                  reinterpret_cast<AT*>(out.data_ptr()), stream);            \
+            } else {                                                         \
+              dispatch_gemv_wholea_m1<T>(N, K, w_stride, s_rows, s_nt, nkb,  \
+                                         (int)block_n,                       \
+                                         (int)(block_k / kStreamChunk), A,   \
+                                         W, w_s_p, lut_p,                    \
+                                         reinterpret_cast<const AT*>(        \
+                                             bias_ptr),                      \
+                                         reinterpret_cast<AT*>(              \
+                                             out.data_ptr()),                \
+                                         stream);                            \
+            }                                                                \
+          } else {                                                           \
+            dispatch_gemv_stream_m1<T>(N, K, w_stride, s_rows, s_nt, nkb,    \
+                                       (int)block_n,                         \
+                                       (int)(block_k / kStreamChunk), A, W,  \
+                                       w_s_p, lut_p,                         \
+                                       reinterpret_cast<const AT*>(bias_ptr),\
+                                       reinterpret_cast<AT*>(out.data_ptr()),\
+                                       stream);                              \
+          }                                                                  \
+        } else if (s_mode == 2) {                                            \
           dispatch_gemv_stream2<T>(M, N, K, w_stride, s_rows, s_nt, nkb,     \
                                    (int)block_n,                            \
                                    (int)(block_k / kStreamChunk), true, A,  \
@@ -2445,8 +3209,7 @@ void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
           dispatch_gemv_stream<T>(M, N, K, w_stride, s_rows, s_nt, nkb,      \
                                   (int)block_n,                              \
                                   (int)(block_k / kStreamChunk), true,       \
-                                  stream_prefetch(), A, W, w_s_p, w_s_p,     \
-                                  lut_p,                                     \
+                                  A, W, w_s_p, w_s_p, lut_p,                 \
                                   reinterpret_cast<const AT*>(bias_ptr),     \
                                   reinterpret_cast<AT*>(out.data_ptr()),     \
                                   stream);                                   \
@@ -2981,9 +3744,8 @@ void dispatch_block_quant(int M, int N, int K, int64_t w_stride,
                                aq_s, w_s, lut, bias, C, stream);
     } else {
       dispatch_gemv_stream<T>(M, N, K, w_stride, s_rows, s_nt, nkb, block_n,
-                              (int)(block_k / kStreamChunk), false,
-                              stream_prefetch(), aq, W, aq_s, w_s, lut, bias, C,
-                              stream);
+                              (int)(block_k / kStreamChunk), false, aq, W,
+                              aq_s, w_s, lut, bias, C, stream);
     }
     return;
   }

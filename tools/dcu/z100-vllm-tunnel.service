@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflare quick tunnel for Z100 vLLM (http://127.0.0.1:8000)
+After=z100-vllm-host.service
+Wants=z100-vllm-host.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/lyh/z100-vllm
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/mnt/game/host-serve/logs/tunnel.log
+StandardError=append:/mnt/game/host-serve/logs/tunnel.log
+
+[Install]
+WantedBy=default.target

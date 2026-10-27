@@ -153,9 +153,9 @@ def run(args) -> int:
     path = os.path.join(args.outdir, args.json)
     if args.json == "perf1_kernel_mprobe.json":
         tag = os.environ.get("VLLM_DCU_FP8_GEMV_STREAM", "unset")
-        pref = os.environ.get("VLLM_DCU_FP8_GEMV_PREF", "unset")
+        rows = os.environ.get("VLLM_DCU_FP8_GEMV_STREAM_ROWS", "unset")
         path = os.path.join(
-            args.outdir, f"perf1_kernel_mprobe_stream{tag}_pref{pref}.json"
+            args.outdir, f"perf1_kernel_mprobe_stream{tag}_rows{rows}.json"
         )
     with open(path, "w") as f:
         json.dump(

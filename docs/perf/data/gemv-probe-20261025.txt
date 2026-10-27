@@ -1,0 +1,17 @@
+N=8704 K=5120, weight bytes 89.1 MB, ref=784 GB/s read / 815 copy
+baseline     ROWS=1  UNROLL=1 NWARP=8   sum    760  dot1    752  dot8    230  dot8pk    201
+rows2        ROWS=2  UNROLL=1 NWARP=8   sum    736  dot1    746  dot8    250  dot8pk    250
+rows4        ROWS=4  UNROLL=1 NWARP=8   sum    730  dot1    734  dot8    323  dot8pk    327
+rows8        ROWS=8  UNROLL=1 NWARP=8   sum    627  dot1    643  dot8    303  dot8pk    306
+unroll2      ROWS=2  UNROLL=2 NWARP=8   sum    737  dot1    753  dot8    249  dot8pk    258
+unroll2      ROWS=4  UNROLL=2 NWARP=8   sum    694  dot1    744  dot8    315  dot8pk    313
+unroll4      ROWS=4  UNROLL=4 NWARP=8   sum    744  dot1    771  dot8    195  dot8pk    336
+nwarp4       ROWS=4  UNROLL=2 NWARP=4   sum    632  dot1    659  dot8    239  dot8pk    242
+nwarp16      ROWS=4  UNROLL=2 NWARP=16  sum    747  dot1    762  dot8    245  dot8pk    253
+rows8w16     ROWS=8  UNROLL=2 NWARP=16  sum    743  dot1    759  dot8    341  dot8pk    351
+-- A staged in LDS, sliced over K (the M=8 fix) --
+lds_m8       ROWS=8  NWARP=8  M=8 SLICE=512  GB/s    451
+lds_m8       ROWS=8  NWARP=8  M=8 SLICE=1024  GB/s    430
+lds_m8       ROWS=16 NWARP=16 M=8 SLICE=512  GB/s    418
+lds_m4       ROWS=8  NWARP=8  M=4 SLICE=512  GB/s    580
+lds_m1       ROWS=8  NWARP=8  M=1 SLICE=512  GB/s    727

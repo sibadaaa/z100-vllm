@@ -114,6 +114,22 @@ export VLLM_DCU_USE_BF16_GEMV=1
 export VLLM_GFX906_ATTN_VERIFY_3D=1
 export VLLM_GFX906_ATTN_FORCE_CAUSAL=0
 
+# S29 WP-A accept-lottery pin (2026-10-25): same as s27_graph_launch.sh -- the
+# accept attractor was a per-process draw; fixing the rocBLAS/HIPBLAS handle
+# workspace pins the accept world (3 restarts x 3 reps -> 1.969 bitwise).
+# s28d tried CUBLAS_WORKSPACE_CONFIG, which rocBLAS ignores.  Rollback: delete.
+export ROCBLAS_WORKSPACE_CONFIG="${ROCBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export HIPBLAS_WORKSPACE_CONFIG="${HIPBLAS_WORKSPACE_CONFIG:-:4096:8}"
+
+# S29 WP-C adoption (2026-10-25, user verdict): FA verify BLOCK_M 8 -> 16.
+# Evidence: docs/result/z100-s29-bm16-ab.md -- step p50 -3.1 ms (89.9 vs 93.1),
+# parity board 16/16 cases zero token flips (within-arm deterministic both
+# arms), 96-token greedy stream bit-identical, max |d top-1 logprob| 0.0213 nat
+# (96-tok) / 0.2255 nat (8-prompt bench, same-token value drift only).
+# Tests: 20 passed + 1 pre-existing failure (unrelated, documented in s28d).
+# Rollback: set 0 (or delete this line).
+export VLLM_GFX906_ATTN_DECODE_BLOCK_M="${VLLM_GFX906_ATTN_DECODE_BLOCK_M:-16}"
+
 # T4 (2026-10-19): long-context prefill split-KV (3D), adopted after controlled arms:
 # cold 36K TTFT -5.53%, hot 36K -7.55%, 32K -2.89%, 14K/16K no regression.
 # Requires the default-inert patch in vllm/v1/attention/ops/triton_unified_attention.py
@@ -122,6 +138,13 @@ export VLLM_GFX906_ATTN_FORCE_CAUSAL=0
 export VLLM_GFX906_TRITON_ATTN_PREFILL_3D="${VLLM_GFX906_TRITON_ATTN_PREFILL_3D:-1}"
 export VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX="${VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX:-16384}"
 export VLLM_GFX906_ATTN_PREFILL_SEGMENTS="${VLLM_GFX906_ATTN_PREFILL_SEGMENTS:-4}"
+
+# WP0.4 policy fingerprint (construction §4 WP0.4): print the *effective* value
+# of every VLLM_DCU_*/VLLM_GFX906_*/VLLM_QWEN35_*/VLLM_S24_*/VLLM_SPEC_* knob
+# plus a sha256[:16] fingerprint, so every A/B report can cite it (G3/C3).
+# `|| true` keeps a broken fingerprint from blocking a production start.
+"${PY}" "${REPO}/tools/dcu/dcu_policy_fingerprint.py" \
+  --prefix "[host-serve] policy: " 2>&1 || true
 
 MODEL="${MODEL:-/mnt/game/models/Qwen3.8-27B-FP8}"
 DRAFT="${DRAFT:-/mnt/game/models/Qwen3.8-27B-DFlash2-ms}"
@@ -150,11 +173,24 @@ MNS_ARGS=(--max-num-seqs "${MAX_SEQS}")
 # docs/result/z100-longctx-vram-optimization-result.md §15.
 KV_ARGS=()
 [ -n "${KV_DTYPE:-}" ] && KV_ARGS=(--kv-cache-dtype "${KV_DTYPE}")
-SPEC="{\"model\":\"${DRAFT}\",\"method\":\"dflash\",\"num_speculative_tokens\":7,\"dtype\":\"bfloat16\",\"kv_cache_dtype\":\"bfloat16\"}"
+# WP0.3: the default is byte-identical to the pre-WP0.3 hardcoded value;
+# a caller may override the whole JSON (e.g. the n-gram upper-bound arm) with
+# SPEC='{"method":"ngram_gpu",...}'.  Kept as a separate variable because a
+# "${SPEC:-{...}}" expansion would mis-parse the JSON braces in bash.
+_DEFAULT_SPEC="{\"model\":\"${DRAFT}\",\"method\":\"dflash\",\"num_speculative_tokens\":7,\"dtype\":\"bfloat16\",\"kv_cache_dtype\":\"bfloat16\"}"
+SPEC="${SPEC:-${_DEFAULT_SPEC}}"
+
+# 2026-10-25: default chat-template kwargs are env-overridable so a host wrapper
+# can start with thinking disabled (content-only replies) without editing this
+# file.  Default stays byte-identical to the previous hardcoded value.
+_DEFAULT_CHAT_TEMPLATE_KWARGS='{"reasoning_effort":"low"}'
+CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS:-${_DEFAULT_CHAT_TEMPLATE_KWARGS}}"
 
 echo "[host-serve] date=$(date -Is) host=$(hostname) user=$(id -un)"
 echo "[host-serve] dcu=$(cat "${DTK_ROOT}/.dtk_version" 2>/dev/null | head -1) python=${PY}"
 echo "[host-serve] model=${MODEL} draft=${DRAFT} tp=4 maxlen=${MAXLEN} mbt=${MBT} util=${UTIL} port=${PORT} iter_details=${ITER_DETAILS}"
+echo "[host-serve] spec=${SPEC}"
+echo "[host-serve] chat_template_kwargs=${CHAT_TEMPLATE_KWARGS}"
 
 mkdir -p "${VLLM_CACHE_ROOT}" 2>/dev/null || true
 
@@ -174,4 +210,4 @@ exec "${PY}" -c 'import torch; from vllm.entrypoints.cli.main import main; main(
   --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
   --override-generation-config '{"temperature":0.7,"repetition_penalty":1.05}' \
-  --default-chat-template-kwargs '{"reasoning_effort":"low"}'
+  --default-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}"

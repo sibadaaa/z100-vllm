@@ -128,6 +128,16 @@ GFX906_DECODE_BLOCK_M_OVERRIDE = _gfx906_env_int(
 GFX906_DECODE_WARPS = _gfx906_env_int("VLLM_GFX906_ATTN_DECODE_WARPS", 0)
 GFX906_DECODE_SEGMENTS = _gfx906_env_int("VLLM_GFX906_ATTN_DECODE_SEGMENTS", 0)
 
+# S28: extend the small-q decode routing beyond the tuned target shape
+# (head 256/GQA6) to the DFlash2 draft tower (head 128/GQA4, 5 sliding-2048
+# layers).  At its 7-token block draft the draft ran the unsplit 2D kernel
+# with grid (2, 2, 1) -- 4 CTAs serially scanning up to 2048 window tokens
+# each, 1234 us/call x 5 layers (graph-A trace); the 3D split-KV path turns
+# that into (4, 2, 64) CTAs.  Kill switch: 0 restores the draft's 2D path.
+ENABLE_GFX906_ATTN_VERIFY_3D_DRAFT = os.getenv(
+    "VLLM_GFX906_ATTN_VERIFY_3D_DRAFT", "1"
+).lower() in {"1", "true", "yes", "on"}
+
 # Lazily grown workspace for the prefill split-KV path. Unlike the decode
 # segment buffers (sized for the decode batch threshold and provided by the
 # backend), prefill needs one row per scheduled token, so the workspace is
@@ -218,6 +228,11 @@ def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
         return GFX906_DECODE_BLOCK_M_OVERRIDE
     if head_size == 256 and num_queries_per_kv == 6:
         return 8
+    # S28: DFlash2 draft shape (8qh/2kvh per rank, head 128, GQA4): 16 rows
+    # = exactly 4 tokens x 4 rows (no padding), so a q-block re-reads the
+    # KV window only twice (BLOCK_M=8 would re-read it four times).
+    if head_size == 128 and num_queries_per_kv == 4:
+        return 16
     return None
 
 
@@ -1328,6 +1343,14 @@ def unified_attention(
     small_q_decode = gfx906_small_q_decode(
         max_seqlen_q, segm_buffers_ready, tuned_decode_shape, gfx906_sched
     )
+    if (
+        small_q_decode
+        and head_size != 256
+        and not ENABLE_GFX906_ATTN_VERIFY_3D_DRAFT
+    ):
+        # S28 kill switch: non-target shapes (the draft tower) keep the
+        # historical 2D path when the draft-side extension is switched off.
+        small_q_decode = False
     decode_block_m = (
         tuned_decode_shape
         if gfx906_sched and (max_seqlen_q == 1 or small_q_decode)
