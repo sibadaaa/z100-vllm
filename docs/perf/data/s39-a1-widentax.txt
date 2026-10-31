@@ -1,0 +1,18 @@
+hipcc_exit=0
+device=Z100L sms=60 l2=8388608
+parity_256codes device_vs_lut: bad=0 (EXACT)
+parity_256codes host_impl_vs_lut: bad=0
+== gate_up [8704,5120] copies=43 grid=1088 block=512
+  K-A raw   median 63.68 us  ->    699.8 GB/s  (p10 63.04 p90 105.76)
+  K-B lut   median 67.20 us  ->    663.2 GB/s  (p10 66.56 p90 105.60)
+  K-C bit   median 141.92 us  ->    314.0 GB/s  (p10 141.76 p90 144.80)
+  K-A2raw+pf  median 64.64 us  ->    689.4 GB/s  (p10 64.16 p90 65.28)
+  K-B2lut+pf  median 142.24 us  ->    313.3 GB/s  (p10 141.76 p90 143.20)
+  K-D flat64  median 75.04 us  ->    593.9 GB/s  (p10 74.72 p90 75.68)
+== o_out [5120,1536] copies=43 grid=640 block=512
+  K-A raw   median 18.56 us  ->    423.7 GB/s  (p10 17.92 p90 18.72)
+  K-B lut   median 21.44 us  ->    366.8 GB/s  (p10 21.12 p90 21.76)
+  K-C bit   median 41.28 us  ->    190.5 GB/s  (p10 41.12 p90 41.76)
+  K-A2raw+pf  median 22.72 us  ->    346.1 GB/s  (p10 22.40 p90 23.04)
+  K-B2lut+pf  median 39.36 us  ->    199.8 GB/s  (p10 39.20 p90 40.00)
+  K-D flat64  median 17.60 us  ->    446.8 GB/s  (p10 17.44 p90 17.76)

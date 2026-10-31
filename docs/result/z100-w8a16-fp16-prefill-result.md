@@ -239,3 +239,62 @@ Qwen3.5 家族在 fp8 下把 checkpoint 的 `in_proj_qkv` + `in_proj_z` 融合�
 臂用了测试内 `_quantize_block`（除法求 scale）而 base 走 `per_token_group_quant_fp8`
 （倒数乘法），16/8192 个激活码翻转导致 0.69% 假失败；改用库量化器做参照后通过。
 内核/宿主代码无问题。
+
+## 7. 2026-10-29 审查修复（测试覆盖 + 防御 gate，零内核改动）
+
+依据 [`docs/design/z100/w8a16/z100-w8a16-review-fix-plan.md`](../design/z100/w8a16/z100-w8a16-review-fix-plan.md)
+闭合代码审查发现的覆盖缺口。核心数值路径（LUT 展宽 + `v_dot2_f32_f16` fp32 累加）未动，
+`.so` 无需重编。
+
+### 7.1 改动
+
+| 项 | 内容 | 文件 |
+|---|---|---|
+| T1 | 4 个 W8A16 端到端用例参数化 `e4m3`/`e5m2`（GEMV / tile GEMM / bias+bf16 / padded stride），e5m2 数据通路首次端到端覆盖 | `tests/kernels/quantization/test_gfx906_fp8_emu.py` |
+| T2 | `_layout_ok` 补 `block_k % 8` gate：exotic `block_k` 提前回退 W8A16 内核，不再白跑一次 C++ `TORCH_CHECK` + warning（防御性，非正确性） | `vllm/model_executor/kernels/linear/scaled_mm/gfx906_fp16_prefill.py` |
+| T3 | wholea / m1 特化（`VLLM_DCU_FP8_GEMV_WA` / `VLLM_DCU_FP8_GEMV_M1`，`.cu` 内 `static const` 进程级只读）维持带外 A/B 验证；测试文件加 TODO 注释说明 env 门控与子进程约束，仅当某开关转默认开时再补子进程 parity 用例 | `tests/kernels/quantization/test_gfx906_fp8_emu.py` |
+| T4 | 本文 §7.3 两条维护提示 | 本文档 |
+
+### 7.2 验收（z100-regress 容器，`HIP_VISIBLE_DEVICES=3`，GPU flock，Triton 3.6.0 gfx906 自建栈）
+
+| 门禁 | 结果 |
+|---|---|
+| `pytest tests/kernels/quantization/test_gfx906_fp8_emu.py` 全文件 | **239 passed / 0 failed**（`.s23/logs/w8a16-reviewfix-pytest.log`；本次改动前收集数 191，T1 参数化 +48） |
+| `-k "w8a16"` 子集 | 102 passed（含 e4m3×48 + e5m2×48 参数化用例 + 6 个非参数化 W8A16 用例） |
+| `-k "prefill"` 子集 | 11 passed（合法 `block_k=128` 路由行为不变） |
+| `_layout_ok` 直测 | `block_k=128, K=512` → True（不变）；`block_k=12, K=528`（旧 gate 放行、C++ 必炸）→ **False** |
+| e5m2 误差记录 | `.s23/logs/w8a16-e5m2-relerr.log`（`.s23/probes/w8a16_e5m2_relerr.py`） |
+
+e5m2 相对误差（`max|err|/max|ref|`，容差 fp32 `1e-5` / fp16 `1e-3` / bf16 `1e-2`）：
+
+| 形状 | e5m2 | e4m3 |
+|---|---|---|
+| GEMV fp32 出（m=1..8） | ≤ 3.4e-07 | ≤ 4.0e-07 |
+| GEMV fp16 出（m=1..8） | ≤ 3.9e-04 | ≤ 3.6e-04 |
+| tile GEMM fp32 出（m=16/64/129/512 × 8 cfg） | 2.6e-07 ~ 4.5e-07 | 2.6e-07 ~ 5.5e-07 |
+| bias + fp16 出（m=17） | 3.5e-04 | 4.4e-04 |
+| bf16 出（m=17） | 2.2e-03 | 2.1e-03 |
+| **全形状最差** | **2.151e-03** | **2.137e-03** |
+
+e4m3 与 e5m2 最差误差同量级（均落在 bf16 末位 cast 的 2^-8 相对舍入内），
+e5m2 与 e4m3 参考吃同一份 `w_q`、唯一差异是 fp32 累加顺序 / 末位 cast——与审查预期一致。
+
+### 7.3 维护提示（审查遗留，勿踩坑）
+
+1. **streaming vs 非 streaming 的标量折叠顺序不同，不能用 `torch.equal` 互卡**：
+   streaming 系列（W8A16 / W8A8 stream GEMV）按 16 元素 chunk 折一次 scale，即
+   `Σ(chunk_sum·s)`；非 streaming GEMV 是整块求和后再乘 scale，即 `(Σblock)·s`。
+   两者浮点舍入顺序不同，逐 bit 比较必然失配（W8A8 既有特性，W8A16 沿用）；
+   A/B 验收请用容差或同路径逐 bit，不要跨路径 `torch.equal`。
+2. **孪生内核需手动同步**：`fp8_emu_gemm_block_w8a16_kernel` 与
+   `fp8_emu_gemm_block_wide2_kernel` 除 A 侧（fp16 直读 vs fp8 LUT 展宽）外逐行一致，
+   `A16Conf` 也复制了 `KConf` 的 `Kw/Kp/MG/NG/NT`。改 wide2 的任何 tiling / 索引 / 折叠
+   bug 修复必须手动镜像到 W8A16 内核，反之亦然；单侧修复不会报错，只会静默分叉。
+
+### 7.4 环境备注
+
+容器系统 Triton（3.4.0）不支持 gfx906：`test_apply_weights_w8a16_full_path` 的 W8A8 臂
+（`per_token_group_quant_fp8` 走 torch.compile）会报
+`error: unsupported target: 'gfx906'`（InductorError），**与内核无关**。验收必须带
+自建栈：容器内 `PYTHONPATH=/src:/mnt/game/triton-gfx906/install`（见
+`tools/dcu/build_triton_gfx906.sh`）；漏掉 `/src` 会 import 到镜像自带旧 vllm。

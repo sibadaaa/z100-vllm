@@ -31,7 +31,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import (
+    tensor_model_parallel_all_reduce_fused_rmsnorm,
+)
+from vllm import envs
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
@@ -1490,6 +1495,47 @@ class Qwen3NextAttention(nn.Module):
         output[:], _ = self.o_proj(attn_output)
 
 
+def _setup_qwen3next_ar_fusion(layer: "Qwen3NextDecoderLayer") -> None:
+    """S38 A1: wire the fused AR+rmsnorm epilogue for one decoder layer
+    (docs/design/z100/s38/z100-s38-design.md §1.2).
+
+    When enabled (env `VLLM_DCU_CUSTOM_AR_FUSION=1`, TP > 1, no layer_scale,
+    dense MLP), the two RowParallelLinear exits of the layer (attention
+    o_proj/out_proj and MLP down_proj) stop reducing on their own
+    (reduce_results=False); the layer forward then fuses each exit's
+    all-reduce with the following add-rmsnorm into a single
+    `vllm.all_reduce_fused_rmsnorm` call (Gemma (1 + w) convention):
+    the attention exit with this layer's post_attention_layernorm and the
+    MLP exit with the NEXT layer's input_layernorm (weight plumbed in by
+    the model loop as `qwen3next_fused_next_norm`; the next layer then
+    skips its input_layernorm via `qwen3next_skip_input_norm`).  With the
+    env off (default) nothing changes: reduce_results stays True and the
+    forward takes the production path.
+    """
+    layer._ar_fusion_eps = layer.post_attention_layernorm.variance_epsilon
+    enabled = False
+    # S38 A1 bisect switch: MLP-exit fusion can be disabled independently
+    # (VLLM_DCU_CUSTOM_AR_FUSION_MLP=0 => attn-exit-only hybrid arm).
+    fusion_mlp = envs.VLLM_DCU_CUSTOM_AR_FUSION_MLP
+    if (
+        envs.VLLM_DCU_CUSTOM_AR_FUSION
+        and get_tensor_model_parallel_world_size() > 1
+        and not layer.layer_scale
+    ):
+        if layer.layer_type == "linear_attention":
+            attn_proj = getattr(layer.linear_attn, "out_proj", None)
+        else:
+            attn_proj = getattr(layer.self_attn, "o_proj", None)
+        down_proj = getattr(layer.mlp, "down_proj", None)
+        if attn_proj is not None and down_proj is not None:
+            attn_proj.reduce_results = False
+            if fusion_mlp:
+                down_proj.reduce_results = False
+            enabled = True
+    layer._ar_fusion = enabled
+    layer._ar_fusion_mlp = enabled and bool(fusion_mlp)
+
+
 class Qwen3NextDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1573,6 +1619,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                 ),
             )
 
+        # S38 A1: fused AR+rmsnorm epilogue (env-gated, default off).
+        _setup_qwen3next_ar_fusion(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1580,9 +1629,20 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        # S38 A1: cross-layer plumbing for the fused AR+rmsnorm epilogue.
+        # qwen3next_skip_input_norm: the previous layer's MLP exit already
+        # fused [down_proj AR + this layer's input_layernorm], so
+        # (hidden_states, residual) arrive ready for the attention block.
+        # qwen3next_fused_next_norm: the weight of the NEXT layer's
+        # input_layernorm; when set, this layer's MLP exit fuses
+        # [down_proj AR + that norm] into one custom op.
+        skip_input_norm = bool(kwargs.pop("qwen3next_skip_input_norm", False))
+        fused_next_norm = kwargs.pop("qwen3next_fused_next_norm", None)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif skip_input_norm:
+            pass
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -1613,7 +1673,23 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._ar_fusion:
+            # S38 A1: o_proj/out_proj runs with reduce_results=False; the
+            # AR is fused with this layer's post_attention_layernorm here
+            # (Gemma (1 + w) convention, residual updated in place).
+            (
+                hidden_states,
+                residual,
+            ) = tensor_model_parallel_all_reduce_fused_rmsnorm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self._ar_fusion_eps,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -1629,6 +1705,29 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states = hidden_states * (
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
+
+        if self._ar_fusion_mlp:
+            if fused_next_norm is not None:
+                # S38 A1: down_proj runs with reduce_results=False; the AR
+                # is fused with the NEXT layer's input_layernorm (the model
+                # loop tells that layer to skip its input_layernorm).
+                (
+                    hidden_states,
+                    residual,
+                ) = tensor_model_parallel_all_reduce_fused_rmsnorm(
+                    hidden_states,
+                    residual,
+                    fused_next_norm,
+                    self._ar_fusion_eps,
+                )
+            else:
+                # Last layer on this rank (or PP boundary): plain AR
+                # restores the production semantics for the model-level
+                # norm / IntermediateTensors consumers.
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # else (attn-only hybrid or production): the MLP output is already
+        # fully reduced inside down_proj (reduce_results=True) -- nothing to
+        # do here.
 
         return hidden_states, residual
 
@@ -1697,17 +1796,46 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         # enters layer j (layer 0 = the embeddings), matching the convention of
         # the other EagleModelMixin models.
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        # S38 A1: cross-layer plumbing for the fused AR+rmsnorm epilogue.
+        # `skip_input_norm` is consumed by the NEXT iteration's layer: it is
+        # True exactly when the previous layer fused [down_proj AR + this
+        # layer's input_layernorm] at its MLP exit.
+        skip_input_norm = False
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
+            fused_next_norm = None
+            if (
+                getattr(layer, "_ar_fusion_mlp", False)
+                and layer_idx + 1 < self.end_layer
+            ):
+                next_norm = getattr(
+                    self.layers[layer_idx + 1], "input_layernorm", None
+                )
+                fused_next_norm = getattr(next_norm, "weight", None)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                qwen3next_skip_input_norm=(
+                    skip_input_norm and envs.VLLM_DCU_CUSTOM_AR_FUSION_SKIP
+                ),
+                qwen3next_fused_next_norm=fused_next_norm,
             )
-            self._maybe_add_hidden_state(
-                aux_hidden_states, layer_idx + 1, hidden_states, residual
-            )
+            skip_input_norm = fused_next_norm is not None
+            if fused_next_norm is not None:
+                # The fused MLP exit leaves residual == the residual stream
+                # after this layer, which is bit-identical to the unfused
+                # hidden + residual sum (same AR quant point and the same
+                # fp32 add, both stored back as fp16) -- record it directly
+                # so the EAGLE/DFlash aux hidden states keep their
+                # production values.
+                if (layer_idx + 1) in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(residual)
+            else:
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, layer_idx + 1, hidden_states, residual
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

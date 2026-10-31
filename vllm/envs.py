@@ -182,6 +182,22 @@ if TYPE_CHECKING:
     # the push path instead of falling back to RCCL. The kernel-side region
     # chunk is 2 MiB, so 256 is safe from the buffer standpoint.
     VLLM_DCU_CUSTOM_AR_MAX_KIB: int = 64
+    # S37 W4: fuse the add-rmsnorm epilogue into the DCU push-AR kernel
+    # (design docs/design/z100/s34/z100-s34-wp4-ar-fusion.md §2-§3). Default
+    # off = zero behavior change; the model layers only route through the
+    # fused path when this is 1 and the per-call shape gates pass.
+    VLLM_DCU_CUSTOM_AR_FUSION: bool = False
+    # S38 A1 bisect switch: 1 (default) = fuse both decoder exits (attn +
+    # mlp, with the next-layer norm skip); 0 = attn-exit fusion only (the
+    # MLP down_proj keeps its own all-reduce).
+    VLLM_DCU_CUSTOM_AR_FUSION_MLP: bool = True
+    # S38 A1 bisect switch: 1 (default) = the layer after a fused MLP exit
+    # skips its input_layernorm; 0 = it runs it anyway (double norm, for
+    # isolating skip-mechanism bugs only).
+    VLLM_DCU_CUSTOM_AR_FUSION_SKIP: bool = True
+    # S38 A1 debug: print the fused op's delta vs the reference math on the
+    # eager (non-captured) path, first 8 calls per rank.
+    VLLM_DCU_CUSTOM_AR_FUSION_DEBUG: bool = False
     # Master switch for the three gfx906 (Z100) emulation kernels: the W8A8
     # INT8 `v_dot4_i32_i8` kernel, the FP8 emulation kernel and the dense
     # fp16/bf16 decode GEMV (see
@@ -214,6 +230,12 @@ if TYPE_CHECKING:
     # "auto" (fp16 -> dot2, bf16 -> fp32), "f32" (exact, bf16 only) or
     # "f16" (bf16 rebased to fp16 + dot2; requires the weight range check).
     VLLM_DCU_BF16_ROUTE: str = "auto"
+    # S40 B1: route M == 1, N >= 2048, K % 128 == 0 fp16 dense GEMVs (the
+    # lm_head shape class) to the streaming-geometry kernel
+    # fp16_gemv_stream_m1 (csrc/rocm/fp8_emu_gemm.cu) instead of the
+    # bf16_emu_gemv dot2 route.  Not bit-identical (different accumulation
+    # order); numeric gate max|delta| <= 3e-4 + the S29 logprob board.
+    VLLM_DCU_FP16_GEMV_STREAM: bool = False
     # Largest M that still takes the GEMV path in the gfx906 scaled-MM
     # emulation kernels (FP8 block-scaled / W8A8 INT8); larger M uses the
     # tiled GEMM.  S18 measurement (tools/dcu/s18_fp8_block_mprobe.py, real
@@ -1551,6 +1573,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCU_CUSTOM_AR_MAX_KIB": lambda: int(
         os.getenv("VLLM_DCU_CUSTOM_AR_MAX_KIB", "64")
     ),
+    # S37 W4: fuse add-rmsnorm into the DCU push-AR kernel epilogue
+    # (docs/design/z100/s34/z100-s34-wp4-ar-fusion.md §2-§3). Default off.
+    "VLLM_DCU_CUSTOM_AR_FUSION": lambda: (
+        os.getenv("VLLM_DCU_CUSTOM_AR_FUSION", "0").lower() in ("true", "1")
+    ),
+    # S38 A1 bisect switch (see the class attr above). Default 1.
+    "VLLM_DCU_CUSTOM_AR_FUSION_MLP": lambda: (
+        os.getenv("VLLM_DCU_CUSTOM_AR_FUSION_MLP", "1").lower()
+        not in ("false", "0")
+    ),
+    # S38 A1 bisect switch (see the class attr above). Default 1.
+    "VLLM_DCU_CUSTOM_AR_FUSION_SKIP": lambda: (
+        os.getenv("VLLM_DCU_CUSTOM_AR_FUSION_SKIP", "1").lower()
+        not in ("false", "0")
+    ),
+    "VLLM_DCU_CUSTOM_AR_FUSION_DEBUG": lambda: (
+        os.getenv("VLLM_DCU_CUSTOM_AR_FUSION_DEBUG", "0").lower()
+        in ("true", "1")
+    ),
     # Master switch for the gfx906 emulation kernels (see the annotation
     # above). Per-kernel switches below override it when set explicitly.
     "VLLM_DCU_USE_GFX906_EMU": lambda: (
@@ -1584,6 +1625,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCU_BF16_ROUTE": lambda: os.getenv(
         "VLLM_DCU_BF16_ROUTE", "auto"
     ).strip().lower(),
+    # S40 B1: fp16 lm_head-class GEMVs take the streaming kernel
+    # (fp16_gemv_stream_m1) when "true"/"1" (see the field annotation).
+    "VLLM_DCU_FP16_GEMV_STREAM": lambda: (
+        os.getenv("VLLM_DCU_FP16_GEMV_STREAM", "False").lower() in
+        ("true", "1")
+    ),
     # gfx906 scaled-MM dispatch threshold (see the annotation on the field).
     "VLLM_DCU_FP8_GEMV_MAX_M": lambda: int(
         os.getenv("VLLM_DCU_FP8_GEMV_MAX_M", "8")

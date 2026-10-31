@@ -1,0 +1,20 @@
+S41 A1 服务 trace(rank3, profile 窗口 40 迭代, 两臂均触发 S38 式楔死=n0/320s,
+trace 40 步完整落盘; 步界破碎使桶中位数不可比, 采纳口径 = 同一总体单发时长)
+A 臂(m1):    fp8_emu_gemv_stream_m1_kernel  9984 发  mean 45.2us  median 43.4us  p10 25.4  p90 72.0
+B 臂(wholea): fp8_emu_gemv_wholea_m1_kernel  9984 发  mean 43.5us  median 40.8us  p10 23.8  p90 68.6
+单发中位: -5.90% 时间 = +6.27% 速率  -> trace 门(+6%) PASS(压线)
+均值口径: -3.66% 时间 = +3.8% 速率(尾部离群拉高均值, 非采纳口径)
+lm_head(fp16 stream, 两臂同): median 808.5/808.8us  与 S40 808.6 一致(设备态稳定)
+内核总账: 全窗口 44067 发/77 类, 两臂唯一差异 = m1<->wholea 互换(9984)
+GEMV 桶/步折算: median 43.4->40.8us x256 发 = 11.11->10.44 ms/step (-0.67 ms)
+  (均值口径 -0.43 ms/step; 设计预期 -0.9~-1.1, 服务折损后 -0.4~-0.7)
+trace 文件: /mnt/game/s30c-prof/s34nospec_rank3.{1793447156597201903(A),1793448006522872837(B)}.pt.trace.json.gz
+
+--- 补充(按 256 发/步重切步界的桶账, 同法两臂, 2026-10-31) ---
+fp8_gemv:  A 11.52 ms/step -> B 11.15 ms/step (per-step busy 中位, -0.37)
+  [三口径汇总: 单发均值 -0.43 / 单发中位 -0.67 / per-step busy -0.37 ms/step]
+push_ar:   A 窗口被楔死污染(9.96, 等对端自旋被拉长, 不可用);
+  B 中位 2.95 ms/step(127 发, 单发中位 14.7us)但逐步 1.8-11.7ms 波动
+  (楔死污染), 干净参考 = S39 账本 3.76 ms/step => 现值 ~3-4 ms/step
+lm_head:   808.5us/发 x1 (两臂同; 上行 "1us" 为打印口径笔误, 0.81ms)
+其余桶(B 臂): bf16_gemv 0.58, attn 1.37, gdn 0.97 ms/step; GPU busy ~20.7 ms/step

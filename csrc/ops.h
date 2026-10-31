@@ -515,6 +515,12 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
 void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
                 torch::stable::Tensor& out, fptr_t reg_buffer,
                 int64_t reg_buffer_sz_bytes);
+void all_reduce_fused(fptr_t _fa, torch::stable::Tensor& inp,
+                      torch::stable::Tensor& out,
+                      torch::stable::Tensor& residual,
+                      torch::stable::Tensor& norm_w, int64_t hidden,
+                      double eps, fptr_t reg_buffer,
+                      int64_t reg_buffer_sz_bytes);
 void custom_all_gather(fptr_t _fa, torch::stable::Tensor& inp,
                        torch::stable::Tensor& out, fptr_t reg_buffer,
                        int64_t reg_buffer_sz_bytes);

@@ -442,6 +442,12 @@ _GFX906_GEMV_NARROW_MAX_N = 4096
 _GFX906_GEMV_AVAILABLE = hasattr(torch.ops, "_rocm_C") and hasattr(
     torch.ops._rocm_C, "bf16_emu_gemv"
 )
+# S40 B1: streaming-geometry fp16 GEMV (fp16_gemv_stream_m1) for the
+# lm_head shape class; only present in .so builds that include it.
+_GFX906_FP16_STREAM_GEMV = (
+    hasattr(torch.ops, "_rocm_C")
+    and hasattr(torch.ops._rocm_C, "fp16_gemv_stream_m1")
+)
 # On gfx11 a weight row stride that is a multiple of 2048 B makes the multi-row global
 # loads of a GEMM collide on the L2/MALL channel hash. Offsetting the stride by one
 # 128 B cache line dodges the collision and keeps each row cache-line aligned.
@@ -611,6 +617,19 @@ def _register_gfx906_dense_gemv() -> None:
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        # S40 B1: the lm_head shape class takes the streaming-geometry
+        # kernel under VLLM_DCU_FP16_GEMV_STREAM=1 (M == 1, N >= 2048,
+        # K % 128 == 0, fp16 operands).  Everything else keeps the
+        # in-service dot2 route unchanged.
+        if (
+            _GFX906_FP16_STREAM_GEMV
+            and envs.VLLM_DCU_FP16_GEMV_STREAM
+            and x.shape[0] == 1
+            and x.dtype == torch.float16
+            and weight.shape[0] >= 2048
+            and weight.shape[1] % 128 == 0
+        ):
+            return torch.ops._rocm_C.fp16_gemv_stream_m1(x, weight, bias, 256)
         return torch.ops._rocm_C.bf16_emu_gemv(
             x,
             weight,

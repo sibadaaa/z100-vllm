@@ -71,3 +71,13 @@ policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完�
   kill -9 后 hy-smi 归零再操作。
 - 验收基线：`runs/specbench/e2e-B-mtp2.json`（贪心流 parity 与基线首 diff @46
   属 batch 形状浮点抖动，verify 本身无损）。
+
+## S39-C1 容量口径(2026-10-31,4 并发验证)
+
+- 单流(M=1)现役:贪心 ~38–39 t/s(W1 96 tok,当日带);TTFT ~0.71 s。
+- 4 路并发(7469-probe,96 tok × 4 流):**聚合 ~76 t/s(×1.95)**,单流
+  16–23 t/s(ITL ~2× solo),TTFT 0.8–2.7 s。
+- 机理:batch M=4 下 stream-GEMV 实测 1.45–1.75× M=1 成本(内核族无 M-flat
+  替代:tile GEMM cfg-35 在 M=4 慢 12×),×1.95 为物理上限而非缺陷。
+- 结论:4 并发是吞吐口径(≈2 倍产能);单流时延口径仅 M=1 独占(现役路径
+  不受任何影响)。数据:`runs/s39/e2e-s39-c1-*.json`;判定:`.s39/c1-close.md`。

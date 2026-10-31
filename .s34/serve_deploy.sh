@@ -25,6 +25,38 @@ export VLLM_DCU_FP8_GEMV_M1=1
 # Default 64 = S33 behavior; 256 validated equal in service but 128 is the
 # microbench sweet spot (push +15.4% @120 KiB, break-even @256 KiB).
 export VLLM_DCU_CUSTOM_AR_MAX_KIB=128
+# 2026-10-30: MTP disabled at operator request (decode-stage re-profile run).
+# Kernel/env stack unchanged (fingerprint e9f6b1ff41e682d6); the ONLY change is
+# no --speculative-config (SPEC_OFF implemented in launch_mtp2.sh, DEPLOY.md
+# contract).  Rollback: comment out the next line + systemctl restart
+# z100-vllm-mtp2 (root) to restore MTP k=2 (~51.6 greedy t/s, warm TTFT 2.4 s).
+export SPEC_OFF=1
+# S39-B1 probe (TEMPORARY, remove after the verdict): one-time log of
+# custom-AR refusals to decide the nccl ring fallback root cause.
+# S38 A1 (temporary ABAB toggle): fuse the DCU push-AR epilogue with the
+# decoder add-rmsnorm (Gemma (1+w) convention) via
+# vllm.all_reduce_fused_rmsnorm.  A arms: uncomment; B arms: comment out.
+# S38 A1 (temporary ABAB toggle): fuse the DCU push-AR epilogue with the
+# decoder add-rmsnorm (Gemma (1+w) convention) via
+# vllm.all_reduce_fused_rmsnorm.  NOT ADOPTED in S38 round 1: the attn-only
+# variant is bit-perfect (parity 8/8) but the two-exit variant corrupts
+# under piecewise compile+capture (eager is clean) -- see .s38/a1-close.md.
+# A arms: uncomment the two exports; B arms (current): keep commented.
+# export VLLM_DCU_CUSTOM_AR_FUSION=1
+# export VLLM_DCU_CUSTOM_AR_FUSION_MLP=0
+# S40-B1 (ADOPTED 2026-10-31): route the lm_head shape class
+# (M == 1, N >= 2048, K % 128 == 0, fp16 dense GEMV) to the streaming
+# fp16_gemv_stream_m1 kernel: 797 vs 709 GB/s (+12.3%, -0.10 ms/step;
+# docs/perf/data/s40-b2-on.txt, docs/perf/data/s40-b0-verdict.md).
+# Rollback: comment the export + systemctl restart (e2e ABAB: no regression;
+# A-vs-B logprob 0.0107 nat, 0 token mismatch; trace 808.6 vs 899.3 us).
+export VLLM_DCU_FP16_GEMV_STREAM=1
+# S41-A1 (ABAB in progress, 2026-10-31): wholea adoption candidate --
+# route M==1 fp8 GEMV to fp8_emu_gemv_wholea_m1_kernel (bit-identical to m1,
+# .s41/a0 dump 7/7 torch.equal green; probe window 643 vs m1-form 582).
+# B arms: keep uncommented.  A arms: comment out + restart.
+# Rollback: comment the export (bit-identical, .so rollback not needed).
+export VLLM_DCU_FP8_GEMV_WA=1
 export MAX_SEQS=4
 export MBT=8192
 export PORT=8000

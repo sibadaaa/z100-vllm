@@ -4450,6 +4450,25 @@ def all_reduce(
     torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
+def all_reduce_fused(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hidden: int,
+    eps: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    # S37 W4: push-AR with a fused add-rmsnorm epilogue (residual updated
+    # in place); see CustomAllreduce.custom_all_reduce_fused.
+    torch.ops._C_custom_ar.all_reduce_fused(
+        fa, inp, out, residual, norm_weight, hidden, eps, reg_buffer,
+        reg_buffer_sz_bytes
+    )
+
+
 def custom_all_gather(
     fa: int,
     inp: torch.Tensor,

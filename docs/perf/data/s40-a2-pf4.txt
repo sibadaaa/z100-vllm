@@ -1,0 +1,14 @@
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+device=Z100L l2=8388608 multiprocessors=60 window=30reps x7 op=prod
+  x = torch.empty(512 * 1024 * 1024, dtype=torch.float16, device="cuda")
+anchor read-only sum(1GiB fp16) win  1353.98us/rep ->   793.0 GB/s
+attn_qkv     [prod  ] copies=43  win    55.08us/rep ->   333.6 GB/s  (win p10 53.03 p90 58.50 us/rep)
+gdn_in_qkv   [prod  ] copies=61  win    41.87us/rep ->   313.5 GB/s  (win p10 41.77 p90 41.95 us/rep)
+gate_up      [prod  ] copies=18  win   109.03us/rep ->   409.1 GB/s  (win p10 108.81 p90 109.13 us/rep)
+gdn_in_z     [prod  ] copies=102 win    30.64us/rep ->   257.1 GB/s  (win p10 30.51 p90 30.74 us/rep)
+attn_o       [prod  ] copies=102 win    34.82us/rep ->   226.3 GB/s  (win p10 34.64 p90 34.86 us/rep)
+gdn_out      [prod  ] copies=102 win    34.99us/rep ->   225.2 GB/s  (win p10 34.72 p90 39.74 us/rep)
+down         [prod  ] copies=36  win    66.49us/rep ->   335.5 GB/s  (win p10 66.34 p90 66.67 us/rep)
+lm_head      [prod  ] copies=3   win   895.18us/rep ->   710.3 GB/s  (win p10 893.44 p90 898.62 us/rep)
+wrote .s40/gemv_bw_win_s40-a2-pf4.json

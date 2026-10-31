@@ -1,0 +1,12 @@
+ctx~ 16384 rep1: warm   18.8s | decode 47 tok ITL p50   26.4 ms min   26.3 max   47.6
+ctx~ 16384 rep2: warm    0.9s | decode 47 tok ITL p50   28.0 ms min   27.7 max   41.7
+ctx~ 16384 p50min   26.4 ms  (reps: 26.4 28.0)
+ctx~ 32768 rep1: warm   30.6s | decode 47 tok ITL p50   29.7 ms min   28.8 max   35.4
+ctx~ 32768 rep2: warm    0.9s | decode 47 tok ITL p50   28.9 ms min   28.8 max   40.9
+ctx~ 32768 p50min   28.9 ms  (reps: 29.7 28.9)
+ctx~ 65536 rep1: warm   97.8s | decode 47 tok ITL p50   33.8 ms min   33.6 max   35.1
+ctx~ 65536 rep2: warm    1.8s | decode 47 tok ITL p50   33.3 ms min   33.1 max   40.9
+ctx~ 65536 p50min   33.3 ms  (reps: 33.8 33.3)
+ctx~131072 rep1: warm    4.9s | decode 47 tok ITL p50   41.8 ms min   41.0 max   46.4
+ctx~131072 rep2: warm    4.9s | decode 47 tok ITL p50   41.8 ms min   41.3 max   44.8
+ctx~131072 p50min   41.8 ms  (reps: 41.8 41.8)

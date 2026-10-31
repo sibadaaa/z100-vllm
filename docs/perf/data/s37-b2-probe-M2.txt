@@ -1,0 +1,13 @@
+[M2] ctx=7469 rep1: warm 19.5s | 96 tok in 4.5s | ITL p50 45.0 ms | tps 8.24 | body_tps 21.75
+[M2] ctx=7469 rep2: warm 2.9s | 96 tok in 4.5s | ITL p50 45.5 ms | tps 8.31 | body_tps 21.97
+[M2] ctx=7469 rep3: warm 2.9s | 96 tok in 4.5s | ITL p50 48.6 ms | tps 8.15 | body_tps 20.69
+[M2] ctx=61440 rep1: warm 137.2s | 256 tok in 8.1s | ITL p50 57.0 ms | tps 3.81 | body_tps 15.63
+[M2] ctx=131072 rep1: warm 10.6s | 256 tok in 12.9s | ITL p50 53.8 ms | tps 3.33 | body_tps 15.11
+[M2] metrics pre:
+  spec_decode_num_draft_tokens_total = 2.0
+  spec_decode_num_drafts_total = 1.0
+[M2] metrics post:
+  spec_decode_num_draft_tokens_total = 323.0
+  spec_decode_num_drafts_total = 182.0
+[M2] delta spec_decode_num_drafts_total = 181
+[M2] delta spec_decode_num_draft_tokens_total = 321

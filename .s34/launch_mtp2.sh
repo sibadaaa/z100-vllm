@@ -57,6 +57,13 @@ DEVICES="${DEVICES:-0,1,2,3}"
 # 1 = 打开 vLLM 逐 iteration 明细日志（--enable-logging-iteration-details）。
 # 需要逐 step 观测/用 vllm-docker-probe 解析 step 级时设 1；默认关，避免生产日志量变大。
 ITER_DETAILS="${ITER_DETAILS:-0}"
+# S38 A1 debug knob: EAGER=1 replaces the piecewise-cudagraph compilation
+# config with --enforce-eager (bisect: capture vs inductor graph handling).
+if [ "${EAGER:-0}" = "1" ]; then
+  EAGER_ARGS=(--enforce-eager)
+else
+  EAGER_ARGS=(--compilation-config '{"cudagraph_mode":"piecewise","cudagraph_capture_sizes":[1,2,4]}')
+fi
 
 export DTK_ROOT
 # env.sh exports its own VLLM_CACHE_ROOT/TRITON_CACHE_DIR defaults, so keep any
@@ -217,7 +224,14 @@ KV_ARGS=()
 # JSON braces in bash.
 _SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":2}'
 SPEC="${SPEC_SET:-${SPEC:-${_SPEC_DEFAULT}}}"
+# 2026-10-30: implement the documented SPEC_OFF contract (DEPLOY.md "SPEC_OFF=1
+# = 无投机（对齐 s33 行为）"): with SPEC_OFF=1 and no explicit SPEC_SET, boot the
+# identical S34 stack WITHOUT --speculative-config.  Rollback: unset SPEC_OFF.
 SPEC_ARGS=()
+if [ "${SPEC_OFF:-0}" = "1" ] && [ -z "${SPEC_SET:-}" ]; then
+  SPEC=""
+  echo "[host-serve] SPEC_OFF=1 -> no --speculative-config (MTP disabled)"
+fi
 [ -n "${SPEC}" ] && SPEC_ARGS=(--speculative-config "${SPEC}")
 
 # 2026-10-25: default chat-template kwargs are env-overridable so a host wrapper
@@ -246,7 +260,7 @@ exec "${PY}" -c 'import torch; from vllm.entrypoints.cli.main import main; main(
   "${MNS_ARGS[@]}" \
   "${KV_ARGS[@]}" \
   "${SPEC_ARGS[@]}" \
-  --compilation-config '{"cudagraph_mode":"piecewise","cudagraph_capture_sizes":[1,2,4]}' \
+  ${EAGER_ARGS+"${EAGER_ARGS[@]}"} \
   --profiler-config '{"profiler":"torch","torch_profiler_dir":"/mnt/game/s30c-prof","torch_profiler_with_stack":false}' \
   --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \

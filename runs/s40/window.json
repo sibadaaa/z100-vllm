@@ -1,0 +1,26 @@
+{
+ "req": {
+  "n": 0,
+  "e2e_s": 319.674,
+  "ttft_s": 0.796
+ },
+ "wall_to_stop_s": 319.675,
+ "traces": [
+  "s34nospec_rank0.1793360594970020927.pt.trace.json.gz",
+  "s34nospec_rank0.1793404514902707232.pt.trace.json.gz",
+  "s34nospec_rank0.1793405011422611559.pt.trace.json.gz",
+  "s34nospec_rank0.1793418038542263121.pt.trace.json.gz",
+  "s34nospec_rank1.1793360595020556874.pt.trace.json.gz",
+  "s34nospec_rank1.1793404514886442107.pt.trace.json.gz",
+  "s34nospec_rank1.1793405011422491288.pt.trace.json.gz",
+  "s34nospec_rank1.1793418038541067153.pt.trace.json.gz",
+  "s34nospec_rank2.1793360594980138845.pt.trace.json.gz",
+  "s34nospec_rank2.1793404514918210816.pt.trace.json.gz",
+  "s34nospec_rank2.1793405011448794298.pt.trace.json.gz",
+  "s34nospec_rank2.1793418038577162916.pt.trace.json.gz",
+  "s34nospec_rank3.1793360594948313044.pt.trace.json.gz",
+  "s34nospec_rank3.1793404514893510331.pt.trace.json.gz",
+  "s34nospec_rank3.1793405011427528091.pt.trace.json.gz",
+  "s34nospec_rank3.1793418038543227299.pt.trace.json.gz"
+ ]
+}

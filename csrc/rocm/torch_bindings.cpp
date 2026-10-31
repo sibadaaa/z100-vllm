@@ -184,6 +184,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "bf16_emu_gemv(Tensor x, Tensor w, Tensor? bias, int nthreads, "
       "int route, bool range_safe) -> Tensor");
   rocm_ops.impl("bf16_emu_gemv", torch::kCUDA, &bf16_emu_gemv);
+
+  // S40 B1: fp16 dense GEMV in the streaming geometry (the lm_head decode
+  // kernel).  Routed by vllm/model_executor/layers/utils.py under
+  // VLLM_DCU_FP16_GEMV_STREAM=1 for M == 1, N >= 2048, K % 128 == 0.
+  rocm_ops.def(
+      "fp16_gemv_stream_m1(Tensor x, Tensor w, Tensor? bias, int nthreads) "
+      "-> Tensor");
+  rocm_ops.impl("fp16_gemv_stream_m1", torch::kCUDA, &fp16_gemv_stream_m1);
 }
 
 // Meta implementations: `torch.compile` / fake tensor propagation needs the
@@ -203,6 +211,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant_x",
                      &fp8_emu_gemm_block_quant_x_meta);
   rocm_meta_ops.impl("bf16_emu_gemv", &bf16_emu_gemv_meta);
+  rocm_meta_ops.impl("fp16_gemv_stream_m1", &fp16_gemv_stream_m1_meta);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

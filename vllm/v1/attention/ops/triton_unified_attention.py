@@ -50,10 +50,17 @@ ENABLE_GFX906_ATTN_PREFILL_3D = os.getenv(
 
 # Upper bound for split-KV segments the decode policy may request. The
 # backend sizes its softmax segment buffers with this value on gfx906.
-# Interleaved sweeps at 8k/32k (tools/dcu/perf1_attn_verify.md) put 128 and
-# 256 within ~11% of each other and 512+ clearly worse, so the cap is not a
-# lever on its own; the win comes from actually reaching this path (below).
-GFX906_MAX_DECODE_SEGMENTS = 128
+# S36 W3 (docs/perf/data/s36-w3-sweep-*.txt): the kernel is
+# parallelism-starved below 128 at long ctx (batch-1 decode grid=(1,1,SEGS):
+# the block count IS the segment count); 32/64 segments regress 64k +10%.
+# S37 A1 ABAB (docs/perf/data/s37-w3-abab-adjudication.txt): 256 vs 128 at
+# 48-token sampling, A->B->A->B interleaved across four instances -- 128k
+# ITL p50 41.8 vs 44.9 ms (-6.8%, both A sides -7.1/-6.5%) with no ctx
+# regressing (16k/32k/64k -2.4/-2.7/-2.6%, all same direction), so the
+# shipped default moves to 256.  Rollback: set the env or revert this line
+# to "128"; buffers follow capacity (256 costs ~+17 MiB/card).
+GFX906_MAX_DECODE_SEGMENTS = int(
+    os.environ.get("VLLM_GFX906_ATTN_DECODE_SEG_MAX") or "256")
 
 # Query-length ceiling up to which a forward pass is treated as decode-shaped.
 # Speculative decoding verifies k+1 tokens per request in one step, so the
@@ -302,7 +309,8 @@ def _decode_num_segments(
         target_grid_size = 4096 if num_queries_per_kv == 1 else 2048
 
     segments = (target_grid_size + base_grid_size - 1) // base_grid_size
-    return min(128, max(16, triton.next_power_of_2(segments)))
+    return min(GFX906_MAX_DECODE_SEGMENTS,
+               max(16, triton.next_power_of_2(segments)))
 
 
 @triton.jit

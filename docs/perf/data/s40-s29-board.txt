@@ -1,0 +1,2 @@
+parity s39-b1-post(in-service baseline) vs s40-b1: max|d top1 logprob|=0.9931 nat at ('probe7469', 12, ' ', '\n') token_seq_mismatch=1 -> FAIL (board 0.2255)
+parity s39-b1-post vs s40-a1(current .so, STREAM=0): max|d top1|=0.9933 nat at ('probe7469', 12, ' ', '\n') mismatch=1 -> FAIL

@@ -128,6 +128,20 @@ torch::Tensor fp8_emu_gemm_block_w8a16_meta(
     std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
     int64_t nthreads, int64_t cfg, int64_t block_n, int64_t block_k);
 
+// S40 B1: fp16 dense GEMV in the streaming geometry (the lm_head shape's
+// decode kernel).  fp16 operands only; M == 1, N >= 2048, K % 128 == 0;
+// nthreads must be 256 (rows = 4, one warp per row, RW = 1).  NOT
+// bit-identical to the bf16_emu_gemv dot2 route (different accumulation
+// order) -- numeric gate is max|delta| <= 3e-4 + the S29 logprob board
+// (docs/perf/data/s40-b0-verdict.md).
+torch::Tensor fp16_gemv_stream_m1(torch::Tensor x, torch::Tensor w,
+                                  std::optional<torch::Tensor> bias,
+                                  int64_t nthreads);
+
+torch::Tensor fp16_gemv_stream_m1_meta(torch::Tensor x, torch::Tensor w,
+                                       std::optional<torch::Tensor> bias,
+                                       int64_t nthreads);
+
 // Materialize one layer's fp8 weight (times its block scales) into fp16,
 // keeping the [N, K] row order so the caller can hand `out.t()` to a row-major
 // GEMM.  In-place on `out`; no allocation, so the buffer can be reused across

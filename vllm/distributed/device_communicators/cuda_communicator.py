@@ -445,6 +445,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_fused(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """S37 W4: push-AR + fused add-rmsnorm via the custom-AR comm.
+
+        Returns (out, residual) or None when the fused path is unavailable;
+        the caller then runs the plain all-reduce + separate norm kernel.
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is None:
+            return None
+        return ca_comm.custom_all_reduce_fused(input_, residual, norm_weight,
+                                               eps)
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:
