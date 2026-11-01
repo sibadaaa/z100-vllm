@@ -1291,16 +1291,42 @@ int wholea_enabled() {
   return on;
 }
 
+// S45 N2a: one fp16 lane of the production SiluAndMul
+// (model_executor/layers/activation.py:178 forward_native):
+// s32 = silu_fp32(f32(g16)); out16 = fp16(s32 * f32(u16)).
+// `expf` must match the inductor kernel's libdevice.exp bit-for-bit; the
+// torch.equal parity gate (.s45/n2a_parity.py) is the arbiter.
+__device__ __forceinline__ uint32_t silu_mul_h2(uint32_t gp, uint32_t up) {
+  const __half2 gh = *reinterpret_cast<const __half2*>(&gp);
+  const __half2 uh = *reinterpret_cast<const __half2*>(&up);
+  const float2 gf = __half22float2(gh);
+  const float2 uf = __half22float2(uh);
+  const float sx = gf.x / (1.0f + expf(-gf.x)) * uf.x;
+  const float sy = gf.y / (1.0f + expf(-gf.y)) * uf.y;
+  const __half2 rh = __floats2half2_rn(sx, sy);
+  return *reinterpret_cast<const uint32_t*>(&rh);
+}
+
+__device__ __forceinline__ uint4 silu_mul_u4(uint4 g, uint4 u) {
+  uint4 r;
+  r.x = silu_mul_h2(g.x, u.x);
+  r.y = silu_mul_h2(g.y, u.y);
+  r.z = silu_mul_h2(g.z, u.z);
+  r.w = silu_mul_h2(g.w, u.w);
+  return r;
+}
+
 template <int RW, typename T>
 __global__ void fp8_emu_gemv_wholea_m1_kernel(
-    const uint8_t* __restrict__ a,      // [1, K] fp16 (W8A16 route)
+    const uint8_t* __restrict__ a,      // [1, K] fp16 (W8A16 route); smul=1:
+                                        // [1, 2K] gate_up output (g|u halves)
     const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
     const float* __restrict__ w_s,      // [cdiv(N, block_n), nkb]
     const __half* __restrict__ lut,     // [256]
     const T* __restrict__ bias,         // [N] | null
     T* __restrict__ out,                // [1, N]
     const int N, const int K, const int64_t w_stride, const int rows,
-    const int nkb, const int block_n, const int cpb) {
+    const int nkb, const int block_n, const int cpb, const int smul) {
   extern __shared__ __align__(16) uint32_t dyn[];
   __half* sA = reinterpret_cast<__half*>(dyn);         // [K] whole A row
   float* sscale = reinterpret_cast<float*>(sA + K);    // [nkb]
@@ -1324,7 +1350,14 @@ __global__ void fp8_emu_gemv_wholea_m1_kernel(
     const uint4* __restrict__ av = reinterpret_cast<const uint4*>(a);
     uint4* __restrict__ sv = reinterpret_cast<uint4*>(sA);
     const int kv = K >> 3;  // fp16 uint4s in the row (stream gate: K % 16 == 0)
-    for (int v = t; v < kv; v += nt) sv[v] = av[v];
+    for (int v = t; v < kv; v += nt) {
+      uint4 g = av[v];
+      // smul: fold the SiluAndMul into staging -- A[k] = silu(a[k]) * a[K+k]
+      // reads the gate half at [0, K) and the up half at [K, 2K) of the same
+      // row; the staged fp16 bits equal the materialized act exactly.
+      if (smul) g = silu_mul_u4(g, av[v + kv]);
+      sv[v] = g;
+    }
     const int n0 = blockIdx.x * rows;
     const int nb = (int)(((int64_t)n0) / block_n);
     const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
@@ -1632,13 +1665,13 @@ void launch_gemv_wholea_m1(int N, int K, int64_t w_stride, int rows, int nt,
                            int nkb, int block_n, int cpb, const uint8_t* A,
                            const uint8_t* W, const float* w_s,
                            const __half* lut, const T* bias, T* C,
-                           hipStream_t stream) {
+                           hipStream_t stream, const int smul = 0) {
   // Whole fp16 A row + the [nkb] folded scales.
   const size_t smem = (size_t)K * sizeof(__half) + (size_t)nkb * sizeof(float);
   dim3 grid((N + rows - 1) / rows);
   dim3 block(nt);
   fp8_emu_gemv_wholea_m1_kernel<RW, T><<<grid, block, smem, stream>>>(
-      A, W, w_s, lut, bias, C, N, K, w_stride, rows, nkb, block_n, cpb);
+      A, W, w_s, lut, bias, C, N, K, w_stride, rows, nkb, block_n, cpb, smul);
 }
 
 // M == 1 dispatch of the whole-A kernel; rows/nt come from
@@ -1649,20 +1682,20 @@ void dispatch_gemv_wholea_m1(int N, int K, int64_t w_stride, int rows, int nt,
                              int nkb, int block_n, int cpb, const uint8_t* A,
                              const uint8_t* W, const float* w_s,
                              const __half* lut, const T* bias, T* C,
-                             hipStream_t stream) {
+                             hipStream_t stream, const int smul = 0) {
   const int rw = rows / (nt >> 6);
   if (rw <= 1) {
     launch_gemv_wholea_m1<1, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
-                                W, w_s, lut, bias, C, stream);
+                                W, w_s, lut, bias, C, stream, smul);
   } else if (rw == 2) {
     launch_gemv_wholea_m1<2, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
-                                W, w_s, lut, bias, C, stream);
+                                W, w_s, lut, bias, C, stream, smul);
   } else if (rw <= 4) {
     launch_gemv_wholea_m1<4, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
-                                W, w_s, lut, bias, C, stream);
+                                W, w_s, lut, bias, C, stream, smul);
   } else {
     launch_gemv_wholea_m1<8, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
-                                W, w_s, lut, bias, C, stream);
+                                W, w_s, lut, bias, C, stream, smul);
   }
 }
 
@@ -4398,6 +4431,90 @@ torch::Tensor fp8_emu_gemm_block_w8a16_meta(
     std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
     int64_t /*nthreads*/, int64_t /*cfg*/, int64_t /*block_n*/,
     int64_t /*block_k*/) {
+  return a.new_empty({a.size(0), w.size(0)}, a.options().dtype(out_dtype));
+}
+
+// ---------------------------------------------------------------------------
+// S45 N2a: W8A16 down-projection GEMV with the SiluAndMul activation folded
+// into the whole-A staging.  `a` is the gate_up output row [1, 2K] (g|u
+// halves, K = act width); the wholea_m1 kernel stages
+// A[k] = silu16(a[k]) * a[K+k], which is bit-identical to materializing the
+// fp16 act (the production SiluAndMul) and running the plain kernel -- the
+// torch.equal parity gate (.s45/n2a_parity.py) is the arbiter of the one
+// risky identity (device expf vs the inductor kernel's libdevice.exp).
+// Eligibility mirrors run_block_w8a16's M == 1 wholea arm exactly; anything
+// else fails loudly (the python route never dispatches those shapes here).
+// ---------------------------------------------------------------------------
+torch::Tensor fp8_emu_gemm_block_w8a16_smul(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t block_n, int64_t block_k) {
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu_block_w8a16_smul: a and w must be 2-D, got ", a.dim(),
+              " and ", w.dim());
+  const int64_t K2 = a.size(1);
+  TORCH_CHECK(a.size(0) == 1, "fp8_emu_block_w8a16_smul: M == 1 only, got ",
+              a.size(0));
+  TORCH_CHECK(K2 % 2 == 0, "fp8_emu_block_w8a16_smul: a.size(1) must be even");
+  auto a_view = a.narrow(/*dim=*/1, /*start=*/0, /*length=*/K2 / 2);
+  const int M = 1;
+  const int N = (int)w.size(0);
+  const int K = (int)(K2 / 2);
+
+  TORCH_CHECK(wholea_enabled(),
+              "fp8_emu_block_w8a16_smul: requires VLLM_DCU_FP8_GEMV_WA=1");
+  TORCH_CHECK(!wholea_l2_enabled(),
+              "fp8_emu_block_w8a16_smul: the WA_L2 variant has no smul arm");
+  int64_t w_stride = 0;
+  int nkb = 0;
+  check_block_w8a16(a_view, w, w_s, lut, bias, out_dtype, block_n, block_k,
+                    w_stride, nkb);
+  int s_rows = 0, s_nt = 0;
+  const int s_mode =
+      stream_block_select(M, N, K, w_stride, nkb, (int)block_n, (int)block_k,
+                          stream_block_mode(), s_rows, s_nt);
+  TORCH_CHECK(s_mode != 0,
+              "fp8_emu_block_w8a16_smul: shape not on the streaming path");
+  TORCH_CHECK(wholea_shape_ok(K, nkb),
+              "fp8_emu_block_w8a16_smul: wholea LDS gate rejected K=", K);
+
+  const c10::cuda::CUDAGuard guard(a.device());
+  auto out = at::empty({M, N}, a.options().dtype(out_dtype));
+  const void* bias_ptr = nullptr;
+  if (bias.has_value() && bias->defined()) bias_ptr = bias->data_ptr();
+  const uint8_t* A = reinterpret_cast<const uint8_t*>(a_view.data_ptr());
+  const uint8_t* W = reinterpret_cast<const uint8_t*>(w.data_ptr());
+  const float* w_s_p = reinterpret_cast<const float*>(w_s.data_ptr());
+  const __half* lut_p = reinterpret_cast<const __half*>(lut.data_ptr());
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  switch (out_dtype) {
+    case at::kBFloat16:
+      dispatch_gemv_wholea_m1<at::BFloat16>(
+          N, K, w_stride, s_rows, s_nt, nkb, (int)block_n,
+          (int)(block_k / kStreamChunk), A, W, w_s_p, lut_p,
+          reinterpret_cast<const at::BFloat16*>(bias_ptr),
+          reinterpret_cast<at::BFloat16*>(out.data_ptr()), stream, /*smul=*/1);
+      break;
+    case at::kHalf:
+      dispatch_gemv_wholea_m1<at::Half>(
+          N, K, w_stride, s_rows, s_nt, nkb, (int)block_n,
+          (int)(block_k / kStreamChunk), A, W, w_s_p, lut_p,
+          reinterpret_cast<const at::Half*>(bias_ptr),
+          reinterpret_cast<at::Half*>(out.data_ptr()), stream, /*smul=*/1);
+      break;
+    default:
+      TORCH_CHECK(false, "fp8_emu_block_w8a16_smul: unsupported out_dtype");
+  }
+  return out;
+}
+
+torch::Tensor fp8_emu_gemm_block_w8a16_smul_meta(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t /*nthreads*/, int64_t /*block_n*/, int64_t /*block_k*/) {
+  TORCH_CHECK(a.dim() == 2 && a.size(1) % 2 == 0,
+              "fp8_emu_block_w8a16_smul: a must be [1, 2K]");
   return a.new_empty({a.size(0), w.size(0)}, a.options().dtype(out_dtype));
 }
 

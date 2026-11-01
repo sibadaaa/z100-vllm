@@ -151,6 +151,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("fp8_emu_gemm_block_w8a16", torch::kCUDA,
                 &fp8_emu_gemm_block_w8a16);
 
+  // S45 N2a: W8A16 M==1 down-projection GEMV with the SiluAndMul activation
+  // folded into the whole-A staging (`a` = gate_up output [1, 2K]).  Gated in
+  // python by VLLM_DCU_W8A16_SILU_MUL, default off.
+  rocm_ops.def(
+      "fp8_emu_gemm_block_w8a16_smul(Tensor a, Tensor w, Tensor w_s, "
+      "Tensor lut, Tensor? bias, ScalarType out_dtype, int nthreads, "
+      "int block_n, int block_k) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemm_block_w8a16_smul", torch::kCUDA,
+                &fp8_emu_gemm_block_w8a16_smul);
+
   // Materialize one layer's fp8 weight * block scales into an fp16 scratch kept
   // in [N, K] row order (the prefill fp16 route consumes out.t()).  In-place on
   // `out` so the caller can reuse one buffer across layers.
@@ -206,6 +216,8 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
   rocm_meta_ops.impl("fp8_emu_gemm_block", &fp8_emu_gemm_block_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_w8a16",
                      &fp8_emu_gemm_block_w8a16_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm_block_w8a16_smul",
+                     &fp8_emu_gemm_block_w8a16_smul_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant",
                      &fp8_emu_gemm_block_quant_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant_x",

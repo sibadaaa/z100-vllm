@@ -34,9 +34,14 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2MoeConfig
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -114,8 +119,40 @@ class Qwen2MoeMLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
+        # S45 N2a (z100): fold the SiluAndMul activation into the W8A16
+        # down_proj GEMV's whole-A staging (M == 1 decode arm; bit-identical,
+        # torch.equal gate).  Opt-in via VLLM_DCU_W8A16_SILU_MUL; the branch
+        # requires the fp8-block down_proj params the z100 kernel consumes and
+        # the registered opaque op (which owns the runtime-M decision, so the
+        # traced graph stays M-agnostic).  Anything else takes the production
+        # path unchanged.
+        w_s = getattr(self.down_proj, "weight_scale_inv", None)
+        if (
+            envs.VLLM_DCU_W8A16_SILU_MUL
+            and w_s is not None
+            and gate_up.is_contiguous()
+            and gate_up.shape[-1] % 2 == 0
+            and hasattr(torch.ops.vllm, "gfx906_w8a16_silu_mul_down")
+        ):
+            out = torch.ops.vllm.gfx906_w8a16_silu_mul_down(
+                gate_up,
+                self.down_proj.weight,
+                w_s,
+                self.down_proj.bias,
+                x.dtype,
+                self.down_proj.weight.shape[0] // w_s.shape[0],
+                self.down_proj.weight.shape[1] // w_s.shape[1],
+                1,
+            )
+            # RowParallelLinear semantics: the fused GEMV produces the local
+            # partial sum; the production path reduces it here.
+            if self.down_proj.reduce_results and (
+                get_tensor_model_parallel_world_size() > 1
+            ):
+                out = tensor_model_parallel_all_reduce(out)
+        else:
+            out = self.act_fn(gate_up)
+            out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
             out = F.sigmoid(self.expert_gate(x)[0]) * out

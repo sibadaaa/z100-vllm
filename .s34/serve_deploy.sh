@@ -54,6 +54,19 @@ export SPEC_OFF=1
 # pre-S44 path; .so unchanged, md5 54ccf2e2).
 export VLLM_DCU_CUSTOM_AR_FUSION=1
 export VLLM_DCU_CUSTOM_AR_FUSION_MLP=0
+# S45-N2a (ADOPTED 2026-11-01): fold the MLP SiluAndMul activation into the
+# W8A16 down_proj wholea_m1 GEMV's whole-A staging (M == 1 decode arm).
+# Bit-identical: torch.equal parity max|d|=0 (.s45/n2a_parity.py), service
+# token stream identical to the unfused arm (board first_div=None), the
+# mul_silu kernel leaves the ledger (-47 launches/step).  Requires the
+# rebuilt _rocm_C (md5 6dee7fad; backup _rocm_C.s44-before.so = f72bb39d).
+# Rollback: comment the export + systemctl restart (env-off = bitwise
+# pre-S45 path; with the old .so also restored, fully pre-S45).
+export VLLM_DCU_W8A16_SILU_MUL=1
+# NOTE (S45 audit, DO NOT SET): VLLM_QWEN35_EMPTY_CORE_ATTN_OUT=1 forks the
+# greedy stream -- gdn_attention_core leaves elements of core_attn_out
+# unwritten and downstream reads them; the torch.zeros is load-bearing
+# (upstream PR 28182).  See .s45/s45-adopt.md §2.
 # S40-B1 (ADOPTED 2026-10-31): route the lm_head shape class
 # (M == 1, N >= 2048, K % 128 == 0, fp16 dense GEMV) to the streaming
 # fp16_gemv_stream_m1 kernel: 797 vs 709 GB/s (+12.3%, -0.10 ms/step;

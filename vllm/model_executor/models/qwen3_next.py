@@ -118,6 +118,13 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# S45 zero-fill audit: same switch as gdn_linear_attn's
+# ENABLE_QWEN35_EMPTY_CORE_ATTN_OUT -- torch.empty for core_attn_out is only
+# safe when the core op writes every position (no padded tail).
+ENABLE_EMPTY_CORE_ATTN_OUT = os.getenv(
+    "VLLM_QWEN35_EMPTY_CORE_ATTN_OUT", "0"
+).lower() in {"1", "true", "yes", "on"}
+
 
 def _gdn_recurrent_state_to_cache(state: torch.Tensor) -> torch.Tensor:
     """Convert GDN operator state ``[N, H, K, V]`` to cache ``[N, H, V, K]``."""
@@ -616,13 +623,48 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        # Note: we should not use torch.empty here like other attention
+        # backends, see discussions in
+        # https://github.com/vllm-project/vllm/pull/28182 -- the core op may
+        # leave tail positions unwritten when the batch is padded.
+        # S45 zero-fill audit: at decode this zeros is 48 launches/step of
+        # pure overhead (the buffer is [num_tokens, v_heads, head_dim], a few
+        # KB).  When there is no padding (num_actual_tokens == num_tokens)
+        # every position is written, so empty is safe; gated by the same
+        # VLLM_QWEN35_EMPTY_CORE_ATTN_OUT switch the gdn_linear_attn path
+        # uses.  Default off = production unchanged.
+        use_empty_core_out = False
+        if ENABLE_EMPTY_CORE_ATTN_OUT:
+            try:
+                md = get_forward_context().attn_metadata
+                # The context carries either one dict keyed by layer prefix or
+                # a list of such dicts (one per kv-cache group).
+                lm = None
+                if isinstance(md, dict):
+                    lm = md.get(self.prefix)
+                elif isinstance(md, (list, tuple)):
+                    for d in md:
+                        if isinstance(d, dict) and self.prefix in d:
+                            lm = d[self.prefix]
+                            break
+                use_empty_core_out = (
+                    isinstance(lm, GDNAttentionMetadata)
+                    and lm.num_actual_tokens == num_tokens
+                )
+            except Exception:
+                use_empty_core_out = False
+        if use_empty_core_out:
+            core_attn_out = torch.empty(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,

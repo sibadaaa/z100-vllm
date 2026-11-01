@@ -59,6 +59,22 @@ journalctl -u z100-vllm-mtp2 -f
 > `docs/result/z100-s34-final.md`；长上下文曲线与 S35 移交项：
 > `docs/result/z100-s34-wp6-longctx.md`。
 
+## S45-N2a 采纳:SiluAndMul 折进 W8A16 down_proj GEMV(2026-11-01)
+
+| env | 值 | 作用 |
+|---|---|---|
+| **VLLM_DCU_W8A16_SILU_MUL** | **1** | **S45-N2a:MLP 激活折入 wholea_m1 整行 staging(M=1 decode;位同,已采纳)** |
+
+- 证据:`.s45/n2a_parity.py` torch.equal max\|d\|=0;board first_div=None;
+  `mul_silu` 内核出账(−47 发/step);`.s45/s45-adopt.md`。
+- **`.so` 变更**:`_rocm_C` md5 `f72bb39d` → `6dee7fad`(smul 变体;原路径
+  逐位不变)。回滚 = 注释本行 + restart + 恢复
+  `.r3/so-backup/_rocm_C.s44-before.so`。
+- **禁令(S45 审计)**:勿设 `VLLM_QWEN35_EMPTY_CORE_ATTN_OUT=1`——
+  core_attn_out 的 zeros 承重(empty 使贪心流分叉,op 有未写元素被下游读)。
+- S45 空隙归因:5.38 ms/step GPU 空闲在 piecewise 图段边界(92%),
+  是下一轮(host 侧)的主池子。
+
 policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完全一致
 （MTP 只经 CLI 传参，不动任何 VLLM_* 环境旋钮）。
 

@@ -128,6 +128,20 @@ torch::Tensor fp8_emu_gemm_block_w8a16_meta(
     std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
     int64_t nthreads, int64_t cfg, int64_t block_n, int64_t block_k);
 
+// S45 N2a: W8A16 M==1 GEMV with the SiluAndMul activation folded into the
+// wholea_m1 whole-A staging.  `a` is the gate_up output [1, 2K] (g|u halves);
+// requires the wholea W8A16 arm (VLLM_DCU_FP8_GEMV_WA=1, WA_L2 off, the
+// streaming shape gate) and fails loudly otherwise.
+torch::Tensor fp8_emu_gemm_block_w8a16_smul(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t block_n, int64_t block_k);
+
+torch::Tensor fp8_emu_gemm_block_w8a16_smul_meta(
+    torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
+    std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
+    int64_t nthreads, int64_t block_n, int64_t block_k);
+
 // S40 B1: fp16 dense GEMV in the streaming geometry (the lm_head shape's
 // decode kernel).  fp16 operands only; M == 1, N >= 2048, K % 128 == 0;
 // nthreads must be 256 (rows = 4, one warp per row, RW = 1).  NOT

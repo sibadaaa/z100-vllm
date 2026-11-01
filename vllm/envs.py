@@ -198,6 +198,12 @@ if TYPE_CHECKING:
     # S38 A1 debug: print the fused op's delta vs the reference math on the
     # eager (non-captured) path, first 8 calls per rank.
     VLLM_DCU_CUSTOM_AR_FUSION_DEBUG: bool = False
+    # S45 N2a: fold the MLP SiluAndMul activation into the W8A16 down_proj
+    # wholea_m1 GEMV's whole-A staging (M == 1 decode only; the gate_up GEMV
+    # output [1, 2K] feeds the kernel directly and the act is never
+    # materialized).  Bit-identical to the unfused path (torch.equal gate);
+    # default off = zero behavior change.
+    VLLM_DCU_W8A16_SILU_MUL: bool = False
     # Master switch for the three gfx906 (Z100) emulation kernels: the W8A8
     # INT8 `v_dot4_i32_i8` kernel, the FP8 emulation kernel and the dense
     # fp16/bf16 decode GEMV (see
@@ -1591,6 +1597,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCU_CUSTOM_AR_FUSION_DEBUG": lambda: (
         os.getenv("VLLM_DCU_CUSTOM_AR_FUSION_DEBUG", "0").lower()
         in ("true", "1")
+    ),
+    # S45 N2a (see the class attr above). Default 0.
+    "VLLM_DCU_W8A16_SILU_MUL": lambda: (
+        os.getenv("VLLM_DCU_W8A16_SILU_MUL", "0").lower() in ("true", "1")
     ),
     # Master switch for the gfx906 emulation kernels (see the annotation
     # above). Per-kernel switches below override it when set explicitly.
