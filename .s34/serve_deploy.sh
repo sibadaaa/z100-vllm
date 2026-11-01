@@ -44,6 +44,16 @@ export SPEC_OFF=1
 # A arms: uncomment the two exports; B arms (current): keep commented.
 # export VLLM_DCU_CUSTOM_AR_FUSION=1
 # export VLLM_DCU_CUSTOM_AR_FUSION_MLP=0
+# S44-A4 (ADOPTED 2026-11-01): attn-exit push-AR + add-rmsnorm fusion (hybrid
+# arm, MLP exit unfused).  B/A/B/A e2e: W1 41.73/40.70 (B) vs 40.03/39.59 (A)
+# t/s (+4.25%/+2.81% paired, both >= +2% gate); norm class-ledger 1.635 ->
+# 0.392 ms/step; TTFT delta within intra-A-arm spread.  The two-exit (full)
+# variant is FAIL (garbage under piecewise capture, S38 corruption reproduced:
+# docs/perf/data/s44-a0-debug.txt) and MUST stay off (FUSION_MLP=0).
+# Rollback: comment the two exports + systemctl restart (env-off = bitwise
+# pre-S44 path; .so unchanged, md5 54ccf2e2).
+export VLLM_DCU_CUSTOM_AR_FUSION=1
+export VLLM_DCU_CUSTOM_AR_FUSION_MLP=0
 # S40-B1 (ADOPTED 2026-10-31): route the lm_head shape class
 # (M == 1, N >= 2048, K % 128 == 0, fp16 dense GEMV) to the streaming
 # fp16_gemv_stream_m1 kernel: 797 vs 709 GB/s (+12.3%, -0.10 ms/step;

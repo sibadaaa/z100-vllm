@@ -62,6 +62,24 @@ journalctl -u z100-vllm-mtp2 -f
 policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完全一致
 （MTP 只经 CLI 传参，不动任何 VLLM_* 环境旋钮）。
 
+## S44-A4 采纳：attn 出口 push-AR+rmsnorm 融合（2026-11-01）
+
+| env | 值 | 作用 |
+|---|---|---|
+| **VLLM_DCU_CUSTOM_AR_FUSION** | **1** | **S44 attn 出口 AR+add-rmsnorm 融合（混合臂，已采纳）** |
+| **VLLM_DCU_CUSTOM_AR_FUSION_MLP** | **0** | **MLP 出口不融合（两出口全融合 = 乱码，禁开）** |
+
+- 证据：B/A/B/A e2e W1 41.73/40.70 vs 40.03/39.59 t/s（配对 +4.25%/+2.81%）；
+  norm 类目账 1.635 → 0.392 ms/step；`runs/s44/e2e-s44-ar-*.json`。
+- **禁令：`VLLM_DCU_CUSTOM_AR_FUSION_MLP=1`（全融合）在 piecewise capture 下
+  输出乱码（S38 原始损坏 S44 复现，`docs/perf/data/s44-a0-debug.txt`），
+  永不开启，除非先修复 S38 §2 根因。**
+- 另：`VLLM_DCU_CUSTOM_AR_FUSION_DEBUG=1` 的对拍分支含逐 rank 数据相关的
+  额外集体操作，warmup 期可致 AR flag 序列跨 rank 分叉 → 服务挂死
+  （S44 三次复现）。**生产与 ABAB 一律 DEBUG=0**；修复见 `.s44/ar-adopt.md`。
+- 回滚：注释上两行 env + `sudo systemctl restart z100-vllm-mtp2`（env 去 0
+  = 逐位恢复 S43 态；`.so` 未动，`_C_stable_libtorch` md5 `54ccf2e2`）。
+
 ## 注意
 
 - **DSH/agent 负载影响**：每请求 TTFT +~1.7 s（draft 预填充），生成段 −17% 左右。

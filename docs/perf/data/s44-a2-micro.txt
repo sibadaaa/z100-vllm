@@ -1,0 +1,21 @@
+Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+[r1] rows= 1 pair=  44.25us fused=  37.87us ratio=0.856 | d_out=0.000e+00 d_res=0.000e+00 rel=0.000e+00 eq_res=True FAIL
+[r3] rows= 1 pair=  43.96us fused=  37.86us ratio=0.861 | d_out=0.000e+00 d_res=0.000e+00 rel=0.000e+00 eq_res=True FAIL
+[r2] rows= 1 pair=  44.21us fused=  37.85us ratio=0.856 | d_out=4.883e-04 d_res=0.000e+00 rel=1.129e-04 eq_res=True FAIL
+[r0] rows= 1 pair=  44.11us fused=  37.72us ratio=0.855 | d_out=0.000e+00 d_res=0.000e+00 rel=0.000e+00 eq_res=True FAIL
+[r2] rows= 4 pair=  44.06us fused=  38.36us ratio=0.871 | d_out=9.766e-04 d_res=0.000e+00 rel=2.216e-04 eq_res=True FAIL[r1] rows= 4 pair=  44.12us fused=  38.36us ratio=0.869 | d_out=9.766e-04 d_res=0.000e+00 rel=1.939e-04 eq_res=True FAIL
+[r3] rows= 4 pair=  44.11us fused=  38.35us ratio=0.869 | d_out=9.766e-04 d_res=0.000e+00 rel=1.905e-04 eq_res=True FAIL
+[r0] rows= 4 pair=  44.02us fused=  38.19us ratio=0.868 | d_out=4.883e-04 d_res=0.000e+00 rel=1.054e-04 eq_res=True FAIL
+[r1] rows= 8 pair=  43.92us fused=  37.91us ratio=0.863 | d_out=9.766e-04 d_res=0.000e+00 rel=1.939e-04 eq_res=True
+[r0] rows= 8 pair=  43.88us fused=  37.74us ratio=0.860 | d_out=4.883e-04 d_res=0.000e+00 rel=1.004e-04 eq_res=True[r3] rows= 8 pair=  43.98us fused=  37.90us ratio=0.862 | d_out=9.766e-04 d_res=0.000e+00 rel=1.905e-04 eq_res=True
+[r2] rows= 8 pair=  43.87us fused=  37.91us ratio=0.864 | d_out=9.766e-04 d_res=0.000e+00 rel=1.932e-04 eq_res=True
+[r1] rows=12 pair=  44.04us fused=  39.97us ratio=0.907 | d_out=9.766e-04 d_res=0.000e+00 rel=1.939e-04 eq_res=True
+[r3] rows=12 pair=  43.97us fused=  39.97us ratio=0.909 | d_out=9.766e-04 d_res=0.000e+00 rel=1.905e-04 eq_res=True
+[r2] rows=12 pair=  43.99us fused=  39.94us ratio=0.908 | d_out=9.766e-04 d_res=0.000e+00 rel=1.932e-04 eq_res=True
+[r0] rows=12 pair=  44.02us fused=  39.95us ratio=0.908 | d_out=4.883e-04 d_res=0.000e+00 rel=1.004e-04 eq_res=True
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+.s38/car_fused_bench.py FAILED

@@ -1,0 +1,4 @@
+[s44-ar-base] rep1: n=96 finish=length e2e=3.297s repeat=False
+[s44-ar-base] rep2: n=96 finish=length e2e=3.335s repeat=False
+[s44-ar-base] rep3: n=96 finish=length e2e=3.377s repeat=False
+[s44-ar-base] wrote /home/lyh/z100-vllm/runs/s44/board-s44-ar-base.json

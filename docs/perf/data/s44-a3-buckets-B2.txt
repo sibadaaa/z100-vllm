@@ -1,0 +1,8 @@
+== lm_head class (dense GEMV >300us): 40 launches, median 808.5us, kernel(s): ['void fp16_gemv_stream_m1_kernel'] ==
+  void fp16_gemv_stream_m1_kernel: n=40 median=808.5us
+Traceback (most recent call last):
+  File "/home/lyh/z100-vllm/.s41/parse_trace_s41.py", line 220, in <module>
+    main()
+  File "/home/lyh/z100-vllm/.s41/parse_trace_s41.py", line 207, in main
+    medians=dict(cpu_wall_ms=med([r['cpu_wall_ms'] for r in rows]),
+TypeError: 'float' object is not callable
