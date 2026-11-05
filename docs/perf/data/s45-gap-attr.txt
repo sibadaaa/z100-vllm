@@ -1,6 +1,0 @@
-decode steps=39; gaps>=50us: 20.1/step, 5.376 ms/step
- ms/step  n/step  gap owner (straddling cpu_op)
-   4.949    18.5  (inter-op boundary / python between ops)
-   0.271     1.1  vllm::gdn_attention_core
-   0.145     0.5  vllm::unified_attention_with_output
-   0.011     0.0  vllm::unified_kv_cache_update

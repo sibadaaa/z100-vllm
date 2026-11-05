@@ -4,6 +4,9 @@
 
 #include <torch/all.h>
 
+#include <optional>
+#include <tuple>
+
 // FP8 (W8A8) GEMM/GEMV for gfx906 (Vega20 / Hygon Z100).
 //
 // gfx906 has no fp8 conversion instruction and no MFMA/WMMA, so this kernel
@@ -14,9 +17,18 @@
 // materialized into fp16.
 //
 // See csrc/rocm/fp8_emu_gemm.cu for the layout contract and provenance.
+//
+// Every `*_meta` below mirrors the entry above it for fake-tensor propagation
+// (`torch.compile`): same argument list, output shape/dtype only, no kernel.
+//
+// The decode entry points choose their kernel internally (per-tensor GEMV, the
+// streaming slice GEMV, or the exact-M tiled GEMM) from the runtime M and the
+// shape; `VLLM_DCU_FP8_GEMV_STREAM` / `..._GEMV_MAX_M` / `..._DECODE_CFG`
+// override that choice without a rebuild.
 
-// Decode path (M <= 8): one block per output column, LDS tree reduction.
-// `a_s`/`w_s` may hold 1 element (per-tensor) or M/N elements.
+// Legacy per-tensor/per-channel decode path (M <= 8): one block per output
+// column, LDS tree reduction.  `a_s`/`w_s` may hold 1 element (per-tensor) or
+// M/N elements.
 torch::Tensor fp8_emu_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor a_s,
                            torch::Tensor w_s, torch::Tensor lut,
                            std::optional<torch::Tensor> bias,
@@ -90,6 +102,10 @@ fp8_emu_gemm_block_quant_x_meta(torch::Tensor a, torch::Tensor w,
                                 int64_t cfg, int64_t block_n, int64_t block_k,
                                 double eps);
 
+// Block-scaled tiled GEMM (prefill range; the decode range is routed to the
+// stream GEMV above when its geometry fits).  Same layout contract as the
+// block-scaled section above; `cfg` selects the tile out of the block-scaled
+// set (see the host-side mapping in fp8_emu_gemm.cu, 0 = auto).
 torch::Tensor fp8_emu_gemm_block(torch::Tensor a, torch::Tensor w,
                                  torch::Tensor a_s, torch::Tensor w_s,
                                  torch::Tensor lut,

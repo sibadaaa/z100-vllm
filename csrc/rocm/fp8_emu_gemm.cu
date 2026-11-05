@@ -58,6 +58,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 
 #include "rocm/fp8_emu_gemm.h"
 #include "rocm/fp8_dequant.cuh"
@@ -236,19 +237,27 @@ struct FConf {
 };
 
 // Stage one K slice of A/W from global into registers (zero-filled for
-// out-of-range M/N/K).
+// out-of-range M/N/K).  The W row pitch is passed explicitly rather than
+// assumed to be K: `process_fp8_weight_block_strategy` pads the last
+// dimension by VLLM_ROCM_FP8_PADDING, so `w.stride(0)` is K + pad.
 template <int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void fp8_gemm_load(const uint8_t* __restrict__ A,
                                               const uint8_t* __restrict__ W,
-                                              int m0, int n0, int M, int N,
-                                              int K, int K4, int k0, int tid,
+                                              int64_t w_stride, int m0, int n0,
+                                              int M, int N, int K, int K4,
+                                              int k0, int tid,
                                               uint32_t* __restrict__ dst) {
   using C = FConf<BM, BN, TM, TN>;
   const uint32_t* __restrict__ ap =
       reinterpret_cast<const uint32_t*>(A + (int64_t)m0 * K + k0);
   const uint32_t* __restrict__ wp =
-      reinterpret_cast<const uint32_t*>(W + (int64_t)n0 * K + k0);
+      reinterpret_cast<const uint32_t*>(W + (int64_t)n0 * w_stride + k0);
+  const int w4 = (int)(w_stride >> 2);
   const bool kfull = (k0 + kFBk) <= K;
+  // The `idx < BM * kFKw4` guards are not redundant with the M/N bounds: A4/B4
+  // are rounded up, so a tile whose dword count is not a multiple of NT would
+  // otherwise have the surplus threads scan rows outside the tile (in bounds of
+  // the tensor, but up to 8x the intended A traffic).
 #pragma unroll
   for (int u = 0; u < C::A4; ++u) {
     const int idx = tid + u * C::NT;
@@ -268,7 +277,7 @@ __device__ __forceinline__ void fp8_gemm_load(const uint8_t* __restrict__ A,
     uint32_t v = 0;
     if (idx < BN * kFKw4 && n0 + r < N &&
         (kfull || (k0 + (jd + 1) * 4) <= K))
-      v = wp[(int64_t)r * K4 + jd];
+      v = wp[(int64_t)r * w4 + jd];
     dst[C::A4 + u] = v;
   }
 }
@@ -368,7 +377,9 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   }
 
   uint32_t f0[FRAGS], f1[FRAGS];
-  fp8_gemm_load<BM, BN, TM, TN>(A, W, m0, n0, M, N, K, K4, 0, tid, f0);
+  // This path requires a contiguous W, so its row pitch is K.
+  fp8_gemm_load<BM, BN, TM, TN>(A, W, /*w_stride=*/K, m0, n0, M, N, K, K4, 0,
+                                tid, f0);
 
   // Per iteration: store LDS(S) -> syncthreads -> issue the next global load ->
   // compute from LDS(S).  One syncthreads suffices: it also guarantees the
@@ -377,13 +388,13 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   for (; kb + 1 < NK; kb += 2) {
     fp8_gemm_store<BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
     __syncthreads();
-    fp8_gemm_load<BM, BN, TM, TN>(A, W, m0, n0, M, N, K, K4,
+    fp8_gemm_load<BM, BN, TM, TN>(A, W, /*w_stride=*/K, m0, n0, M, N, K, K4,
                                   (kb + 1) * kFBk, tid, f1);
     fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[0], Bs[0], acc);
 
     fp8_gemm_store<BM, BN, TM, TN>(tid, f1, sl, As[1], Bs[1]);
     __syncthreads();
-    fp8_gemm_load<BM, BN, TM, TN>(A, W, m0, n0, M, N, K, K4,
+    fp8_gemm_load<BM, BN, TM, TN>(A, W, /*w_stride=*/K, m0, n0, M, N, K, K4,
                                   (kb + 2) * kFBk, tid, f0);
     fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[1], Bs[1], acc);
   }
@@ -629,6 +640,10 @@ constexpr int kStreamSlice = 1024;
 // degrades to the tiled GEMM instead of failing the launch.
 constexpr size_t kStreamSmemCap = (size_t)44 * 1024;
 
+// The gate itself: the device's LDS per block minus the 256-entry LUT and its
+// slack, capped at kStreamSmemCap.  Queried once per process for the current
+// device (single-device deployment; a second device would reuse the first
+// device's limit).
 size_t stream_smem_limit() {
   static const size_t lim = []() -> size_t {
     int dev = 0;
@@ -660,7 +675,8 @@ static bool gemv_pf4_enabled() {
   return on;
 }
 
-template <int PF, int MS, int RW, typename T>
+template <int PF, int MS, int RW, typename T, bool PK = false,
+          bool EXACT = false>
 __global__ void fp8_emu_gemv_stream_block_kernel(
     const uint8_t* __restrict__ a,      // [M, K] fp8 (a16 == 0) or fp16 (a16)
     const uint8_t* __restrict__ w,      // [N, K], row stride w_stride
@@ -716,7 +732,7 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
   {  // Folded per-block_k scales: rows divides block_n, so one w_s row.
     const int nb = (int)(((int64_t)n0) / block_n);
     const float* __restrict__ wsr = w_s + (int64_t)nb * nkb;
-    const int tot = M * nkb;
+    const int tot = (EXACT ? MS : M) * nkb;
     for (int i = t; i < tot; i += nt) {
       const int m = i / nkb;
       const int kb = i - m * nkb;
@@ -762,7 +778,8 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
       const uint4* __restrict__ av = reinterpret_cast<const uint4*>(a);      \
       uint4* __restrict__ sv = reinterpret_cast<uint4*>(sA);                 \
       const int full_ = sl_el_ >> 3;                                         \
-      for (int i = t; i < M * kSliceV8; i += nt) {                           \
+      const int mrows_ = EXACT ? MS : M;                                     \
+      for (int i = t; i < mrows_ * kSliceV8; i += nt) {                      \
         const int m = i / kSliceV8;                                          \
         const int v = i - m * kSliceV8;                                      \
         uint4 val = make_uint4(0u, 0u, 0u, 0u);                              \
@@ -811,11 +828,25 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
         /* chunk's 8 W registers cover the whole M range instead of one */   \
         /* accumulator group per pass (the M >= 5 instantiation runs the */  \
         /* two groups back to back on the same p[]). */                      \
+        /* WP-A3 M3FAST (PK): the 8 pair MACs of one (chunk, m) chain in */ \
+        /* fp16 via v_pk_fma_f16 (full rate) and fold once to fp32; the */  \
+        /* fp32 dot2 chain is issue-bound at M >= 2 (half rate), which */   \
+        /* is exactly the wall the gemv_m3_probe measured (366 GB/s at */   \
+        /* M=3 vs 645 at M=1).  EXACT (MS == M, dispatch-guaranteed) */     \
+        /* drops the runtime m < M guards so the unroll carries no dead */  \
+        /* slot. */                                                          \
+        /* The 16 MACs are split into two fp16 chains (xa, xb) that are */  \
+        /* summed in fp32: fp8 codes peak at 448, so a single product can */ \
+        /* reach 2e5 and a 16-deep fp16 chain saturates at 65504.  Two */   \
+        /* 8-deep chains double the headroom; the path is still NOT */      \
+        /* bit-identical to the dot2 route (fp16 rounding, 2^-11 per */     \
+        /* step), so the gate is max|delta| + an inf/NaN scan, not */       \
+        /* equality (same convention as fp16_gemv_stream_m1). */            \
         _Pragma("unroll")                                                    \
         for (int g = 0; g < (MS + 3) / 4; ++g) {                             \
           _Pragma("unroll")                                                  \
           for (int m = 4 * g; m < (4 * g + 4 < MS ? 4 * g + 4 : MS); ++m) {  \
-            if (m < M) {                                                     \
+            if (EXACT || m < M) {                                            \
               const uint4* __restrict__ ap =                                 \
                   reinterpret_cast<const uint4*>(                            \
                       sA + (int64_t)m * kStreamSlice +                       \
@@ -823,14 +854,33 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
               const uint4 xa = ap[0];                                        \
               const uint4 xb = ap[1];                                        \
               float loc = 0.0f;                                              \
-              loc = dot2(p[0], xa.x, loc);                                   \
-              loc = dot2(p[1], xa.y, loc);                                   \
-              loc = dot2(p[2], xa.z, loc);                                   \
-              loc = dot2(p[3], xa.w, loc);                                   \
-              loc = dot2(p[4], xb.x, loc);                                   \
-              loc = dot2(p[5], xb.y, loc);                                   \
-              loc = dot2(p[6], xb.z, loc);                                   \
-              loc = dot2(p[7], xb.w, loc);                                   \
+              if constexpr (PK) {                                            \
+                __half2 h0 = __float2half2_rn(0.0f);                         \
+                __half2 h1 = __float2half2_rn(0.0f);                         \
+                const __half2* wp =                                          \
+                    reinterpret_cast<const __half2*>(p);                     \
+                const __half2* xap =                                         \
+                    reinterpret_cast<const __half2*>(&xa);                   \
+                const __half2* xbp =                                         \
+                    reinterpret_cast<const __half2*>(&xb);                   \
+                _Pragma("unroll")                                            \
+                for (int q = 0; q < 4; ++q)                                  \
+                  h0 = __hfma2(wp[q], xap[q], h0);                           \
+                _Pragma("unroll")                                            \
+                for (int q = 0; q < 4; ++q)                                  \
+                  h1 = __hfma2(wp[4 + q], xbp[q], h1);                       \
+                loc = (__half2float(h0.x) + __half2float(h0.y)) +            \
+                      (__half2float(h1.x) + __half2float(h1.y));             \
+              } else {                                                       \
+                loc = dot2(p[0], xa.x, loc);                                 \
+                loc = dot2(p[1], xa.y, loc);                                 \
+                loc = dot2(p[2], xa.z, loc);                                 \
+                loc = dot2(p[3], xa.w, loc);                                 \
+                loc = dot2(p[4], xb.x, loc);                                 \
+                loc = dot2(p[5], xb.y, loc);                                 \
+                loc = dot2(p[6], xb.z, loc);                                 \
+                loc = dot2(p[7], xb.w, loc);                                 \
+              }                                                              \
               acc[rr][m] += loc * sscale[m * nkb + kb];                      \
             }                                                                \
           }                                                                  \
@@ -887,7 +937,7 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
     if (row >= N) continue;
 #pragma unroll
     for (int m = 0; m < MS; ++m) {
-      if (m < M) {
+      if (EXACT || m < M) {
         float v = acc[rr][m];
 #pragma unroll
         for (int off = 32; off > 0; off >>= 1) v += __shfl_down(v, off);
@@ -904,10 +954,12 @@ __global__ void fp8_emu_gemv_stream_block_kernel(
 // Highest MS instantiation `dispatch_gemv_stream` will use for this M.  The
 // slice buffer is sized by the template parameter, so the host-side LDS gate
 // has to match it.
+int gemv_m3fast_enabled();  // defined next to dispatch_gemv_stream
+
 int stream_ms_for(int M) {
   if (M <= 1) return 1;
   if (M <= 2) return 2;
-  if (M <= 4) return 4;
+  if (M <= 4) return (M == 3 && gemv_m3fast_enabled()) ? 3 : 4;
   return kMsMax;
 }
 
@@ -1163,7 +1215,9 @@ static int splitk_segments() {
 
 // Workspace: (S, N) fp32 partials.  Decode runs single-stream per device;
 // concurrent multi-stream use of the same (S, N) would race -- recorded as
-// a known limitation in the S37 ledger (design §3.3).
+// a known limitation in the S37 ledger (design §3.3).  The pointer is cached
+// for the lifetime of the process, so it also assumes one device per process
+// (the first one to reach this function).
 static float* splitk_workspace() {
   static float* ws = []() {
     float* p = nullptr;
@@ -1173,16 +1227,38 @@ static float* splitk_workspace() {
   return ws;
 }
 
+// Rows per warp of the streaming GEMV family: a block's `rows` rows are split
+// over `nt / 64` warps, so the quotient must be exactly one of the compiled RW
+// instantiations (1, 2, 4, 8).  A geometry that does not divide would leave the
+// surplus rows of every block unwritten (or, for the `rows`-strided variant,
+// spill them into the next w_s window) -- reject it, never clamp.
+int gemv_rw(int rows, int nt) {
+  TORCH_CHECK(nt >= 64 && (nt % 64) == 0 && rows > 0,
+              "fp8_emu: streaming GEMV needs rows > 0 and a block size that is "
+              "a multiple of 64, got rows=",
+              rows, " nt=", nt);
+  const int nwarp = nt >> 6;
+  const int rw = rows / nwarp;
+  TORCH_CHECK(rows % nwarp == 0 && (rw == 1 || rw == 2 || rw == 4 || rw == 8),
+              "fp8_emu: streaming GEMV needs rows to be a whole number of "
+              "compiled rows-per-warp (1/2/4/8) times the warp count, got "
+              "rows=",
+              rows, " nt=", nt, " (RW=", rw, ")");
+  return rw;
+}
+
 template <typename T>
 void dispatch_gemv_stream_m1(int N, int K, int64_t w_stride, int rows, int nt,
                              int nkb, int block_n, int cpb, const uint8_t* A,
                              const uint8_t* W, const float* w_s,
                              const __half* lut, const T* bias, T* C,
                              hipStream_t stream) {
-  const int rw = rows / (nt >> 6);
+  const int rw = gemv_rw(rows, nt);
   const int S = splitk_segments();
-  const bool splitk_ok =
-      S > 1 && N <= 2048 && K >= 4096 && K <= 8192 && K % S == 0;
+  // A split-K segment must start on a kStreamChunk boundary: every W chunk /
+  // A slice index below is derived from the absolute K offset with a shift.
+  const bool splitk_ok = S > 1 && N <= 2048 && K >= 4096 && K <= 8192 &&
+                         K % S == 0 && ((K / S) % kStreamChunk) == 0;
   // S40 A1: PF=4 ring only for the RW <= 2 geometries (rw > 2 keeps pf[2]).
 #define VLLM_M1_DISPATCH(PFv)                                                \
   do {                                                                       \
@@ -1207,8 +1283,15 @@ void dispatch_gemv_stream_m1(int N, int K, int64_t w_stride, int rows, int nt,
                     A, W, w_s, lut, nullptr, C, N, K, w_stride, rows, nkb,   \
                     block_n, cpb, seg_len, ws);                              \
             break;                                                           \
-          default:  /* PF=4 never dispatched at rw > 2; reuse the pf2 ring */\
+          case 4:                                                            \
+            /* PF=4 is only ever dispatched at rw <= 2 (see the gate below) */\
             fp8_emu_gemv_stream_m1_kernel<2, 4, T>                           \
+                <<<grid, block, smem, stream>>>(                             \
+                    A, W, w_s, lut, nullptr, C, N, K, w_stride, rows, nkb,   \
+                    block_n, cpb, seg_len, ws);                              \
+            break;                                                           \
+          default:  /* rw == 8; PF=4 never dispatched at rw > 2 */            \
+            fp8_emu_gemv_stream_m1_kernel<2, 8, T>                           \
                 <<<grid, block, smem, stream>>>(                             \
                     A, W, w_s, lut, nullptr, C, N, K, w_stride, rows, nkb,   \
                     block_n, cpb, seg_len, ws);                              \
@@ -1644,7 +1727,7 @@ void dispatch_gemv_wholea_l2_m1(int N, int K, int64_t w_stride, int rows,
                                 const uint8_t* A, const uint8_t* W,
                                 const float* w_s, const __half* lut,
                                 const T* bias, T* C, hipStream_t stream) {
-  const int rw = rows / (nt >> 6);
+  const int rw = gemv_rw(rows, nt);
   if (rw <= 1) {
     launch_gemv_wholea_l2_m1<1, T>(N, K, w_stride, rows, nt, nkb, block_n,
                                    cpb, A, W, w_s, lut, bias, C, stream);
@@ -1683,7 +1766,7 @@ void dispatch_gemv_wholea_m1(int N, int K, int64_t w_stride, int rows, int nt,
                              const uint8_t* W, const float* w_s,
                              const __half* lut, const T* bias, T* C,
                              hipStream_t stream, const int smul = 0) {
-  const int rw = rows / (nt >> 6);
+  const int rw = gemv_rw(rows, nt);
   if (rw <= 1) {
     launch_gemv_wholea_m1<1, T>(N, K, w_stride, rows, nt, nkb, block_n, cpb, A,
                                 W, w_s, lut, bias, C, stream, smul);
@@ -1699,7 +1782,8 @@ void dispatch_gemv_wholea_m1(int N, int K, int64_t w_stride, int rows, int nt,
   }
 }
 
-template <int PF, int MS, int RW, typename T>
+template <int PF, int MS, int RW, typename T, bool PK = false,
+          bool EXACT = false>
 void launch_gemv_stream_pf(int M, int N, int K, int64_t w_stride, int rows,
                            int nt, int nkb, int block_n, int cpb, bool a16,
                            const uint8_t* A, const uint8_t* W,
@@ -1707,16 +1791,16 @@ void launch_gemv_stream_pf(int M, int N, int K, int64_t w_stride, int rows,
                            const __half* lut, const T* bias, T* C,
                            hipStream_t stream) {
   const size_t smem = (size_t)MS * kStreamSlice * sizeof(__half) +
-                      (size_t)M * nkb * sizeof(float);
+                      (size_t)(EXACT ? MS : M) * nkb * sizeof(float);
   dim3 grid((N + rows - 1) / rows);
   dim3 block(nt);
-  fp8_emu_gemv_stream_block_kernel<PF, MS, RW, T>
+  fp8_emu_gemv_stream_block_kernel<PF, MS, RW, T, PK, EXACT>
       <<<grid, block, smem, stream>>>(A, W, a_s, w_s, lut, bias, C, M, N, K,
                                       w_stride, rows, nkb, block_n, cpb,
                                       a16 ? 1 : 0);
 }
 
-template <int MS, int RW, typename T>
+template <int MS, int RW, typename T, bool PK = false, bool EXACT = false>
 void launch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows, int nt,
                         int nkb, int block_n, int cpb, bool a16,
                         const uint8_t* A, const uint8_t* W, const float* a_s,
@@ -1724,17 +1808,18 @@ void launch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows, int nt,
                         T* C, hipStream_t stream) {
   // S40 A1: the pf[4] ring instantiates only for RW <= 2 (if constexpr keeps
   // the RW > 2, PF = 4 fat kernels out of the binary).
-  if constexpr (RW <= 2) {
+  if constexpr (RW <= 2 && !PK) {
     if (gemv_pf4_enabled()) {
-      launch_gemv_stream_pf<4, MS, RW, T>(M, N, K, w_stride, rows, nt, nkb,
-                                          block_n, cpb, a16, A, W, a_s, w_s,
-                                          lut, bias, C, stream);
+      launch_gemv_stream_pf<4, MS, RW, T, PK, EXACT>(
+          M, N, K, w_stride, rows, nt, nkb, block_n, cpb, a16, A, W, a_s, w_s,
+          lut, bias, C, stream);
       return;
     }
   }
-  launch_gemv_stream_pf<2, MS, RW, T>(M, N, K, w_stride, rows, nt, nkb,
-                                      block_n, cpb, a16, A, W, a_s, w_s, lut,
-                                      bias, C, stream);
+  launch_gemv_stream_pf<2, MS, RW, T, PK, EXACT>(M, N, K, w_stride, rows, nt,
+                                                 nkb, block_n, cpb, a16, A, W,
+                                                 a_s, w_s, lut, bias, C,
+                                                 stream);
 }
 
 // S23 / O4: highest M that may still take the streaming decode kernel.
@@ -1803,8 +1888,21 @@ int stream_block_select(int M, int N, int K, int64_t w_stride, int nkb,
       (size_t)M * nkb * sizeof(float);
   if (smem > stream_smem_limit()) return 0;
   if (want2) {
-    rows = 64;
-    nt = 512;
+    // WP-A2 follow-up: whole-A geometry is env-tunable (VLLM_DCU_FP8_GEMV_
+    // STREAM2_ROWS = rows per block); nt keeps RW = rows/(nt>>6) in {1,2,4,8}.
+    // Default 64 = the shipped text (RW 8 at 512 threads).
+    static const int rows2 = []() {
+      const char* e = std::getenv("VLLM_DCU_FP8_GEMV_STREAM2_ROWS");
+      const int v = e != nullptr ? std::atoi(e) : 64;
+      switch (v) {
+        case 8: return 8;    // nt 256, RW 2
+        case 16: return 16;  // nt 512, RW 2
+        case 32: return 32;  // nt 512, RW 4
+        default: return 64;  // nt 512, RW 8 (shipped)
+      }
+    }();
+    rows = rows2;
+    nt = rows2 >= 16 ? 512 : 256;
     return 2;
   }
   // S39 A5 (B1-a): small-K runway.  For K <= 2048 (o/gdn_out, K = 1536) the
@@ -1861,6 +1959,19 @@ int stream_block_mode() {
   return mode;
 }
 
+// WP-A3 M3FAST: exact-M=3 arm of the streaming kernel (template dispatch
+// below): MS=3 instantiation (no dead 4th row slot), compile-time m bounds
+// (EXACT) and the v_pk_fma_f16 MAC (PK).  0 = today's dispatch (default).
+// Gated behind the env so the production path is byte-identical until the
+// A/B flips the knob; rollback = unset the env (no .so swap).
+int gemv_m3fast_enabled() {
+  static const bool on = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_GEMV_M3FAST");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
 template <typename T>
 void dispatch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows,
                           int nt, int nkb, int block_n, int cpb, bool a16,
@@ -1869,37 +1980,43 @@ void dispatch_gemv_stream(int M, int N, int K, int64_t w_stride, int rows,
                           const __half* lut, const T* bias, T* C,
                           hipStream_t stream) {
   // Rows per warp of the W pipeline: the selector pairs `rows` with a block
-  // size of min(512, rows*64), so RW is exact and >= 1.
-  const int rw = rows / (nt >> 6);
-#define VLLM_FP8_EMU_GEMV_STREAM_RW(MS)                                     \
-  do {                                                                      \
-    if (rw <= 1) {                                                          \
-      launch_gemv_stream<MS, 1, T>(M, N, K, w_stride, rows, nt, nkb,        \
-                                   block_n, cpb, a16, A, W, a_s, w_s, lut,  \
-                                   bias, C, stream);                        \
-      return;                                                               \
-    }                                                                       \
-    if (rw == 2) {                                                          \
-      launch_gemv_stream<MS, 2, T>(M, N, K, w_stride, rows, nt, nkb,        \
-                                   block_n, cpb, a16, A, W, a_s, w_s, lut,  \
-                                   bias, C, stream);                        \
-      return;                                                               \
-    }                                                                       \
-    if (rw <= 4) {                                                          \
-      launch_gemv_stream<MS, 4, T>(M, N, K, w_stride, rows, nt, nkb,        \
-                                   block_n, cpb, a16, A, W, a_s, w_s, lut,  \
-                                   bias, C, stream);                        \
-      return;                                                               \
-    }                                                                       \
-    launch_gemv_stream<MS, 8, T>(M, N, K, w_stride, rows, nt, nkb,          \
-                                 block_n, cpb, a16, A, W, a_s, w_s, lut,    \
-                                 bias, C, stream);                          \
-    return;                                                                 \
+  // size of min(512, rows*64), so RW is a whole number in 1..8.
+  const int rw = gemv_rw(rows, nt);
+  // PK/EXACT select the M3FAST arms (fp16-pair MAC / compile-time M bound);
+  // both are off unless VLLM_DCU_FP8_GEMV_M3FAST asked for them.
+#define VLLM_FP8_EMU_GEMV_STREAM_RW(MS, PKv, EXACTv)                         \
+  do {                                                                       \
+    if (rw <= 1) {                                                           \
+      launch_gemv_stream<MS, 1, T, PKv, EXACTv>(                             \
+          M, N, K, w_stride, rows, nt, nkb, block_n, cpb, a16, A, W, a_s,    \
+          w_s, lut, bias, C, stream);                                        \
+      return;                                                                \
+    }                                                                        \
+    if (rw == 2) {                                                           \
+      launch_gemv_stream<MS, 2, T, PKv, EXACTv>(                             \
+          M, N, K, w_stride, rows, nt, nkb, block_n, cpb, a16, A, W, a_s,    \
+          w_s, lut, bias, C, stream);                                        \
+      return;                                                                \
+    }                                                                        \
+    if (rw <= 4) {                                                           \
+      launch_gemv_stream<MS, 4, T, PKv, EXACTv>(                             \
+          M, N, K, w_stride, rows, nt, nkb, block_n, cpb, a16, A, W, a_s,    \
+          w_s, lut, bias, C, stream);                                        \
+      return;                                                                \
+    }                                                                        \
+    launch_gemv_stream<MS, 8, T, PKv, EXACTv>(                               \
+        M, N, K, w_stride, rows, nt, nkb, block_n, cpb, a16, A, W, a_s, w_s, \
+        lut, bias, C, stream);                                               \
+    return;                                                                  \
   } while (0)
-  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM_RW(1);
-  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM_RW(2);
-  if (M <= 4) VLLM_FP8_EMU_GEMV_STREAM_RW(4);
-  VLLM_FP8_EMU_GEMV_STREAM_RW(kMsMax);
+  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM_RW(1, false, false);
+  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM_RW(2, false, false);
+  if (M <= 4) {
+    if (gemv_m3fast_enabled() && M == 3)
+      VLLM_FP8_EMU_GEMV_STREAM_RW(3, true, true);
+    VLLM_FP8_EMU_GEMV_STREAM_RW(4, false, false);
+  }
+  VLLM_FP8_EMU_GEMV_STREAM_RW(kMsMax, false, false);
 #undef VLLM_FP8_EMU_GEMV_STREAM_RW
 }
 
@@ -2079,55 +2196,36 @@ void dispatch_gemv_stream2(int M, int N, int K, int64_t w_stride, int rows,
                            const float* a_s, const float* w_s,
                            const __half* lut, const T* bias, T* C,
                            hipStream_t stream) {
-  constexpr int kRW = 8;  // rows per warp (= rows / nwarp at 512 threads)
-#define VLLM_FP8_EMU_GEMV_STREAM2_CASE(MS)                                  \
+  // WP-A2 follow-up: RW follows the (env-tunable) rows/nt geometry instead of
+  // the fixed 64/512 -> 8 pairing, so the whole-A variant can be probed at a
+  // smaller register budget (acc = RW x MS floats per lane).  Each warp owns
+  // RW *contiguous* rows (`rbase = n0 + warp * RW`), so the geometry has to
+  // match an instantiated RW exactly.
+  const int krw = gemv_rw(rows, nt);
+#define VLLM_FP8_EMU_GEMV_STREAM2_CASE(MS, KRW)                             \
   do {                                                                      \
-    launch_gemv_stream2<MS, kRW, T>(M, N, K, w_stride, rows, nt, nkb,       \
-                                    block_n, cpb, a16, A, W, a_s, w_s, lut,  \
-                                    bias, C, stream);                       \
+    launch_gemv_stream2<MS, KRW, T>(M, N, K, w_stride, rows, nt, nkb,       \
+                                    block_n, cpb, a16, A, W, a_s, w_s,     \
+                                    lut, bias, C, stream);                 \
     return;                                                                 \
   } while (0)
-  if (M <= 1) VLLM_FP8_EMU_GEMV_STREAM2_CASE(1);
-  if (M <= 2) VLLM_FP8_EMU_GEMV_STREAM2_CASE(2);
-  VLLM_FP8_EMU_GEMV_STREAM2_CASE(4);
+  if (M <= 1) {
+    if (krw <= 1) VLLM_FP8_EMU_GEMV_STREAM2_CASE(1, 1);
+    if (krw <= 2) VLLM_FP8_EMU_GEMV_STREAM2_CASE(1, 2);
+    if (krw <= 4) VLLM_FP8_EMU_GEMV_STREAM2_CASE(1, 4);
+    VLLM_FP8_EMU_GEMV_STREAM2_CASE(1, 8);
+  }
+  if (M <= 2) {
+    if (krw <= 1) VLLM_FP8_EMU_GEMV_STREAM2_CASE(2, 1);
+    if (krw <= 2) VLLM_FP8_EMU_GEMV_STREAM2_CASE(2, 2);
+    if (krw <= 4) VLLM_FP8_EMU_GEMV_STREAM2_CASE(2, 4);
+    VLLM_FP8_EMU_GEMV_STREAM2_CASE(2, 8);
+  }
+  if (krw <= 1) VLLM_FP8_EMU_GEMV_STREAM2_CASE(4, 1);
+  if (krw <= 2) VLLM_FP8_EMU_GEMV_STREAM2_CASE(4, 2);
+  if (krw <= 4) VLLM_FP8_EMU_GEMV_STREAM2_CASE(4, 4);
+  VLLM_FP8_EMU_GEMV_STREAM2_CASE(4, 8);
 #undef VLLM_FP8_EMU_GEMV_STREAM2_CASE
-}
-
-// Stage a K slice from global into registers, honouring the (possibly padded)
-// row stride of W: `process_fp8_weight_block_strategy` pads the last dimension
-// by VLLM_ROCM_FP8_PADDING, so `w.stride(0)` is K + pad, not K.
-template <int BM, int BN, int TM, int TN>
-__device__ __forceinline__ void fp8_gemm_load_block(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ W,
-    int64_t w_stride, int m0, int n0, int M, int N, int K, int K4, int k0,
-    int tid, uint32_t* __restrict__ dst) {
-  using C = FConf<BM, BN, TM, TN>;
-  const uint32_t* __restrict__ ap =
-      reinterpret_cast<const uint32_t*>(A + (int64_t)m0 * K + k0);
-  const uint32_t* __restrict__ wp =
-      reinterpret_cast<const uint32_t*>(W + (int64_t)n0 * w_stride + k0);
-  const int w4 = (int)(w_stride >> 2);
-  const bool kfull = (k0 + kFBk) <= K;
-#pragma unroll
-  for (int u = 0; u < C::A4; ++u) {
-    const int idx = tid + u * C::NT;
-    const int r = idx >> kFLogKw4;
-    const int jd = idx & (kFKw4 - 1);
-    uint32_t v = 0;
-    if (m0 + r < M && (kfull || (k0 + (jd + 1) * 4) <= K))
-      v = ap[(int64_t)r * K4 + jd];
-    dst[u] = v;
-  }
-#pragma unroll
-  for (int u = 0; u < C::B4; ++u) {
-    const int idx = tid + u * C::NT;
-    const int r = idx >> kFLogKw4;
-    const int jd = idx & (kFKw4 - 1);
-    uint32_t v = 0;
-    if (n0 + r < N && (kfull || (k0 + (jd + 1) * 4) <= K))
-      v = wp[(int64_t)r * w4 + jd];
-    dst[C::A4 + u] = v;
-  }
 }
 
 // Fold one finished block_k window into the (scale-applied) accumulator.
@@ -2196,14 +2294,14 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN), MINB)
   }
 
   uint32_t f0[FRAGS], f1[FRAGS];
-  fp8_gemm_load_block<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4, 0,
+  fp8_gemm_load<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4, 0,
                                       tid, f0);
 
   int c = 0;  // K chunk index (kFBk elements each)
   for (; c + 1 < NK; c += 2) {
     fp8_gemm_store<BM, BN, TM, TN>(tid, f0, sl, As[0], Bs[0]);
     __syncthreads();
-    fp8_gemm_load_block<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
+    fp8_gemm_load<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
                                         (c + 1) * kFBk, tid, f1);
     fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[0], Bs[0], blk);
     if (((c + 1) % cpb) == 0)
@@ -2213,7 +2311,7 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN), MINB)
 
     fp8_gemm_store<BM, BN, TM, TN>(tid, f1, sl, As[1], Bs[1]);
     __syncthreads();
-    fp8_gemm_load_block<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
+    fp8_gemm_load<BM, BN, TM, TN>(A, W, w_stride, m0, n0, M, N, K, K4,
                                         (c + 2) * kFBk, tid, f0);
     fp8_gemm_compute<BM, BN, TM, TN>(tx, ty, As[1], Bs[1], blk);
     if (((c + 2) % cpb) == 0)
@@ -2803,6 +2901,23 @@ void dispatch_gemm_block_w8a16(int cfg, int M, int N, int K, int64_t w_stride,
 #undef VLLM_FP8_EMU_GEMM_W8A16_CASE
 }
 
+// Every kernel below indexes all operands on one device; a tensor that lives
+// elsewhere would race or fault instead of failing here.
+void check_same_device(const char* op,
+                       std::initializer_list<const torch::Tensor*> tensors,
+                       const std::optional<torch::Tensor>& bias) {
+  const at::Device dev = (*tensors.begin())->device();
+  for (const torch::Tensor* t : tensors) {
+    TORCH_CHECK(t->device() == dev, op,
+                ": all tensors must be on the same device (got ", dev, " and ",
+                t->device(), ")");
+  }
+  if (bias.has_value() && bias->defined()) {
+    TORCH_CHECK(bias->device() == dev, op,
+                ": bias must be on the same device as the operands");
+  }
+}
+
 void check_common(const torch::Tensor& a, const torch::Tensor& w,
                   const torch::Tensor& a_s, const torch::Tensor& w_s,
                   const torch::Tensor& lut,
@@ -2811,6 +2926,7 @@ void check_common(const torch::Tensor& a, const torch::Tensor& w,
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && a_s.is_cuda() && w_s.is_cuda() &&
                   lut.is_cuda(),
               "fp8_emu: all tensors must be on the GPU");
+  check_same_device("fp8_emu", {&a, &w, &a_s, &w_s, &lut}, bias);
   TORCH_CHECK(a.element_size() == 1 && w.element_size() == 1,
               "fp8_emu: a/w must be 8-bit (fp8) tensors");
   TORCH_CHECK(a.scalar_type() == w.scalar_type(),
@@ -2925,7 +3041,6 @@ void run(const torch::Tensor& a, const torch::Tensor& w,
                              cfg, stream);
       break;
   }
-  (void)K;
 }
 
 // ---------------------------------------------------------------------------
@@ -2941,6 +3056,7 @@ void check_block_common(const torch::Tensor& a, const torch::Tensor& w,
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && a_s.is_cuda() && w_s.is_cuda() &&
                   lut.is_cuda(),
               "fp8_emu_block: all tensors must be on the GPU");
+  check_same_device("fp8_emu_block", {&a, &w, &a_s, &w_s, &lut}, bias);
   TORCH_CHECK(a.element_size() == 1 && w.element_size() == 1,
               "fp8_emu_block: a/w must be 8-bit (fp8) tensors");
   TORCH_CHECK(a.scalar_type() == w.scalar_type(),
@@ -2973,6 +3089,12 @@ void check_block_common(const torch::Tensor& a, const torch::Tensor& w,
   TORCH_CHECK((w_stride % 4) == 0,
               "fp8_emu_block: w row stride must be a multiple of 4, got ",
               w_stride);
+  // The kernels address a row as `W + n * w_stride` and then scan K elements;
+  // a stride shorter than K (an overlapping as_strided view) would walk into
+  // the next row and past the end of the tensor.
+  TORCH_CHECK(w_stride >= K,
+              "fp8_emu_block: w row stride must cover K (stride(0)=", w_stride,
+              " K=", K, ")");
 
   const int64_t M = a.size(0), N = w.size(0), nblk = (N + block_n - 1) / block_n;
   TORCH_CHECK(a_s.dim() == 2 && a_s.size(0) == M && a_s.size(1) == nkb,
@@ -3140,15 +3262,18 @@ void dispatch_gemm_block_cfg(int cfg, int M, int N, int K, int64_t w_stride,
 // the auto rule.  The default is deliberately the legacy policy until the
 // end-to-end A/B accepts the new tiles.
 int decode_gemm_cfg(int N) {
-  const int wide = 16;  // auto rule: exact-M tile with TN=2 (occupancy)
-  const char* e = std::getenv("VLLM_DCU_FP8_DECODE_CFG");
-  if (e == nullptr) return (N >= 6144) ? 10 : 5;
-  if (e[0] == 'a' || e[0] == 'A') return wide;  // "auto"
-  const int v = std::atoi(e);
-  if (v >= 11 && v <= 19) return v;
-  if (v >= 32 && v <= 35) return v;
+  // Parsed once per process, like every other knob in this file: the entry is
+  // called per layer per step and must not pay a getenv in the hot path.
+  // 16 = "auto": the exact-M tile with TN=2 (occupancy).
+  static const int v = []() {
+    const char* e = std::getenv("VLLM_DCU_FP8_DECODE_CFG");
+    if (e == nullptr) return 0;
+    if (e[0] == 'a' || e[0] == 'A') return 16;  // "auto"
+    return std::atoi(e);
+  }();
   if (v == 0) return (N >= 6144) ? 10 : 5;
-  return wide;
+  if ((v >= 11 && v <= 19) || (v >= 32 && v <= 35)) return v;
+  return 16;
 }
 
 void run_block(const torch::Tensor& a, const torch::Tensor& w,
@@ -3296,13 +3421,7 @@ void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
                        int64_t block_k, int64_t& w_stride, int& nkb) {
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && w_s.is_cuda() && lut.is_cuda(),
               "fp8_emu_block_w8a16: all tensors must be on the GPU");
-  // The kernels index every operand on one device; several torch ops on
-  // different devices would otherwise race instead of failing here.
-  TORCH_CHECK(a.device() == w.device() && a.device() == w_s.device() &&
-                  a.device() == lut.device() &&
-                  (!bias.has_value() || !bias->defined() ||
-                   bias->device() == a.device()),
-              "fp8_emu_block_w8a16: all tensors must be on the same device");
+  check_same_device("fp8_emu_block_w8a16", {&a, &w, &w_s, &lut}, bias);
   TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
               "fp8_emu_block_w8a16: a and w must be 2-D, got ",
               a.dim(), " and ", w.dim());
@@ -3331,7 +3450,7 @@ void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
               "fp8_emu_block_w8a16: lut must be a 256-element fp16 tensor");
   TORCH_CHECK(w.size(1) == a.size(1), "fp8_emu_block_w8a16: K mismatch: a K=",
               a.size(1), " w K=", w.size(1));
-  const int64_t K = a.size(1), M = a.size(0), N = w.size(0);
+  const int64_t K = a.size(1), N = w.size(0);
   TORCH_CHECK(K % 8 == 0, "fp8_emu_block_w8a16: K must be a multiple of 8, got ",
               K);
   TORCH_CHECK(block_n > 0,
@@ -3370,7 +3489,6 @@ void check_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
     TORCH_CHECK(bias->scalar_type() == out_dtype,
                 "fp8_emu_block_w8a16: bias dtype must match out dtype");
   }
-  (void)M;
 }
 
 void run_block_w8a16(const torch::Tensor& a, const torch::Tensor& w,
@@ -3601,8 +3719,6 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
   const int ty = tid / C_::NG;
   const int m0 = blockIdx.y * BM;
   const int n0 = blockIdx.x * BN;
-  const int K4 = K >> 2;
-  const int w4 = (int)(w_stride >> 2);
   const int NK = (K + kQbk - 1) / kQbk;
   const int ar = tid >> 5;    // A row owned by this thread
   const int ajd = tid & 31;   // 4-element position inside the group
@@ -3949,6 +4065,11 @@ torch::Tensor fp16_gemv_stream_m1(torch::Tensor x, torch::Tensor w,
                                   std::optional<torch::Tensor> bias,
                                   int64_t nthreads) {
   TORCH_CHECK(x.is_cuda() && w.is_cuda(), "fp16_gemv_stream_m1: x/w on GPU");
+  TORCH_CHECK(x.dim() == 2 && w.dim() == 2,
+              "fp16_gemv_stream_m1: x and w must be 2-D, got ", x.dim(),
+              " and ", w.dim());
+  TORCH_CHECK(x.device() == w.device(),
+              "fp16_gemv_stream_m1: x and w must be on the same device");
   TORCH_CHECK(x.scalar_type() == at::kHalf && w.scalar_type() == at::kHalf,
               "fp16_gemv_stream_m1: fp16 operands only, got x ",
               x.scalar_type(), " w ", w.scalar_type());
@@ -4007,6 +4128,10 @@ torch::Tensor fp8_emu_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor a_s,
                            torch::Tensor w_s, torch::Tensor lut,
                            std::optional<torch::Tensor> bias,
                            at::ScalarType out_dtype, int64_t nthreads) {
+  // Check the rank before indexing: `a.size(1)` on a 1-D tensor would raise an
+  // ATen IndexError instead of a readable message.
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu: a and w must be 2-D, got ", a.dim(), " and ", w.dim());
   const int64_t M = a.size(0), K = a.size(1), N = w.size(0);
   TORCH_CHECK(K % 4 == 0, "fp8_emu: K must be a multiple of 4, got ", K);
   TORCH_CHECK(K >= 4, "fp8_emu: K must be >= 4, got ", K);
@@ -4026,6 +4151,8 @@ torch::Tensor fp8_emu_gemm(torch::Tensor a, torch::Tensor w, torch::Tensor a_s,
                            torch::Tensor w_s, torch::Tensor lut,
                            std::optional<torch::Tensor> bias,
                            at::ScalarType out_dtype, int64_t cfg) {
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu: a and w must be 2-D, got ", a.dim(), " and ", w.dim());
   const int64_t M = a.size(0), K = a.size(1), N = w.size(0);
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "fp8_emu: K must be a positive multiple of 4, got ", K);
@@ -4064,6 +4191,9 @@ torch::Tensor fp8_emu_gemv_block(torch::Tensor a, torch::Tensor w,
                                  std::optional<torch::Tensor> bias,
                                  at::ScalarType out_dtype, int64_t nthreads,
                                  int64_t block_n, int64_t block_k) {
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu_block: a and w must be 2-D, got ", a.dim(), " and ",
+              w.dim());
   const int64_t M = a.size(0), K = a.size(1), N = w.size(0);
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "fp8_emu_block: K must be a positive multiple of 4, got ", K);
@@ -4088,6 +4218,9 @@ torch::Tensor fp8_emu_gemm_block(torch::Tensor a, torch::Tensor w,
                                  std::optional<torch::Tensor> bias,
                                  at::ScalarType out_dtype, int64_t cfg,
                                  int64_t block_n, int64_t block_k) {
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu_block: a and w must be 2-D, got ", a.dim(), " and ",
+              w.dim());
   const int64_t M = a.size(0), K = a.size(1), N = w.size(0);
   TORCH_CHECK(K % 4 == 0 && K >= 4,
               "fp8_emu_block: K must be a positive multiple of 4, got ", K);
@@ -4186,8 +4319,10 @@ void dispatch_block_quant(int M, int N, int K, int64_t w_stride,
   const bool use_stream = s_mode != 0;
   // The fused tile keeps the per-group scales in static LDS
   // (`sA[BM][kQMaxNkb]`), so it only applies when K/block_k fits that budget;
-  // larger K (or a stream route, or block_k != 128) takes the standalone
-  // quantizer route below.
+  // a longer K (or a stream route) takes the standalone quantizer below.
+  // `block_k == kQGroup` is guaranteed by `run_block_quant`'s entry check, so
+  // the standalone quantizer (which hard-codes 128-element groups) can never
+  // see a mismatched group size.
   const bool fused_tile = !use_stream && M <= kMsMax && block_k == kQGroup &&
                           nkb <= kQMaxNkb;
 
@@ -4264,9 +4399,16 @@ void run_block_quant(const torch::Tensor& a, const torch::Tensor& w,
                      torch::Tensor* xq_w, torch::Tensor* xs_w) {
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && w_s.is_cuda() && lut.is_cuda(),
               "fp8_emu_block_quant: all tensors must be on the GPU");
-  TORCH_CHECK(a.element_size() == 2,
+  check_same_device("fp8_emu_block_quant", {&a, &w, &w_s, &lut}, bias);
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
+              "fp8_emu_block_quant: a and w must be 2-D, got ", a.dim(),
+              " and ", w.dim());
+  // Explicit dtype (not element_size): an int16 activation would otherwise be
+  // reinterpreted as bf16 below.
+  TORCH_CHECK(a.scalar_type() == at::kHalf || a.scalar_type() == at::kBFloat16,
               "fp8_emu_block_quant: `a` is the *unquantized* activation and must "
-              "be 16-bit (fp16/bf16), got element_size ", a.element_size());
+              "be float16 or bfloat16, got ",
+              a.scalar_type());
   TORCH_CHECK(w.element_size() == 1 && w.scalar_type() == at::kFloat8_e4m3fn,
               "fp8_emu_block_quant: `w` must be fp8 e4m3");
   TORCH_CHECK(a.is_contiguous() && w.stride(1) == 1 && w.stride(0) > 0 &&
@@ -4448,7 +4590,7 @@ torch::Tensor fp8_emu_gemm_block_w8a16_meta(
 torch::Tensor fp8_emu_gemm_block_w8a16_smul(
     torch::Tensor a, torch::Tensor w, torch::Tensor w_s, torch::Tensor lut,
     std::optional<torch::Tensor> bias, at::ScalarType out_dtype,
-    int64_t nthreads, int64_t block_n, int64_t block_k) {
+    int64_t /*nthreads*/, int64_t block_n, int64_t block_k) {
   TORCH_CHECK(a.dim() == 2 && w.dim() == 2,
               "fp8_emu_block_w8a16_smul: a and w must be 2-D, got ", a.dim(),
               " and ", w.dim());
@@ -4456,6 +4598,12 @@ torch::Tensor fp8_emu_gemm_block_w8a16_smul(
   TORCH_CHECK(a.size(0) == 1, "fp8_emu_block_w8a16_smul: M == 1 only, got ",
               a.size(0));
   TORCH_CHECK(K2 % 2 == 0, "fp8_emu_block_w8a16_smul: a.size(1) must be even");
+  // The wholea kernel stages A (and reads the `up` half) as uint4; a
+  // 4-byte-aligned view would trap instead of falling back (there is no
+  // non-streaming arm on this entry).
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0,
+              "fp8_emu_block_w8a16_smul: `a` must be 16-byte aligned (the "
+              "wholea kernel stages it as uint4); call .contiguous() on it");
   auto a_view = a.narrow(/*dim=*/1, /*start=*/0, /*length=*/K2 / 2);
   const int M = 1;
   const int N = (int)w.size(0);

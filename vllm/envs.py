@@ -242,6 +242,14 @@ if TYPE_CHECKING:
     # bf16_emu_gemv dot2 route.  Not bit-identical (different accumulation
     # order); numeric gate max|delta| <= 3e-4 + the S29 logprob board.
     VLLM_DCU_FP16_GEMV_STREAM: bool = False
+    # S53-ATTN: gfx906 decode attention inner-loop rebuild (HIP dot2) --
+    # registered so the EngineCore workers inherit it (the worker env is
+    # rebuilt from this registry; unregistered VLLM_* vars are dropped).
+    VLLM_GFX906_ATTN_DECODE_HIP_INNER: bool = False
+    # BLOCK_M override for the gfx906 decode path (the in-service Triton
+    # verify needs 16 to match the tuned shape; without registration the
+    # workers run the code default 8).
+    VLLM_GFX906_ATTN_DECODE_BLOCK_M: int = 0
     # Largest M that still takes the GEMV path in the gfx906 scaled-MM
     # emulation kernels (FP8 block-scaled / W8A8 INT8); larger M uses the
     # tiled GEMM.  S18 measurement (tools/dcu/s18_fp8_block_mprobe.py, real

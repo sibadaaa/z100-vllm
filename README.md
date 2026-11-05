@@ -48,22 +48,43 @@
 > **支持范围**：本 README 只覆盖 **DTK 26.04** 栈。DTK 26.10/其他厂商栈未验证；
 > `/opt/dtk` 或 `DTK_ROOT` 必须指向 DTK 26.04。
 
-## 当前性能（2026-10-27）
+## 当前性能（2026-11-05）
 
-Qwen3.8-27B-FP8，TP=4，单流，7469-token 真实文档，MTP `num_speculative_tokens=2`。
-`t/s` 为**引擎生成段**口径（`tok/step ÷ step_p50`，不含 TTFT）。
+Qwen3.8-27B-FP8，TP=4，单流，MTP `num_speculative_tokens=2`。
+生产配置 = **FULL_DECODE_ONLY 图捕获 [2,3,6,12] + dynamic-k 关闭**（S55 投产）。
+`decode 步时 p50` 为单步 decode 耗时中位；`引擎 t/s ≈ tok/step ÷ 步时`（MTP k=2，`tok/step≈2.35–2.40`，不含 TTFT）。
 
-| 上下文 | step p50 | tok/步 | t/s |
-|---:|---:|---:|---:|
-| 7.5k | 46.5 ms | 2.40 | **51.6** |
-| 32k | 52.6 ms | 2.27 | 43.0 |
-| 60k | 60.6 ms | 2.23 | 36.7 |
-| 128k | 62.2 ms | 1.95 | 31.4 |
+| 上下文 | decode 步时 p50 | 引擎 t/s |
+|---:|---:|---:|
+| 16k | 36.6 ms | ≈66 |
+| 32k | 38.4 ms | ≈62 |
+| 64k | 41.9 ms | ≈56 |
+| 128k | 47.9 ms | ≈50（131k 实测 **50.65**） |
 
-- 无投机基线 36.9 t/s → MTP k=2 51.6 t/s（+40%，贪心）；采样口径 34.7 → 40.6 t/s（+17%）。
-- MTP 的 warm TTFT 从 0.72 s 升到 2.40 s；输出少于约 **220–230 token** 时，端到端可能比无投机更慢。
-- 30 min decode 连发 139 探测 / 0 失败；生产 60k 均值约 32.8 t/s。
-- c=4 合批聚合 59–70 t/s（decode 相 66–70）；4 路只有单流的 1.2–1.4×，合批 verify 仍是已知低效项。
+> 表中 `引擎 t/s` 为派生值（`tok/step ÷ 步时`）；131k 为在役同口径实测 50.65 t/s，较在役 piecewise 臂 **+22%**。
+
+- 长上下文无悬崖：16k→128k 步时仅 36.6→47.9 ms（2026-10-27 同档 128k 为 62.2 ms / 31.4 t/s）。
+- 131k 50.65 t/s = S53 注意力内核（在役 +15.7%）叠加 S55 图模式长 ctx 修复（+22%）。
+- 10/10 boot TPOT 带内 0 fault、greedy 双 boot 逐位一致；c=4 无回退。
+- MTP k=2 收益（2026-10-27 短 ctx 口径）：无投机 36.9 → 51.6 t/s（+40%）；warm TTFT 0.72→2.40 s，输出 <220–230 tok 时端到端可能不如无投机。
+
+## 已落地优化（截至 2026-11-05）
+
+> 完整逐项证据见 [`docs/perf/OPT-EFFECTIVE-20261027.md`](docs/perf/OPT-EFFECTIVE-20261027.md) 与各轮判定；
+> 此处只列**已进生产 / 服务级 A/B 过门**的项。一句话：有效的都是**拆串行、压每-op 延迟、
+> 按真实形状派发、用投机摊薄权重读**；只改字节/精度的项基本被实测挡回。
+
+| 层 | 已落地项 | 代表收益 |
+|---|---|---|
+| 图/调度 | piecewise → FULL_DECODE_ONLY 图捕获 [2,3,6,12] + dynamic-k 关闭（S55） | 长 ctx 不再整步回退 eager；131k +22% |
+| 注意力 | S53 v6D/B832 decode 注意力内核（832 页游标 + descale 折叠） | 在役 +15.7%（140 GB/s，2.37×），数值门 40/40 |
+| 内核/派发 | FP8-emu cfg35、A1 in_proj_ba GEMV、draft 3D 路由、FA verify BM16、GDN M1 原生核、GEMV rows=4+M1、W8A16 + fp16 prefill 物化 | 单项 −3~−9 ms/步；GDN M1 17×；W8A16 decode 1.2–2.1× |
+| 通信 | gfx906 push one-shot AR、AR size 门 64→128 KiB、hybrid AR+norm 融合（S44） | MTP 臂 AR-off 代价 +10 ms；c4 −4.6 ms/步；S44 +2.8–4.3% |
+| 投机 | MTP k=2（目标自带 mtp 层，verify M=3 近免费）；退役 DFlash2 k=7 | 贪心 +40%；移除 −38% 回归 |
+| 宿主/配置 | O1/O2 host fastpath、prefix caching + mamba align、accept workspace pin | c≥4 +3.5~6.6%；生产命中 91.5% |
+
+**累计**：同一 Qwen3.8-27B-FP8 / TP=4 单流，128k 从 2026-10-27 的 31.4 t/s 提升到
+2026-11-05 的 ≈50 t/s（131k 实测 50.65 t/s）。
 
 ## 1. 硬件与软件栈
 

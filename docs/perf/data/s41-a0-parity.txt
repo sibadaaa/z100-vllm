@@ -1,6 +1,0 @@
-S41 A0 位同复核(2026-10-31, kill-fast gate)
-臂1 m1:  VLLM_DCU_FP8_GEMV_WA=0 M1=1 PF4=0  -> .s41/a-wholea-ref.pt
-臂2 wa:  VLLM_DCU_FP8_GEMV_WA=1 M1=1 PF4=0  -> .s41/a-wholea-new.pt
-七形状 torch.equal: attn_qkv/gdn_in_qkv/gate_up/gdn_in_z/attn_o/gdn_out/down = 全 True
-附加复核(完整服务 env: STREAM_ROWS=4, DECODE_CFG=35):
-  .s41/a-fullenv-{ref,new}.pt 七形状 torch.equal = 全 True

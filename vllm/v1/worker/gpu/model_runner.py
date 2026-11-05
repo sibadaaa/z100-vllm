@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -1334,6 +1335,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         prefill_runs_as_decode_np = None
         decode_graph_eligible = not has_prefill
+        # VLLM_CG_DECODE_MAX_CTX (z100 VMFault follow-up): a FULL decode graph
+        # bakes the capture-time split-KV segment count, so long-context
+        # replays lose segment parallelism (~-25% tps at 128k on gfx906).
+        # Decode steps above the threshold run eager (dynamic segments).
+        # Unset = no gate (upstream behavior).
+        max_ctx = os.environ.get("VLLM_CG_DECODE_MAX_CTX")
+        if decode_graph_eligible and max_ctx:
+            seq_upper = (
+                self.req_states.num_computed_tokens_np[idx_mapping_np]
+                + num_scheduled_tokens
+            )
+            decode_graph_eligible = bool((seq_upper <= int(max_ctx)).all())
         if has_prefill and self.pcp_manager is None:
             # One new prompt token over existing context (possibly padded with
             # placeholder drafts) runs as a decode. PCP partitions prefill rows.

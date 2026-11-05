@@ -1,8 +1,0 @@
-attn_qkv     equal=True max|d|=0.0
-gdn_in_qkv   equal=True max|d|=0.0
-gate_up      equal=True max|d|=0.0
-gdn_in_z     equal=True max|d|=0.0
-attn_o       equal=True max|d|=0.0
-gdn_out      equal=True max|d|=0.0
-down         equal=True max|d|=0.0
-PARITY ALL-GREEN

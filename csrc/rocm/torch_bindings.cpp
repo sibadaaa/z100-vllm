@@ -53,6 +53,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
+  // S53-ATTN: gfx906 decode split-KV attention inner-loop rebuild (HIP);
+  // env-gated on the Python side (VLLM_GFX906_ATTN_DECODE_HIP_INNER),
+  // supported subset only, segm buffers shared with the Triton 3D kernel.
+  // B832: block_size % 16 == 0 (production hybrid page 832); optional fp32
+  // KV descales fold into the kernel's softmax scale / accumulator.
+  rocm_ops.def(
+      "gfx906_attnd_decode_inner(Tensor! segm_output, Tensor! segm_max, "
+      "Tensor! segm_expsum, Tensor query, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_tables, Tensor seq_lens, "
+      "Tensor cu_query_lens, float scale, int num_segments, "
+      "bool delayed_merge, int tps_hint, "
+      "Tensor? k_descale=None, Tensor? v_descale=None) -> ()");
+  rocm_ops.impl("gfx906_attnd_decode_inner", torch::kCUDA,
+                &gfx906_attnd_decode_inner);
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(

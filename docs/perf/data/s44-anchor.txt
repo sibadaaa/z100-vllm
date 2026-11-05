@@ -1,9 +1,0 @@
-/home/lyh/z100-vllm/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
-No module named 'vllm._version'
-  from .version import __version__, __version_tuple__  # isort:skip
-device=Z100L l2=8388608 multiprocessors=60 window=30reps x7 op=prod
-/home/lyh/z100-vllm/.s40/gemv_bw_bench.py:133: UserWarning: expandable_segments not supported on this platform (Triggered internally at /home/pytorch/c10/hip/HIPAllocatorConfig.h:42.)
-  x = torch.empty(512 * 1024 * 1024, dtype=torch.float16, device="cuda")
-anchor read-only sum(1GiB fp16) win  1354.17us/rep ->   792.9 GB/s
-gate_up      [prod  ] copies=18  win    79.20us/rep ->   563.2 GB/s  (win p10 78.58 p90 86.84 us/rep)
-wrote /home/lyh/z100-vllm/.s40/gemv_bw_win_s44-anchor.json

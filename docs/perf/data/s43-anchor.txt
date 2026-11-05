@@ -1,7 +1,0 @@
-/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
-No module named 'vllm._version'
-  from .version import __version__, __version_tuple__  # isort:skip
-device=Z100L l2=8388608 multiprocessors=60 window=30reps x7 op=prod
-anchor read-only sum(1GiB fp16) win  1354.63us/rep ->   792.6 GB/s
-gate_up      [prod  ] copies=18  win    78.54us/rep ->   567.9 GB/s  (win p10 78.25 p90 86.99 us/rep)
-wrote /src/.s40/gemv_bw_win_s43-anchor.json

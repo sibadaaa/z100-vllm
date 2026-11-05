@@ -96,6 +96,26 @@ policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完�
 - 回滚：注释上两行 env + `sudo systemctl restart z100-vllm-mtp2`（env 去 0
   = 逐位恢复 S43 态；`.so` 未动，`_C_stable_libtorch` md5 `54ccf2e2`）。
 
+## S46 复役：MTP k=2 于 S44/S45 采纳栈（2026-11-01）
+
+| 项 | 值 |
+|---|---|
+| **SPEC_OFF** | **（已注释）** 移除后 `launch_mtp2.sh` 默认 `--speculative-config {"method":"mtp","num_speculative_tokens":2}` |
+
+- 证据：同日 ABAB W1 med B 51.35/52.72 vs A 38.44/39.16 t/s（配对
+  +33.6%/+34.6%，门 +29%）；W2 B 池中位 42.4 ≥ 施工图绝对下限 41.3
+  （严格配对 +12.4%，B2 配对 +18.1%；当日 A 臂 W2 偏强属分母效应）；
+  board `first_div=None`（verify 无损先例）；accept/drafts 代理
+  2.46 true tok/step（≥2.0）。`runs/s46/e2e-s46-mtp-*.json`、
+  `runs/s44/board-s46-*.json`、`docs/perf/data/s46-*.txt`、`.s46/mtp-adopt.md`。
+- 长 ctx（同日同口径，软门仅记录）：50k +179%（24.8 vs 8.9 tps）；
+  128k −16%（15.2 vs 18.0，S37 +28% 未在本栈复现——dynk k=1 区间经济学，
+  S47 候选）；128k TTFT +6%（370 vs 347 s）。
+- 运营：MTP 臂跑 `/start_profile` 沿用 S38/S41 预案（stop 超时 → health
+  000 → restart 恢复；本日 1/1 见 `.s46/mtp-adopt.md` §异常，干净路径不触发）。
+- 回滚：取消注释上行 + `sudo systemctl restart z100-vllm-mtp2`
+  （env 级，零 `.so`/代码变更）。
+
 ## 注意
 
 - **DSH/agent 负载影响**：每请求 TTFT +~1.7 s（draft 预填充），生成段 −17% 左右。

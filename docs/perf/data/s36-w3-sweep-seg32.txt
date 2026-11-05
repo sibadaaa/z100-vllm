@@ -1,3 +1,0 @@
-ctx~ 16384: warm   18.9s | decode 15 tok ITL p50   28.3 ms min   28.2 max   32.9
-ctx~ 32768: warm   30.5s | decode 15 tok ITL p50   31.8 ms min   31.1 max   36.2
-ctx~ 65536: warm   97.9s | decode 15 tok ITL p50   38.5 ms min   38.4 max   40.3

@@ -1,5 +1,0 @@
-[s44-ar-hybrid] rep1: n=96 finish=length e2e=11.463s repeat=False
-[s44-ar-hybrid] rep2: n=96 finish=length e2e=3.112s repeat=False
-[s44-ar-hybrid] rep3: n=96 finish=length e2e=3.192s repeat=False
-[s44-ar-hybrid] wrote /home/lyh/z100-vllm/runs/s44/board-s44-ar-hybrid.json
-[s44-ar-hybrid] vs board-s44-ar-base.json: len 96 vs 96, first_div=2, n_common=2, |dlp| p50=2.88e-03 p90=2.88e-03 max=2.88e-03

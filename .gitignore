@@ -89,7 +89,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
-
+runs/s*
 # Translations
 *.mo
 *.pot
@@ -330,3 +330,12 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 tools/dcu/__pycache__/
 !tests/kernels/test_gfx906_packed_silu_fp16.py
 !tests/platforms/test_hygon_dtk.py
+
+# --- Z100 local-only archives (kept on disk, never uploaded to GitHub) --------
+# Design/construction docs for the Z100 optimization rounds (archived locally).
+docs/design/z100/
+# Old-session perf data moved out of the hot path (see docs/perf/data/archive/);
+# only the latest session + the reference baselines stay tracked.
+docs/perf/data/archive/
+# Latest-session perf data: local reference, not committed.
+docs/perf/data/s55-*

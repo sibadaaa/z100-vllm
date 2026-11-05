@@ -38,6 +38,19 @@ ENABLE_GFX906_TRITON_CAUSAL_CONV1D = os.getenv(
     "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "0"
 ).lower() in {"1", "true", "yes", "on"}
 
+# gfx906 launch-safety sync for the PYTHON fallback's prefill branch (S51):
+# the same compute-ring wedge that hit the fully-async Triton conv also
+# wedges the fallback once its per-sequence .item() boundary reads became
+# sync-free (query_start_loc_cpu mirror): during 90k-token prefills the
+# compute ring spins at 100% with no completion, every TP worker's submit
+# thread blocks inside F.conv1d on hsa_signal_wait_scacquire, and only
+# killing the process recovers the card (7 incidents, .s51/capture_h1).
+# Draining the stream after each conv bounds the in-flight window.  Off by
+# default; opt in with VLLM_GFX906_CONV_PREFILL_DRAIN=1.
+ENABLE_GFX906_CONV_PREFILL_DRAIN = os.getenv(
+    "VLLM_GFX906_CONV_PREFILL_DRAIN", "0"
+).lower() in {"1", "true", "yes", "on"}
+
 # gfx906 launch-safety sync: synchronize the stream right after the Triton
 # prefill kernel launch. On gfx906, serving long chunked prefills with the
 # fully-async Triton conv (no per-layer .item() syncs like the fallback)
@@ -259,6 +272,9 @@ def _causal_conv1d_gfx906_fallback(
             seq_out = F.conv1d(
                 full_x, weight_conv, bias=bias, groups=dim
             ).squeeze(0)
+            if (ENABLE_GFX906_CONV_PREFILL_DRAIN
+                    and not torch.cuda.is_current_stream_capturing()):
+                torch.cuda.synchronize()
         if activation in ["silu", "swish"]:
             seq_out = F.silu(seq_out)
         if valid is not None:

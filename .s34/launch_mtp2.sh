@@ -59,8 +59,28 @@ DEVICES="${DEVICES:-0,1,2,3}"
 ITER_DETAILS="${ITER_DETAILS:-0}"
 # S38 A1 debug knob: EAGER=1 replaces the piecewise-cudagraph compilation
 # config with --enforce-eager (bisect: capture vs inductor graph handling).
+# WP-A1 (z100-single-stream-decode construction §3): COMPILATION_CONFIG, when
+# set, overrides the cudagraph compilation config verbatim.  Default unset =
+# byte-identical production behaviour.  Rollback: unset the env (systemd
+# drop-in removal) + restart.
 if [ "${EAGER:-0}" = "1" ]; then
   EAGER_ARGS=(--enforce-eager)
+elif [ -n "${COMPILATION_CONFIG:-}" ]; then
+  echo "[host-serve] COMPILATION_CONFIG override: ${COMPILATION_CONFIG}"
+  EAGER_ARGS=(--compilation-config "${COMPILATION_CONFIG}")
+elif [ "${CG_MODE:-}" = "full_decode" ]; then
+  # WP-A1 arm B: full cudagraph on decode batches only (prefill stays eager).
+  COMP='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4]}'
+  echo "[host-serve] CG_MODE=full_decode -> ${COMP}"
+  EAGER_ARGS=(--compilation-config "${COMP}")
+elif [ "${CG_MODE:-}" = "full_decode_m1" ]; then
+  # WP-A1 mitigation arm: capture ONLY the batch-1 decode graph.  Single
+  # stream keeps the FULL-graph TPOT win; batch>=2 decode falls back to
+  # eager (correct but slower than PIECEWISE graphs) -- sidesteps the
+  # mamba precopy VMFault that only fires under batch>=2 FULL replays.
+  COMP='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'
+  echo "[host-serve] CG_MODE=full_decode_m1 -> ${COMP}"
+  EAGER_ARGS=(--compilation-config "${COMP}")
 else
   EAGER_ARGS=(--compilation-config '{"cudagraph_mode":"piecewise","cudagraph_capture_sizes":[1,2,4]}')
 fi
@@ -92,7 +112,10 @@ export VLLM_CACHE_ROOT="${_VLLM_CACHE_OVERRIDE:-/mnt/game/vllm-cache-host}"
 export TRITON_CACHE_DIR="${_TRITON_CACHE_OVERRIDE:-/mnt/game/host-serve/triton-cache}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TOKENIZERS_PARALLELISM=false
-export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+# WP-A1 VMFault debug: caller may override the allocator mode (systemd drop-in
+# sets PYTORCH_HIP_ALLOC_CONF=expandable_segments:False on the debug arm);
+# default stays the shipped expandable_segments:True.
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
 export HIP_VISIBLE_DEVICES="${DEVICES}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 export PYTHONUNBUFFERED=1
@@ -182,6 +205,12 @@ export VLLM_GFX906_ATTN_DECODE_BLOCK_M="${VLLM_GFX906_ATTN_DECODE_BLOCK_M:-16}"
 export VLLM_GFX906_TRITON_ATTN_PREFILL_3D="${VLLM_GFX906_TRITON_ATTN_PREFILL_3D:-1}"
 export VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX="${VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX:-16384}"
 export VLLM_GFX906_ATTN_PREFILL_SEGMENTS="${VLLM_GFX906_ATTN_PREFILL_SEGMENTS:-4}"
+# S51 (2026-11-03): drain the stream after each conv in the gfx906 conv1d
+# fallback prefill branch.  Bounds the deep in-flight launch window that
+# wedges the compute ring on 90k prefills (all TP submit threads freeze
+# inside F.conv1d on hsa_signal_wait_scacquire; 7+ incidents, .s51/).
+# Default OFF; turn on per-boot via systemd drop-in Environment=...=1.
+export VLLM_GFX906_CONV_PREFILL_DRAIN="${VLLM_GFX906_CONV_PREFILL_DRAIN:-0}"
 
 # WP0.4 policy fingerprint (construction §4 WP0.4): print the *effective* value
 # of every VLLM_DCU_*/VLLM_GFX906_*/VLLM_QWEN35_*/VLLM_S24_*/VLLM_SPEC_* knob

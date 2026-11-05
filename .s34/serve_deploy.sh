@@ -30,7 +30,18 @@ export VLLM_DCU_CUSTOM_AR_MAX_KIB=128
 # no --speculative-config (SPEC_OFF implemented in launch_mtp2.sh, DEPLOY.md
 # contract).  Rollback: comment out the next line + systemctl restart
 # z100-vllm-mtp2 (root) to restore MTP k=2 (~51.6 greedy t/s, warm TTFT 2.4 s).
-export SPEC_OFF=1
+# S46 (ADOPTED 2026-11-01): MTP k=2 recommissioned on the S44/S45 adopted
+# stack (AR fusion hybrid + W8A16 silu-mul fold).  SPEC_OFF commented out per
+# the documented contract -> launch_mtp2.sh boots the MTP k=2 default via CLI.
+# Same-day ABAB (runs/s46/e2e-s46-mtp-{B1,A1,B2,A2}.json): W1 med 51.35/52.72
+# (B) vs 38.44/39.16 (A) = +33.6%/+34.6% paired (gate +29%); W2 med 40.06/44.49
+# vs 37.72/37.66 (B-pooled 42.4 >= 41.3 floor, strict paired +12.4%); TTFT
+# 2.44-2.47 s (S34 cost band); board first_div=None.  Long-ctx same-protocol:
+# 50k +179% (24.8 vs 8.9 tps); 128k -16% (15.2 vs 18.0; S37 +28% NOT
+# reproduced on this stack, soft gate, recorded only).  Details:
+# .s46/mtp-adopt.md.  Rollback: uncomment the next line + systemctl restart
+# z100-vllm-mtp2 (env-level, zero .so/code change).
+# export SPEC_OFF=1
 # S39-B1 probe (TEMPORARY, remove after the verdict): one-time log of
 # custom-AR refusals to decide the nccl ring fallback root cause.
 # S38 A1 (temporary ABAB toggle): fuse the DCU push-AR epilogue with the
@@ -62,7 +73,13 @@ export VLLM_DCU_CUSTOM_AR_FUSION_MLP=0
 # rebuilt _rocm_C (md5 6dee7fad; backup _rocm_C.s44-before.so = f72bb39d).
 # Rollback: comment the export + systemctl restart (env-off = bitwise
 # pre-S45 path; with the old .so also restored, fully pre-S45).
-export VLLM_DCU_W8A16_SILU_MUL=1
+# S49-A1 (2026-11-03) REVERTED: the smul fold's whole-A staging reads g|u,
+# doubling per-launch A traffic to N*K (= the W bytes); measured down GEMV
+# 69.8us/319 GB/s vs plain 41.8us/534 (graph trace + card-3 window bench,
+# output bit-identical either way).  See runs/fulldec/graph_recalibration.md
+# section 2 and docs/design/z100/s49/.  Re-enable only behind the S49
+# L2-smul kernel variant (per-slice A read, no whole-row staging).
+# export VLLM_DCU_W8A16_SILU_MUL=1
 # NOTE (S45 audit, DO NOT SET): VLLM_QWEN35_EMPTY_CORE_ATTN_OUT=1 forks the
 # greedy stream -- gdn_attention_core leaves elements of core_attn_out
 # unwritten and downstream reads them; the torch.zeros is load-bearing
@@ -74,6 +91,14 @@ export VLLM_DCU_W8A16_SILU_MUL=1
 # Rollback: comment the export + systemctl restart (e2e ABAB: no regression;
 # A-vs-B logprob 0.0107 nat, 0 token mismatch; trace 808.6 vs 899.3 us).
 export VLLM_DCU_FP16_GEMV_STREAM=1
+# S53-ATTN (2026-11-04, user-approved production): gfx906 decode split-KV
+# attention inner-loop rebuild (HIP dot2, csrc/rocm/attnd_inner.hip) --
+# microbench 141 GB/s dedup @109k = 2.35x in-service Triton; numerics
+# 12/12 vs SDPA fp32 (|d| <= 1.4e-4); env-gated dispatch, supported subset
+# only (num_seqs 1 / causal / fp16 / head 256 / GQA6), else Triton bit-path.
+# Rollback: comment this export + systemctl restart z100-vllm-mtp2 (the
+# dispatch reads the env live; the Triton path is bit-identical to pre-S53).
+export VLLM_GFX906_ATTN_DECODE_HIP_INNER=1
 # S41-A1 (ABAB in progress, 2026-10-31): wholea adoption candidate --
 # route M==1 fp8 GEMV to fp8_emu_gemv_wholea_m1_kernel (bit-identical to m1,
 # .s41/a0 dump 7/7 torch.equal green; probe window 643 vs m1-form 582).

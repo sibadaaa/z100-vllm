@@ -1,5 +1,0 @@
-/home/lyh/z100-vllm/.s45/n2a_parity.py:33: UserWarning: expandable_segments not supported on this platform (Triggered internally at /home/pytorch/c10/hip/HIPAllocatorConfig.h:42.)
-  w = (torch.randn(N, K, device=dev) * 0.05).to(fp8)
-M=1: torch.equal=True max|d|=0.000e+00 ref[:4]=[0.0104217529296875, -0.014007568359375, -0.0006856918334960938, 0.00022852420806884766] got[:4]=[0.0104217529296875, -0.014007568359375, -0.0006856918334960938, 0.00022852420806884766]
-M=4 (fallback arm): torch.equal=True
-PARITY: PASS

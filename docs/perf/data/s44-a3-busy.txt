@@ -1,2 +1,0 @@
-BASE(N0): decode steps=39 GPU busy = 21.599 ms/step (interval-union)
-B2(hybrid): decode steps=39 GPU busy = 22.911 ms/step (interval-union)

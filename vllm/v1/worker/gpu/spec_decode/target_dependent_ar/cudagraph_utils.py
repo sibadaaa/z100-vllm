@@ -9,6 +9,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cg_sentinel import maybe_register_full_graph_buffers
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
@@ -115,3 +116,14 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
             )
 
         super().capture(create_forward_fn, progress_bar_desc)
+        # WP-B1: register the draft FULL graphs' static input buffers for the
+        # replay sentinel (no-op unless VLLM_CG_SENTINEL=1). poison_staging
+        # off: the draft never stages the target's GDN spec buffers.
+        maybe_register_full_graph_buffers(
+            self,
+            input_buffers,
+            block_tables,
+            model_state,
+            attn_groups,
+            poison_staging=False,
+        )

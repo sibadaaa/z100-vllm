@@ -1,7 +1,0 @@
-attn_qkv     [cold] copies=43     56.80us ->   323.5 GB/s  (p10 54.7us)
-gdn_in_qkv   [cold] copies=61     45.76us ->   286.8 GB/s  (p10 45.1us)
-gate_up      [cold] copies=18     94.08us ->   474.1 GB/s  (p10 93.6us)
-gdn_in_z     [cold] copies=102    40.80us ->   193.1 GB/s  (p10 38.7us)
-attn_o       [cold] copies=102    45.28us ->   174.0 GB/s  (p10 44.0us)
-gdn_out      [cold] copies=102    45.76us ->   172.2 GB/s  (p10 45.3us)
-down         [cold] copies=36     65.44us ->   340.9 GB/s  (p10 64.5us)

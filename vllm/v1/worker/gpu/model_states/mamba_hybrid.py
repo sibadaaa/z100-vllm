@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -35,6 +37,16 @@ from vllm.v1.worker.mamba_utils import (
     validate_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
+
+# WP-A1 VMFault debug: validate the mamba align decision tables before the
+# pre-copy launch so a bad column/pointer aborts on the host with the full
+# table dump instead of a GPU VMFault (see
+# docs/design/z100/single-stream/z100-single-stream-decode-result.md §7).
+_MAMBA_DEBUG_CHECK = (
+    os.environ.get("VLLM_MAMBA_DEBUG_CHECK", "0") == "1"
+)
 
 
 @dataclass
@@ -176,6 +188,84 @@ class MambaHybridModelState(DefaultModelState):
             [block_tables.block_tables[gid].gpu for gid in mamba_group_ids],
             [block_tables.input_block_tables[gid] for gid in mamba_group_ids],
         )
+        if _MAMBA_DEBUG_CHECK:
+            # Keep the init-time block tables for the per-step pointer-divergence
+            # check (the copy kernels hold data_ptr()s captured here).
+            self._mamba_debug_bt_gpu = [
+                block_tables.block_tables[gid].gpu for gid in mamba_group_ids
+            ]
+
+    def _mamba_debug_precheck(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+        num_reqs: int,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        """Dump-and-abort validation of the align decision tables.
+
+        Runs between the decision kernel and the pre-copy launch, so any value
+        that would make ``precopy_mamba_align_fused_kernel`` write outside the
+        mamba pool aborts here with the full table state on the host.
+        """
+        assert self._mamba_ctx is not None
+        torch.cuda.synchronize()
+        ctx = self._mamba_ctx
+        num_blocks = kv_cache_config.num_blocks
+        state_idx = self._mamba_state_idx_gpu[:num_reqs].tolist()
+        src_col = self._mamba_src_col_gpu[:num_reqs].tolist()
+        src_off = self._mamba_src_off_gpu[:num_reqs].tolist()
+        accepted = self.num_accepted_tokens_gpu[:num_reqs].tolist()
+        idx_mapping = input_batch.idx_mapping[:num_reqs].tolist()
+        problems: list[str] = []
+        for r, (si, sc) in enumerate(zip(state_idx, src_col)):
+            if not (0 <= si < num_blocks):
+                problems.append(f"slot {r}: state_idx={si} out of "
+                                f"[0, {num_blocks})")
+            if not (-1 <= sc < num_blocks):
+                problems.append(f"slot {r}: src_col={sc} out of "
+                                f"[-1, {num_blocks})")
+        # Pointer divergence: the kernels read the block tables through the
+        # data_ptrs captured at initialize; if the live tables moved, those
+        # reads (and the columns derived from them) are garbage.
+        captured_ptrs = ctx.block_table_ptrs[: len(self._mamba_debug_bt_gpu)]
+        captured_ptrs = [p & 0xFFFFFFFFFFFFFFFF for p in captured_ptrs.tolist()]
+        for i, bt in enumerate(self._mamba_debug_bt_gpu):
+            live = int(bt.data_ptr())
+            if captured_ptrs[i] != live:
+                problems.append(
+                    f"group {i}: block_table ptr diverged: captured="
+                    f"{captured_ptrs[i]:#x} live={live:#x} (shape="
+                    f"{tuple(bt.shape)})")
+        if problems:
+            captured_hex = [hex(p) for p in captured_ptrs]
+            live_hex = [hex(int(bt.data_ptr()))
+                        for bt in self._mamba_debug_bt_gpu]
+            live_shapes = [tuple(bt.shape) for bt in self._mamba_debug_bt_gpu]
+            live_rows = [bt[:num_reqs].tolist()
+                         for bt in self._mamba_debug_bt_gpu]
+            dump = (
+                "mamba align decision tables (num_reqs="
+                f"{num_reqs}, num_blocks={num_blocks}, "
+                f"num_states={ctx.num_states}):\n"
+                f"  state_idx      = {state_idx}\n"
+                f"  src_col        = {src_col}\n"
+                f"  src_off        = {src_off}\n"
+                f"  num_accepted   = {accepted}\n"
+                f"  idx_mapping    = {idx_mapping}\n"
+                f"  captured bt ptrs = {captured_hex}\n"
+                f"  live bt ptrs     = {live_hex}\n"
+                f"  live bt shapes   = {live_shapes}\n"
+                f"  live bt rows     = {live_rows}\n"
+                f"  computed_tokens  = {num_computed_tokens[:num_reqs].tolist()}\n"
+                f"  problems: {problems}"
+            )
+            logger.error("%s", dump)
+            raise RuntimeError(
+                "mamba align pre-copy decision tables invalid; refusing to "
+                "launch the pre-copy kernel (VMFault prevention). See the "
+                "dump above.")
 
     def preprocess_state(
         self,
@@ -219,6 +309,11 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        if _MAMBA_DEBUG_CHECK:
+            self._mamba_debug_precheck(
+                input_batch, block_tables, kv_cache_config, num_reqs,
+                num_computed_tokens,
+            )
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,

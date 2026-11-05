@@ -1,9 +1,0 @@
-== PF4=0: stream vs prod (fp16, M=1) ==
-  w = torch.randn(N, K, dtype=torch.float16, device="cuda",
-attn_qkv     max|d|=0.00003 rel=5.86e-06 maxulp=1.00 mism=1.67e-03
-gdn_in_qkv   max|d|=0.00024 rel=4.46e-05 maxulp=1.00 mism=7.81e-04
-gate_up      max|d|=0.00098 rel=1.82e-04 maxulp=2.00 mism=1.61e-03
-attn_o       max|d|=0.00000 rel=5.29e-07 maxulp=1.00 mism=3.91e-04
-down         max|d|=0.00049 rel=7.40e-05 maxulp=1.00 mism=5.86e-04
-lm_head      max|d|=0.00195 rel=2.74e-04 maxulp=5.00 mism=1.16e-03
-worst rel=2.74e-04 worst mism frac=1.67e-03 -> PASS (gate rel<=3e-4; S29 board judges in-service)
