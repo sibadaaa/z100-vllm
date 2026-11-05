@@ -1,0 +1,113 @@
+{
+ "rows": "8",
+ "device": "Z100L",
+ "shapes": {
+  "attn_qkv": {
+   "cold": {
+    "us": 57.44,
+    "GBps": 319.9,
+    "copies": 43,
+    "n": 1720
+   },
+   "hot": {
+    "us": 57.92,
+    "GBps": 317.2,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.01
+  },
+  "gdn_in_qkv": {
+   "cold": {
+    "us": 49.44,
+    "GBps": 265.5,
+    "copies": 61,
+    "n": 2440
+   },
+   "hot": {
+    "us": 50.08,
+    "GBps": 262.1,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.01
+  },
+  "gate_up": {
+   "cold": {
+    "us": 100.0,
+    "GBps": 446.0,
+    "copies": 18,
+    "n": 720
+   },
+   "hot": {
+    "us": 100.48,
+    "GBps": 443.9,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.0
+  },
+  "gdn_in_z": {
+   "cold": {
+    "us": 41.6,
+    "GBps": 189.4,
+    "copies": 102,
+    "n": 4080
+   },
+   "hot": {
+    "us": 41.92,
+    "GBps": 188.0,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.01
+  },
+  "attn_o": {
+   "cold": {
+    "us": 44.96,
+    "GBps": 175.3,
+    "copies": 102,
+    "n": 4080
+   },
+   "hot": {
+    "us": 45.04,
+    "GBps": 174.9,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.0
+  },
+  "gdn_out": {
+   "cold": {
+    "us": 45.12,
+    "GBps": 174.6,
+    "copies": 102,
+    "n": 4080
+   },
+   "hot": {
+    "us": 45.12,
+    "GBps": 174.6,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.0
+  },
+  "down": {
+   "cold": {
+    "us": 67.52,
+    "GBps": 330.4,
+    "copies": 36,
+    "n": 1440
+   },
+   "hot": {
+    "us": 67.84,
+    "GBps": 328.8,
+    "copies": 1,
+    "n": 200
+   },
+   "cold_hot_ratio": 1.0
+  }
+ },
+ "read_only_GBps": 783.6,
+ "d2d_GBps": 808.5
+}

@@ -313,6 +313,75 @@ void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
   }
 }
 
+// S37 W4: push all-reduce with a fused add-rmsnorm epilogue.  residual is
+// updated in place; `out` receives s * rrms * norm_w.  Same staging /
+// registration contract as all_reduce(); hidden must divide numel and fit
+// one 1024-thread block (8 packed fp16 per thread unit).
+void all_reduce_fused(fptr_t _fa, torch::stable::Tensor& inp,
+                      torch::stable::Tensor& out,
+                      torch::stable::Tensor& residual,
+                      torch::stable::Tensor& norm_w, int64_t hidden,
+                      double eps, fptr_t _reg_buffer,
+                      int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      inp.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(inp.get_device_index());
+
+  STD_TORCH_CHECK((inp.scalar_type()) == (out.scalar_type()));
+  STD_TORCH_CHECK((inp.scalar_type()) == (residual.scalar_type()));
+  STD_TORCH_CHECK((inp.scalar_type()) == (norm_w.scalar_type()));
+  STD_TORCH_CHECK((inp.numel()) == (out.numel()));
+  STD_TORCH_CHECK((inp.numel()) == (residual.numel()));
+  STD_TORCH_CHECK((norm_w.numel()) == hidden);
+  STD_TORCH_CHECK(_is_weak_contiguous(out));
+  STD_TORCH_CHECK(_is_weak_contiguous(inp));
+  STD_TORCH_CHECK(_is_weak_contiguous(residual));
+  STD_TORCH_CHECK(_is_weak_contiguous(norm_w));
+  STD_TORCH_CHECK(inp.dim() == 2 && inp.size(1) == hidden);
+  auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  int64_t chunk_bytes = 0;
+  if (reg_buffer && fa->world_size_ > 0) {
+    chunk_bytes = reg_buffer_sz_bytes / fa->world_size_;
+  }
+  if (reg_buffer) {
+    STD_TORCH_CHECK((input_size) <= (chunk_bytes > 0 ? chunk_bytes
+                                                     : reg_buffer_sz_bytes));
+  } else {
+    reg_buffer = inp.mutable_data_ptr();
+  }
+  switch (out.scalar_type()) {
+    case torch::headeronly::ScalarType::Float: {
+      const int c = (int)(chunk_bytes / 16);
+      fa->allreduce_fused<float>(
+          stream, reinterpret_cast<float*>(reg_buffer),
+          reinterpret_cast<const float*>(inp.const_data_ptr()),
+          reinterpret_cast<float*>(out.mutable_data_ptr()),
+          reinterpret_cast<float*>(residual.mutable_data_ptr()),
+          reinterpret_cast<const float*>(norm_w.const_data_ptr()),
+          out.numel(), (int)hidden, (float)eps, 1024, vllm::defaultBlockLimit,
+          c);
+      break;
+    }
+    case torch::headeronly::ScalarType::Half: {
+      const int c = (int)(chunk_bytes / 16);
+      fa->allreduce_fused<half>(
+          stream, reinterpret_cast<half*>(reg_buffer),
+          reinterpret_cast<const half*>(inp.const_data_ptr()),
+          reinterpret_cast<half*>(out.mutable_data_ptr()),
+          reinterpret_cast<half*>(residual.mutable_data_ptr()),
+          reinterpret_cast<const half*>(norm_w.const_data_ptr()),
+          out.numel(), (int)hidden, (float)eps, 1024, vllm::defaultBlockLimit,
+          c);
+      break;
+    }
+    default:
+      throw std::runtime_error(
+          "fused allreduce only supports float32 and float16");
+  }
+}
+
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
 }

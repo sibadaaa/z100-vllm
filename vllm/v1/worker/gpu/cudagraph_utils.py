@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cg_sentinel import maybe_register_full_graph_buffers
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -558,6 +559,13 @@ class CudaGraphManager:
             f"Expected FULL mode, got {desc.cg_mode}"
         )
         assert desc in self.graphs, f"No cudagraph for {desc}"
+        # WP-B2 sentinel: per-manager registry (target and speculator graphs
+        # have different static-input sets; both replay through here).
+        sent = getattr(self, "_cg_sentinel", None)
+        num_reqs = desc.num_reqs or 0
+        if sent is not None:
+            sent.check_before_replay(num_reqs, desc.num_tokens, num_reqs)
+            sent.snapshot_before_replay()
         # Sync offloader before replay - needed when transitioning from
         # eager/piecewise to full cudagraph (e.g., prefill → decode).
         # The previous eager iteration's start_prefetch may have queued
@@ -566,6 +574,9 @@ class CudaGraphManager:
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
         self.graphs[desc].replay()
+        if sent is not None:
+            sent.diff_after_replay(num_reqs)
+            sent.poison_after_replay()
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
@@ -784,6 +795,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
+        # WP-B1: register the FULL graph's static input buffers for the
+        # replay sentinel (no-op unless VLLM_CG_SENTINEL=1).
+        maybe_register_full_graph_buffers(
+            self, input_buffers, block_tables, model_state, attn_groups
+        )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

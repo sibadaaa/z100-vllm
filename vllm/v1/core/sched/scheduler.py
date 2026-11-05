@@ -299,9 +299,16 @@ class Scheduler(SchedulerInterface):
         self.dynk_lo = envs.VLLM_S24_DYNK_LO
         self.dynk_hi = envs.VLLM_S24_DYNK_HI
         self.dynk_ema_beta = envs.VLLM_S24_DYNK_EMA
-        # Acceptance length that still counts as "drafting well" (of k=7).
-        self.dynk_ema_good = 5.0
-        self.dynk_mid_k = 3
+        # Acceptance length that still counts as "drafting well".  S37 B1:
+        # scale with the draft tower height -- the shipped 5.0 was calibrated
+        # for the k=7 M7 tower (docs/perf/data/s36-b1-dynk.txt), so a k=2 MTP
+        # drafter (acceptance EMA ceiling 2.0) is always "weak" and past
+        # dynk_hi verifies a single position.  0.75*k keeps every k=7 value
+        # bit-identical (0.75*7 > 5.0) and gives k=2 a reachable 1.5.
+        # mid_k is clamped to k so a weak step never verifies more positions
+        # than were drafted.
+        self.dynk_ema_good = min(5.0, 0.75 * self.num_spec_tokens)
+        self.dynk_mid_k = min(3, self.num_spec_tokens)
         self.dynk_min_k = 1
         self.dynk_ema: dict[str, float] = {}
         self.dynk_enabled = bool(

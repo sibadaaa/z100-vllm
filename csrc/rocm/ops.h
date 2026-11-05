@@ -2,6 +2,8 @@
 
 #include <torch/all.h>
 
+#include <optional>
+
 #include "rocm/bf16_emu_gemv.h"
 #include "rocm/fp8_emu_gemm.h"
 #include "rocm/w8a8_sdot4.h"
@@ -55,3 +57,18 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type, bool use_interleaved_v_cache);
+
+// S53-ATTN: gfx906 decode split-KV attention inner-loop rebuild (HIP).
+// Supported subset only (gates inside + the Python dispatch); everything
+// else stays on the Triton path. segm_* buffers and reduce_segments are
+// shared with the Triton 3D kernel. B832: any block_size % 16 == 0;
+// k/v_descale (optional fp32, [num_seqs, nkv] or broadcast) fold into the
+// softmax scale / segment-end accumulator.
+void gfx906_attnd_decode_inner(
+    torch::Tensor& segm_output, torch::Tensor& segm_max,
+    torch::Tensor& segm_expsum, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, torch::Tensor& block_tables,
+    torch::Tensor& seq_lens, torch::Tensor& cu_query_lens, double scale,
+    int64_t num_segments, bool delayed_merge, int64_t tps_hint,
+    std::optional<torch::Tensor> k_descale,
+    std::optional<torch::Tensor> v_descale);

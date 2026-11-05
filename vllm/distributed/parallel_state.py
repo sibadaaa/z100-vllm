@@ -208,6 +208,80 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def all_reduce_fused_rmsnorm(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """S37 W4 / S38 A1: all-reduce with a fused add-rmsnorm epilogue.
+
+    Computes s = AR(tensor) + residual (residual updated in place) and
+    returns (s * rrms * (1 + norm_weight), residual) -- the Gemma RMSNorm
+    convention of the Qwen3Next/Qwen3.5 decoder norms, so norm_weight is the
+    RAW weight parameter.  Falls back to the plain all-reduce + the
+    production norm math whenever the DCU fused path is unavailable, so the
+    observable semantics are identical.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_fused_rmsnorm(tensor, residual, norm_weight, eps)
+
+
+def all_reduce_fused_rmsnorm_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(tensor), torch.empty_like(residual)
+
+
+def _fused_add_rmsnorm_gemma(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """S38 A1: the production norm math on this stack, written out (the
+    native impl of ir.ops.fused_add_rms_norm with the Gemma (1 + w) weight
+    convention the Qwen3Next/Qwen3.5 decoder norms use).  Used as the fused
+    epilogue's fallback so the fused and unfused paths agree exactly:
+    s = x_f32 + residual_f32; residual <- fp16(s);
+    out = fp16((s * rrms(s)) * (w_f32 + 1))."""
+    s = x.to(torch.float32) + residual.to(torch.float32)
+    residual.copy_(s.to(x.dtype))
+    w_eff = norm_weight.to(torch.float32) + 1.0
+    out = s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + eps) * w_eff
+    return out.to(x.dtype), residual
+
+
+def tensor_model_parallel_all_reduce_fused_rmsnorm(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """S38 A1: TP all-reduce fused with the following add-rmsnorm (Gemma
+    (1 + w) convention; norm_weight is the raw weight parameter).
+
+    Under compilation this goes through the registered custom op so the call
+    is functionalized and capture-safe; otherwise the group coordinator's
+    method is called directly.  The DCU fused kernel path gates internally
+    (env + shape) and falls back to plain AR + the production norm math, so
+    callers may treat the fused route as always available."""
+    group = get_tp_group()
+    if group.world_size == 1 or not group.use_custom_op_call:
+        return group._all_reduce_fused_rmsnorm(tensor, residual, norm_weight, eps)
+    return torch.ops.vllm.all_reduce_fused_rmsnorm(
+        tensor, residual, norm_weight, eps, group_name=group.unique_name
+    )
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -400,6 +474,13 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_fused_rmsnorm",
+    op_func=all_reduce_fused_rmsnorm,
+    fake_impl=all_reduce_fused_rmsnorm_fake,
+    mutates_args=["residual"],
 )
 
 direct_register_custom_op(
@@ -749,6 +830,58 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
+
+    def _all_reduce_fused_rmsnorm(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """S37 W4 / S38 A1: AR + fused add-rmsnorm epilogue (Gemma (1 + w)
+        convention; norm_weight is the raw weight parameter).  Falls back to
+        the plain AR + the production norm math (ir.ops.fused_add_rms_norm
+        native impl) whenever the DCU fused kernel path is unavailable, so
+        the observable semantics are identical."""
+        if self.world_size == 1:
+            return _fused_add_rmsnorm_gemma(tensor, residual, norm_weight, eps)
+        fused = None
+        fused_fn = getattr(self.device_communicator, "all_reduce_fused", None)
+        dbg = None
+        if (
+            envs.VLLM_DCU_CUSTOM_AR_FUSION_DEBUG
+            and fused_fn is not None
+            and not torch.cuda.is_current_stream_capturing()
+            and getattr(self, "_fused_debug_n", 0) < 16
+            and tensor.float().abs().max().item() > 0
+        ):
+            self._fused_debug_n = getattr(self, "_fused_debug_n", 0) + 1
+            dbg = (
+                tensor.clone(),
+                residual.clone(),
+                norm_weight.float().abs().max().item(),
+                norm_weight.float().flatten()[0].item(),
+                tuple(tensor.shape),
+            )
+        if fused is None and fused_fn is not None:
+            fused = fused_fn(tensor, residual, norm_weight, eps)
+        if fused is None:
+            out = self._all_reduce_out_place(tensor)
+            return _fused_add_rmsnorm_gemma(out, residual, norm_weight, eps)
+        if dbg is not None:
+            x_ref, r_ref, w_abs, w_head, shape = dbg
+            x_ref = self._all_reduce_out_place(x_ref)
+            out_ref, res_ref = _fused_add_rmsnorm_gemma(
+                x_ref, r_ref, norm_weight, eps)
+            d_out = (fused[0].float() - out_ref.float()).abs().max().item()
+            d_res = (fused[1].float() - res_ref.float()).abs().max().item()
+            logger.warning(
+                "S38A1 fused debug: shape=%s d_out=%.3e d_res=%.3e "
+                "|w|=%.3e w_head=%.4f |out|=%.3e",
+                shape, d_out, d_res, w_abs, w_head,
+                fused[0].float().abs().max().item(),
+            )
+        return fused
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

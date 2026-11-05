@@ -110,6 +110,7 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _setup_qwen3next_ar_fusion,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -831,6 +832,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self._qwen35_layer_profile_limit = _qwen35_env_int(
             "VLLM_QWEN35_LAYER_PROFILE_LIMIT", 2
         )
+
+        # S38 A1: fused AR+rmsnorm epilogue (env-gated, default off).
+        _setup_qwen3next_ar_fusion(self)
+        if self._ar_fusion:
+            # The hand-rolled profiling flow below replays the unfused
+            # AR-then-norm sequence, which no longer matches the
+            # reduce_results=False linears -- keep the two debug paths
+            # mutually exclusive (profiling loses to the fusion).
+            self._qwen35_layer_profile_enabled = False
 
     def _use_qwen35_layer_profile(self, hidden_states: torch.Tensor) -> bool:
         if not self._qwen35_layer_profile_enabled:

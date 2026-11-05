@@ -230,7 +230,10 @@ def _layout_ok(
         return False
     if K % 8 or w.stride(0) % 8:
         return False
-    if block_n <= 0 or block_k <= 0 or K % block_k:
+    # block_k must also satisfy the dequant kernel's TORCH_CHECK
+    # (csrc/rocm/fp8_dequant.cuh) so an exotic block_k falls back to the
+    # W8A16 kernel instead of burning a failed route + warning.
+    if block_n <= 0 or block_k <= 0 or block_k % 8 or K % block_k:
         return False
     return tuple(w_s.shape) == ((N + block_n - 1) // block_n, K // block_k)
 

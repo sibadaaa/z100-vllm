@@ -1,0 +1,49 @@
+{
+ "tag": "s38-a1-car",
+ "host": "lyh",
+ "ts": "2026-11-01 02:26:51",
+ "note": "Gemma (1+w) epilogue; raw weight; ref=production ir.ops.fused_add_rms_norm native math",
+ "results": [
+  {
+   "rows": 1,
+   "t_pair_us": 44.10795211791992,
+   "t_fused_us": 37.722365856170654,
+   "ratio": 0.8552282308487641,
+   "max_d_out": 0.0,
+   "max_d_res": 0.0,
+   "rel_out": 0.0,
+   "eq_res": true
+  },
+  {
+   "rows": 4,
+   "t_pair_us": 44.017558097839355,
+   "t_fused_us": 38.19356441497803,
+   "ratio": 0.8676893054831407,
+   "max_d_out": 0.00048828125,
+   "max_d_res": 0.0,
+   "rel_out": 0.00010539629005059021,
+   "eq_res": true
+  },
+  {
+   "rows": 8,
+   "t_pair_us": 43.883957862854004,
+   "t_fused_us": 37.7367639541626,
+   "ratio": 0.8599216158236548,
+   "max_d_out": 0.00048828125,
+   "max_d_res": 0.0,
+   "rel_out": 0.00010040160642570282,
+   "eq_res": true
+  },
+  {
+   "rows": 12,
+   "t_pair_us": 44.016761779785156,
+   "t_fused_us": 39.94636058807373,
+   "ratio": 0.9075261098925098,
+   "max_d_out": 0.00048828125,
+   "max_d_res": 0.0,
+   "rel_out": 0.00010040160642570282,
+   "eq_res": true
+  }
+ ],
+ "gate_fail": true
+}

@@ -708,6 +708,72 @@ def _register_fp8_emu_mm_block_w8a16_auto() -> None:
         return x.new_empty((*x.shape[:-1], w.shape[0]), dtype=out_dtype)
 
 
+def _register_gfx906_w8a16_silu_mul_down() -> None:
+    """S45 N2a: W8A16 down-projection with the SiluAndMul folded into the
+    wholea_m1 GEMV's whole-A staging (M == 1 decode arm only).
+
+    Compiled callers cannot branch on the symbolic token count, so the M
+    decision lives inside this opaque body (same shape as
+    ``fp8_emu_mm_block_w8a16_auto``): M == 1 + the wholea W8A16 arm dispatches
+    ``_rocm_C.fp8_emu_gemm_block_w8a16_smul`` (the gate_up output ``gu``
+    [1, 2K] feeds the kernel directly, the act is never materialized);
+    everything else materializes the act exactly as the production
+    SiluAndMul and reuses the unchanged auto route, so the fallback is
+    bit-identical to today's path by construction.  The csrc entry fails
+    loudly when the wholea arm is not eligible, and the parity gate is
+    torch.equal (.s45/n2a_parity.py).
+    """
+    if hasattr(torch.ops.vllm, "gfx906_w8a16_silu_mul_down"):
+        return
+
+    @torch.library.custom_op(
+        "vllm::gfx906_w8a16_silu_mul_down", mutates_args=()
+    )
+    def gfx906_w8a16_silu_mul_down(
+        gu: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        block_n: int,
+        block_k: int,
+        min_m: int,
+    ) -> torch.Tensor:
+        # Runs eagerly: the branch is on the concrete runtime M.
+        K = gu.shape[-1] // 2
+        m = gu.numel() // (2 * K)
+        if (
+            m == 1
+            and gu.is_contiguous()
+            and hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16_smul")
+        ):
+            lut = _device_lut(w.dtype, gu.device)
+            return torch.ops._rocm_C.fp8_emu_gemm_block_w8a16_smul(
+                gu, w, w_s, lut, bias, out_dtype, _GEMV_THREADS, block_n,
+                block_k
+            )
+        # Single-rounding act (fp32 silu, fp32 mul, one fp16 round) -- the
+        # same math the inductor mul_silu kernel and the in-kernel fold use.
+        act = (torch.nn.functional.silu(gu[..., :K].float())
+               * gu[..., K:].float()).to(gu.dtype)
+        return torch.ops.vllm.fp8_emu_mm_block_w8a16_auto(
+            act, w, w_s, bias, out_dtype, block_n, block_k, min_m
+        )
+
+    @gfx906_w8a16_silu_mul_down.register_fake
+    def _(
+        gu: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        block_n: int,
+        block_k: int,
+        min_m: int,
+    ) -> torch.Tensor:
+        return gu.new_empty((*gu.shape[:-1], w.shape[0]), dtype=out_dtype)
+
+
 if ops_available():
     _register_fp8_emu_mm()
 
@@ -720,6 +786,7 @@ if ops_available_block_quant():
 if hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16"):
     _register_fp8_emu_mm_block_w8a16()
     _register_fp8_emu_mm_block_w8a16_auto()
+    _register_gfx906_w8a16_silu_mul_down()
 
 _register_fp8_emu_lut()
 

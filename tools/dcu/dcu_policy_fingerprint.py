@@ -110,13 +110,77 @@ KNOBS: list[dict] = [
         note="custom all-reduce IPC allocation flag, read in hygon_dtk.py:174",
     ),
     dict(
+        name="VLLM_DCU_CUSTOM_AR_MAX_KIB",
+        kind="int",
+        default=64,
+        src="vllm/envs.py:1579",
+        envs=True,
+        note="S34-WP2 push-AR size gate (KiB); production runs 128",
+    ),
+    dict(
+        name="VLLM_DCU_CUSTOM_AR_FUSION",
+        kind="bool",
+        default=False,
+        src="vllm/envs.py:1584",
+        envs=True,
+        note="S37 W4: fuse add-rmsnorm into the push-AR epilogue",
+    ),
+    dict(
+        name="VLLM_DCU_CUSTOM_AR_FUSION_MLP",
+        kind="bool",
+        default=True,
+        src="vllm/envs.py:1588",
+        envs=True,
+        note="S44 A4: two-exit variant is FAIL under piecewise capture; "
+        "production sets 0 (getter not_off; S49-P2 re-verifies FULL graph)",
+    ),
+    dict(
+        name="VLLM_DCU_CUSTOM_AR_FUSION_SKIP",
+        kind="bool",
+        default=True,
+        src="vllm/envs.py:1593",
+        envs=True,
+        note="S38 A1 bisect switch (getter not_off)",
+    ),
+    dict(
+        name="VLLM_DCU_CUSTOM_AR_FUSION_DEBUG",
+        kind="bool",
+        default=False,
+        src="vllm/envs.py:1597",
+        envs=True,
+    ),
+    dict(
+        name="VLLM_DCU_CUSTOM_AR_FALLBACK_LOG",
+        kind="bool",
+        default=False,
+        src="vllm/distributed/device_communicators/custom_all_reduce.py:545",
+        envs=False,
+        note="S39-B1 probe: one-time log of custom-AR refusals (==1 gate)",
+    ),
+    dict(
+        name="VLLM_DCU_CUSTOM_AR_DEBUG",
+        kind="cxx_int",
+        default=0,
+        src="csrc/custom_all_reduce.cu:135",
+        note="C++ atoi debug level (0 = off)",
+    ),
+    dict(
         name="VLLM_CUSTOM_ALLREDUCE_ALGO",
         kind="str_strip",
         default="",
-        src="vllm/distributed/device_communicators/custom_all_reduce.py:44",
+        src="vllm/distributed/device_communicators/custom_all_reduce.py:48",
         envs=False,
         note="S33 WP2: forced custom AR algorithm (oneshot on PCIe-only "
         "gfx906 groups); empty = C++ dispatch default",
+    ),
+    dict(
+        name="VLLM_CUSTOM_SCOPES_FOR_PROFILING",
+        kind="bool",
+        default=False,
+        src="vllm/envs.py:2299",
+        envs=True,
+        note="torch-profiler named scopes (vllm/v1/utils.py:792); "
+        "getter bool(int(env)) replicated as ne_zero",
     ),
     dict(
         name="VLLM_DCU_USE_GFX906_EMU",
@@ -333,6 +397,64 @@ KNOBS: list[dict] = [
         note="S30c WP2-N: M==1 m1 stream kernel gate (W8A16 route)",
     ),
     dict(
+        name="VLLM_DCU_FP16_GEMV_STREAM",
+        kind="bool",
+        default=False,
+        src="vllm/envs.py:244",
+        envs=True,
+        note="S40 Track B: lm_head-class fp16 GEMV streaming kernel",
+    ),
+    dict(
+        name="VLLM_DCU_W8A16_SILU_MUL",
+        kind="bool",
+        default=False,
+        src="vllm/envs.py:206",
+        envs=True,
+        note="S45 N2a fold SiluAndMul into down wholea staging (M==1); "
+        "S49-A1 reverted (whole-row staging doubles A traffic)",
+    ),
+    dict(
+        name="VLLM_DCU_FP8_GEMV_M3FAST",
+        kind="cxx_int",
+        default=0,
+        src="csrc/rocm/fp8_emu_gemm.cu:1914",
+        post="cxx_flag",
+        note="m3fast candidate gate (enabled iff set and atoi != 0)",
+    ),
+    dict(
+        name="VLLM_DCU_FP8_GEMV_PF4",
+        kind="cxx_int",
+        default=0,
+        src="csrc/rocm/fp8_emu_gemm.cu:657",
+        post="cxx_flag",
+        note="pf[4] pipeline gate (default 0 = pf[2] production pipeline)",
+    ),
+    dict(
+        name="VLLM_DCU_FP8_GEMV_SMALLK",
+        kind="cxx_int",
+        default=0,
+        src="csrc/rocm/fp8_emu_gemm.cu:1860",
+        post="cxx_flag",
+        note="S39 A5 small-K runway (K<=2048 rows=8 gate; default off)",
+    ),
+    dict(
+        name="VLLM_DCU_FP8_GEMV_SPLITK",
+        kind="cxx_int",
+        default=0,
+        src="csrc/rocm/fp8_emu_gemm.cu:1184",
+        post="splitk",
+        note="S37 A3 split-K gate: only 2/3 segments honored, else 0",
+    ),
+    dict(
+        name="VLLM_DCU_FP8_GEMV_STREAM2_ROWS",
+        kind="cxx_int",
+        default=64,
+        src="csrc/rocm/fp8_emu_gemm.cu:1840",
+        post="stream2_rows",
+        note="whole-A rows/block override: 8/16/32 kept, everything "
+        "else (incl. unset) -> 64",
+    ),
+    dict(
         name="VLLM_DCU_FP8_GEMV_WA_L2",
         kind="cxx_int",
         default=0,
@@ -414,6 +536,14 @@ KNOBS: list[dict] = [
         kind="int_e",
         default=4,
         src="vllm/v1/attention/ops/triton_unified_attention.py:104",
+    ),
+    dict(
+        name="VLLM_GFX906_ATTN_DECODE_SEG_MAX",
+        kind="int",
+        default=256,
+        src="vllm/v1/attention/ops/triton_unified_attention.py:63",
+        note="GFX906_MAX_DECODE_SEGMENTS is env-derived (default 256); "
+        "retires CAP_ATTN_MAX_DECODE_SEGMENTS (old compile-time 128)",
     ),
     dict(
         name="VLLM_GFX906_ATTN_PREFILL_3D_WARPS",
@@ -953,12 +1083,8 @@ CAPS: list[dict] = [
         rx=r"^GFX906_VERIFY_MAX_QUERY_LEN = (\d+)$",
         expect=8,
     ),
-    dict(
-        key="CAP_ATTN_MAX_DECODE_SEGMENTS",
-        path="vllm/v1/attention/ops/triton_unified_attention.py",
-        rx=r"^GFX906_MAX_DECODE_SEGMENTS = (\d+)$",
-        expect=128,
-    ),
+    # CAP_ATTN_MAX_DECODE_SEGMENTS retired (S49-E2): the constant is now
+    # env-derived -- see the VLLM_GFX906_ATTN_DECODE_SEG_MAX KNOBS entry.
     dict(
         key="CAP_FP16_PREFILL_FORCE_MIN_M",
         path=("vllm/model_executor/kernels/linear/scaled_mm/gfx906_fp16_prefill.py"),
@@ -969,7 +1095,9 @@ CAPS: list[dict] = [
 
 SCAN_DIRS = ("vllm", "csrc", "tools/dcu")
 SCAN_EXTS = (".py", ".cu", ".cuh", ".cpp", ".h", ".sh")
-_NAME_RX = re.compile(r'"((?:VLLM_(?:DCU|GFX906|QWEN35|S24|SPEC)_[A-Z0-9_]+))"')
+_NAME_RX = re.compile(
+    r'"(VLLM_(?:DCU|GFX906|QWEN35|S24|SPEC)_[A-Z0-9_]+'
+    r'|VLLM_CUSTOM_(?:ALLREDUCE_ALGO|SCOPES_FOR_PROFILING))"')
 KNOB_NAMES = tuple(entry["name"] for entry in KNOBS)
 
 
@@ -1312,6 +1440,20 @@ def _post_cxx_flag(value, raw, ctx):
     return (False if raw is None else _atoi(raw) != 0), []
 
 
+def _post_cxx_int(value, raw, ctx):
+    return value, []
+
+
+def _post_splitk(value, raw, ctx):
+    # csrc/rocm/fp8_emu_gemm.cu splitk_segments(): only 2/3 honored.
+    return (value if value in (2, 3) else 0), []
+
+
+def _post_stream2_rows(value, raw, ctx):
+    # csrc/rocm/fp8_emu_gemm.cu rows2 switch: 8/16/32 kept, else 64.
+    return (value if value in (8, 16, 32) else 64), []
+
+
 POSTS = {
     "arch_auto": _post_arch_auto,
     "bf16_policy": _post_bf16_policy,
@@ -1335,6 +1477,9 @@ POSTS = {
     "smallm": _post_smallm,
     "cxx_enabled": _post_cxx_enabled,
     "cxx_flag": _post_cxx_flag,
+    "cxx_int": _post_cxx_int,
+    "splitk": _post_splitk,
+    "stream2_rows": _post_stream2_rows,
 }
 
 

@@ -370,6 +370,9 @@ class CustomAllreduce:
         )
         self.rank = rank
         self.world_size = world_size
+        # S39 B1 probe: one-time log of custom-AR refusals (H1 capture vs H2
+        # size-gate verdict).  Active only with VLLM_DCU_CUSTOM_AR_FALLBACK_LOG=1.
+        self._fallback_seen: set[tuple] = set()
         self.fully_connected = fully_connected
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
@@ -533,16 +536,51 @@ class CustomAllreduce:
         offsets = cast(list[list[int]], [d[1] for d in all_data])
         ops.register_graph_buffers(self._ptr, handles, offsets)
 
+    def _log_refusal(self, inp: torch.Tensor, reason: str) -> None:
+        """S39 B1 probe: one-time log of custom-AR refusals per
+        (rank, shape, dtype, contiguity, capturing, reason) so one profile
+        window decides whether the nccl ring fallback is capture-driven (H1)
+        or size-gate-driven (H2).  Active only with
+        VLLM_DCU_CUSTOM_AR_FALLBACK_LOG=1."""
+        if os.environ.get("VLLM_DCU_CUSTOM_AR_FALLBACK_LOG", "0") != "1":
+            return
+        capturing = torch.cuda.is_current_stream_capturing()
+        key = (
+            self.rank,
+            tuple(inp.shape),
+            str(inp.dtype),
+            inp.is_contiguous(),
+            capturing,
+            reason,
+        )
+        if key in self._fallback_seen:
+            return
+        self._fallback_seen.add(key)
+        logger.info(
+            "S39B1 CUSTOM_AR refusal rank=%d shape=%s dtype=%s contig=%s "
+            "capturing=%s size=%dB reason=%s",
+            self.rank,
+            tuple(inp.shape),
+            inp.dtype,
+            inp.is_contiguous(),
+            capturing,
+            inp.numel() * inp.element_size(),
+            reason,
+        )
+
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled or self.world_size > 8:
             return False
         if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            self._log_refusal(inp, "dtype")
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
+            self._log_refusal(inp, "align16")
             return False
         if not is_weak_contiguous(inp):
+            self._log_refusal(inp, "noncontig")
             return False
         # gfx906 is opt-in only (RocmPlatform.use_custom_allreduce), so when
         # this gate is reachable at all VLLM_DCU_CUSTOM_AR=1 is set -- it must
@@ -593,6 +631,7 @@ class CustomAllreduce:
             # MTP verify payloads (4 seqs x 3 tok = 120 KiB) can stay on the
             # push path; kernel-side region chunk is 2 MiB.
             if inp_size > envs.VLLM_DCU_CUSTOM_AR_MAX_KIB * 1024:
+                self._log_refusal(inp, "max_kib_gate")
                 return False
             return inp_size < self.max_size
         return False
@@ -633,6 +672,7 @@ class CustomAllreduce:
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
+        # (S39 B1: refusals are logged inside should_custom_ar.)
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
@@ -647,6 +687,66 @@ class CustomAllreduce:
             # cost of cudaMemcpy, which should be small (<=1% of overall
             # latency) compared to the performance gain of using custom kernels
             return self.all_reduce(input, registered=False)
+
+    def custom_all_reduce_fused(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """S37 W4 / S38 A1: push-AR with a fused add-rmsnorm epilogue.
+
+        Returns ``(out, residual)`` with ``residual`` updated in place
+        (s = AR(inp) + residual; out = s * rrms * (1 + norm_weight) -- the
+        Gemma RMSNorm convention of the Qwen3Next/Qwen3.5 decoder norms, so
+        ``norm_weight`` is the RAW weight parameter), or None when the fused
+        path is unavailable -- the caller then falls back to the plain AR +
+        separate norm kernel.  The gates here are trace-stable (env + static
+        shape only); the capture/warmup dance mirrors
+        :meth:`custom_all_reduce`.  The kernel keeps the AR reduction order
+        bit-identical and re-rounds the fp32 sum to fp16 at the same point
+        as the unfused path; only the sum-of-squares tree order is new
+        (governed by the logprob board, not torch.equal).
+        """
+        if self.disabled or not envs.VLLM_DCU_CUSTOM_AR_FUSION:
+            return None
+        if not self.should_custom_ar(inp):
+            return None
+        if inp.dim() != 2 or inp.dtype not in (torch.float16, torch.float32):
+            return None
+        hidden, rows = inp.size(1), inp.size(0)
+        # one 1024-thread block per hidden row, 8 elements per packed unit
+        if hidden % 16 != 0 or hidden // 8 > 1024:
+            return None
+        if not 1 <= rows <= 36:
+            return None
+        out = torch.empty_like(inp)
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                ops.all_reduce_fused(
+                    self._ptr, inp, out, residual, norm_weight, hidden, eps,
+                    self.buffer_ptrs[self.rank], self.max_size)
+                return out, residual
+            # Capture warmup: outputs are discarded; mimic the allocation
+            # pattern and skip the device work (same as custom_all_reduce).
+            return out, residual
+        return self.all_reduce_fused(inp, out, residual, norm_weight, hidden,
+                                     eps)
+
+    def all_reduce_fused(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        hidden: int,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ops.all_reduce_fused(self._ptr, inp, out, residual, norm_weight,
+                             hidden, eps, self.buffer_ptrs[self.rank],
+                             self.max_size)
+        return out, residual
 
     def should_custom_all_gather(self, inp: torch.Tensor) -> bool:
         if self.disabled or not current_platform.is_cuda():

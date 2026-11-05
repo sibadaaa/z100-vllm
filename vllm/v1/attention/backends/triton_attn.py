@@ -162,10 +162,28 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.num_par_softmax_segments = (
             segments_capacity if segments_capacity > 0 else NUM_PAR_SOFTMAX_SEGMENTS
         )
+        # The 3D/reduce kernels index the segment buffers by TOKEN row
+        # (q.shape[0]), not by sequence. Under decode-cudagraph modes the
+        # routing threshold above collapses to a capture size (e.g. 1 for
+        # cudagraph_capture_sizes=[1]), which would size the buffers below
+        # one verify step's tokens (num_speculative_tokens + 1 per sequence)
+        # and every multi-token verify would write past them (VMFault).
+        # Keep at least max_num_seqs verify steps' worth of rows; routing is
+        # unchanged, only the buffers grow.
+        segm_rows = self.seq_threshold_3D
+        if self.decode_cudagraph_enabled:
+            spec_config = self.vllm_config.speculative_config
+            spec_tokens = (
+                spec_config.num_speculative_tokens if spec_config is not None else 0
+            )
+            segm_rows = max(
+                segm_rows,
+                self.vllm_config.scheduler_config.max_num_seqs * (spec_tokens + 1),
+            )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                segm_rows,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -174,12 +192,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (segm_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (segm_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )

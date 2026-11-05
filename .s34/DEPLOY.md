@@ -59,8 +59,62 @@ journalctl -u z100-vllm-mtp2 -f
 > `docs/result/z100-s34-final.md`；长上下文曲线与 S35 移交项：
 > `docs/result/z100-s34-wp6-longctx.md`。
 
+## S45-N2a 采纳:SiluAndMul 折进 W8A16 down_proj GEMV(2026-11-01)
+
+| env | 值 | 作用 |
+|---|---|---|
+| **VLLM_DCU_W8A16_SILU_MUL** | **1** | **S45-N2a:MLP 激活折入 wholea_m1 整行 staging(M=1 decode;位同,已采纳)** |
+
+- 证据:`.s45/n2a_parity.py` torch.equal max\|d\|=0;board first_div=None;
+  `mul_silu` 内核出账(−47 发/step);`.s45/s45-adopt.md`。
+- **`.so` 变更**:`_rocm_C` md5 `f72bb39d` → `6dee7fad`(smul 变体;原路径
+  逐位不变)。回滚 = 注释本行 + restart + 恢复
+  `.r3/so-backup/_rocm_C.s44-before.so`。
+- **禁令(S45 审计)**:勿设 `VLLM_QWEN35_EMPTY_CORE_ATTN_OUT=1`——
+  core_attn_out 的 zeros 承重(empty 使贪心流分叉,op 有未写元素被下游读)。
+- S45 空隙归因:5.38 ms/step GPU 空闲在 piecewise 图段边界(92%),
+  是下一轮(host 侧)的主池子。
+
 policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完全一致
 （MTP 只经 CLI 传参，不动任何 VLLM_* 环境旋钮）。
+
+## S44-A4 采纳：attn 出口 push-AR+rmsnorm 融合（2026-11-01）
+
+| env | 值 | 作用 |
+|---|---|---|
+| **VLLM_DCU_CUSTOM_AR_FUSION** | **1** | **S44 attn 出口 AR+add-rmsnorm 融合（混合臂，已采纳）** |
+| **VLLM_DCU_CUSTOM_AR_FUSION_MLP** | **0** | **MLP 出口不融合（两出口全融合 = 乱码，禁开）** |
+
+- 证据：B/A/B/A e2e W1 41.73/40.70 vs 40.03/39.59 t/s（配对 +4.25%/+2.81%）；
+  norm 类目账 1.635 → 0.392 ms/step；`runs/s44/e2e-s44-ar-*.json`。
+- **禁令：`VLLM_DCU_CUSTOM_AR_FUSION_MLP=1`（全融合）在 piecewise capture 下
+  输出乱码（S38 原始损坏 S44 复现，`docs/perf/data/s44-a0-debug.txt`），
+  永不开启，除非先修复 S38 §2 根因。**
+- 另：`VLLM_DCU_CUSTOM_AR_FUSION_DEBUG=1` 的对拍分支含逐 rank 数据相关的
+  额外集体操作，warmup 期可致 AR flag 序列跨 rank 分叉 → 服务挂死
+  （S44 三次复现）。**生产与 ABAB 一律 DEBUG=0**；修复见 `.s44/ar-adopt.md`。
+- 回滚：注释上两行 env + `sudo systemctl restart z100-vllm-mtp2`（env 去 0
+  = 逐位恢复 S43 态；`.so` 未动，`_C_stable_libtorch` md5 `54ccf2e2`）。
+
+## S46 复役：MTP k=2 于 S44/S45 采纳栈（2026-11-01）
+
+| 项 | 值 |
+|---|---|
+| **SPEC_OFF** | **（已注释）** 移除后 `launch_mtp2.sh` 默认 `--speculative-config {"method":"mtp","num_speculative_tokens":2}` |
+
+- 证据：同日 ABAB W1 med B 51.35/52.72 vs A 38.44/39.16 t/s（配对
+  +33.6%/+34.6%，门 +29%）；W2 B 池中位 42.4 ≥ 施工图绝对下限 41.3
+  （严格配对 +12.4%，B2 配对 +18.1%；当日 A 臂 W2 偏强属分母效应）；
+  board `first_div=None`（verify 无损先例）；accept/drafts 代理
+  2.46 true tok/step（≥2.0）。`runs/s46/e2e-s46-mtp-*.json`、
+  `runs/s44/board-s46-*.json`、`docs/perf/data/s46-*.txt`、`.s46/mtp-adopt.md`。
+- 长 ctx（同日同口径，软门仅记录）：50k +179%（24.8 vs 8.9 tps）；
+  128k −16%（15.2 vs 18.0，S37 +28% 未在本栈复现——dynk k=1 区间经济学，
+  S47 候选）；128k TTFT +6%（370 vs 347 s）。
+- 运营：MTP 臂跑 `/start_profile` 沿用 S38/S41 预案（stop 超时 → health
+  000 → restart 恢复；本日 1/1 见 `.s46/mtp-adopt.md` §异常，干净路径不触发）。
+- 回滚：取消注释上行 + `sudo systemctl restart z100-vllm-mtp2`
+  （env 级，零 `.so`/代码变更）。
 
 ## 注意
 
@@ -71,3 +125,13 @@ policy 指纹（journalctl 可查）：`FP e9f6b1ff41e682d6` —— 与 s33 完�
   kill -9 后 hy-smi 归零再操作。
 - 验收基线：`runs/specbench/e2e-B-mtp2.json`（贪心流 parity 与基线首 diff @46
   属 batch 形状浮点抖动，verify 本身无损）。
+
+## S39-C1 容量口径(2026-10-31,4 并发验证)
+
+- 单流(M=1)现役:贪心 ~38–39 t/s(W1 96 tok,当日带);TTFT ~0.71 s。
+- 4 路并发(7469-probe,96 tok × 4 流):**聚合 ~76 t/s(×1.95)**,单流
+  16–23 t/s(ITL ~2× solo),TTFT 0.8–2.7 s。
+- 机理:batch M=4 下 stream-GEMV 实测 1.45–1.75× M=1 成本(内核族无 M-flat
+  替代:tile GEMM cfg-35 在 M=4 慢 12×),×1.95 为物理上限而非缺陷。
+- 结论:4 并发是吞吐口径(≈2 倍产能);单流时延口径仅 M=1 独占(现役路径
+  不受任何影响)。数据:`runs/s39/e2e-s39-c1-*.json`;判定:`.s39/c1-close.md`。

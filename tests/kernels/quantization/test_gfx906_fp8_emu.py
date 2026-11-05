@@ -627,10 +627,12 @@ def _cos(x, y):
 
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6, 8])
-def test_block_gemv_w8a16(w8a16_ops, m, out_dtype):
+@pytest.mark.parametrize(
+    "fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"]
+)
+def test_block_gemv_w8a16(w8a16_ops, m, out_dtype, fp8_dtype):
     """Decode M = 1..8: the GEMV reads the fp16 activation directly."""
     torch.manual_seed(0)
-    fp8_dtype = torch.float8_e4m3fn
     n, k = 384, 1024
     a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
     w = torch.randn(n, k, device="cuda") * 0.02
@@ -645,10 +647,12 @@ def test_block_gemv_w8a16(w8a16_ops, m, out_dtype):
 
 @pytest.mark.parametrize("m", [16, 64, 129, 512])
 @pytest.mark.parametrize("cfg", W8A16_CFGS)
-def test_block_gemm_w8a16(w8a16_ops, m, cfg):
+@pytest.mark.parametrize(
+    "fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"]
+)
+def test_block_gemm_w8a16(w8a16_ops, m, cfg, fp8_dtype):
     """Prefill tile path: every W8A16 cfg must match the fp32 reference."""
     torch.manual_seed(0)
-    fp8_dtype = torch.float8_e4m3fn
     n, k = 256, 512
     a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
     w = torch.randn(n, k, device="cuda") * 0.02
@@ -660,10 +664,12 @@ def test_block_gemm_w8a16(w8a16_ops, m, cfg):
     assert err < 1e-5, f"m={m} cfg={cfg} max|err|/max|ref| = {err}"
 
 
-def test_block_w8a16_bias_and_bf16_out(w8a16_ops):
+@pytest.mark.parametrize(
+    "fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"]
+)
+def test_block_w8a16_bias_and_bf16_out(w8a16_ops, fp8_dtype):
     """Bias is added in out_dtype, and the bf16 *output* cast still works."""
     torch.manual_seed(0)
-    fp8_dtype = torch.float8_e4m3fn
     m, n, k = 17, 256, 512
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
     w = torch.randn(n, k, device="cuda") * 0.02
@@ -683,10 +689,12 @@ def test_block_w8a16_bias_and_bf16_out(w8a16_ops):
     assert _rel_err(bf16, _reference_block_w8a16(a, w_q, w_s)) < 1e-2
 
 
-def test_block_w8a16_accepts_padded_weight_row_stride(w8a16_ops):
+@pytest.mark.parametrize(
+    "fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"]
+)
+def test_block_w8a16_accepts_padded_weight_row_stride(w8a16_ops, fp8_dtype):
     """`process_fp8_weight_block_strategy` pads K, so stride(0) != K."""
     torch.manual_seed(0)
-    fp8_dtype = torch.float8_e4m3fn
     m, n, k, pad = 32, 256, 512, 256
     a = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.5
     w = torch.randn(n, k, device="cuda") * 0.02
@@ -754,6 +762,15 @@ def test_w8a16_route_is_off_unless_asked():
         assert (
             m.Gfx906Fp8BlockScaledMMLinearKernel.apply_input_quant is True
         ), "switch off must keep the W8A8 quantization"
+
+
+# TODO(W8A16 A/B coverage): the wholea / m1 specializations gated by the env
+# switches VLLM_DCU_FP8_GEMV_WA / VLLM_DCU_FP8_GEMV_M1 (csrc/rocm/
+# fp8_emu_gemm.cu) are read once into `static const`, so a test cannot flip
+# them in-process -- exercising them needs a subprocess launched with the env
+# set.  They stay default-off experiment paths, verified out-of-band by the
+# bitwise A/B probes in docs/result/z100-w8a16-fp16-prefill-result.md; add a
+# subprocess parity test here only if a switch is promoted to default-on.
 
 
 # ---------------------------------------------------------------------------

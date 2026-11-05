@@ -131,3 +131,45 @@ fp32-dequantized reference over 17 shapes, all output dtypes), so the kernel is
 deliberately **not** arch-gated. It is however ~36x slower than fp16 on this
 part (`4096^3`: 304 ms vs 8.4 ms), because gfx906 has no FP8 unit at all. See
 `docs/result/z100-08b-gating-and-requirements-result.md`.
+
+## decode trace 判读(S49 起)
+
+服务以 `--profiler-config {"profiler":"torch","torch_profiler_dir":"/mnt/game/s30c-prof"}`
+在役时,采样规程(acceptance §8):单请求(99 tok 提示 → 256 out),
+`POST /start_profile` 后**立即** `POST /stop_profile`;楔死 → restart。得到的
+per-rank `*.pt.trace.json(.gz)` 用**两件套**判读,禁止只看桶中位数:
+
+```bash
+.venv/bin/python runs/tritonq/decode_stages.py <trace> runs/fulldec/<tag>_stages
+.venv/bin/python runs/fulldec/classify_wholea_pos.py <trace> runs/fulldec/<tag>_shapes.json
+.venv/bin/python runs/fulldec/gap_attribution.py <trace> runs/fulldec/<tag>_gaps.json
+```
+
+- `decode_stages.py`:按内核名类聚出每步分段耗时(gemv/attention/AR/idle…),
+  回答"decode 各环节速度"。
+- `classify_wholea_pos.py`:wholea GEMV 按发射序位分类(attn: qkv/o/gate_up/
+  down;gdn: in/out/gate_up/down),给出逐形状 µs 与 GB/s。
+- `gap_attribution.py`:GPU idle 归因(步间大停顿 + 步内小间隙,含边界核名)。
+
+**告示:GEMV 桶必须看逐形状行。** down_smul 与 plain down 是**同一内核名**
+(`fp8_emu_gemv_wholea_m1`),桶粒度会掩盖单形状回退——S45/S49 两次教训
+(S45 N2a 的整行 staging 把 down 从 41.8µs/534 GB/s 打到 69.8µs/319 GB/s,
+桶中位只 +1.8ms,逐形状分类才定罪;见 `runs/fulldec/graph_recalibration.md`)。
+
+## 窗口微测标准跑法(S49 起)
+
+微测一律在**空闲卡 3** 上跑(卡 3 较卡 0 同形状慢 11-13%,比值口径有效;
+卡 0 被在役服务占用):
+
+```bash
+source /mnt/game/host-runtime/dtk2604/env.sh
+export HIP_VISIBLE_DEVICES=3
+export VLLM_DCU_FP8_GEMV_WA=1 VLLM_DCU_FP8_GEMV_STREAM_ROWS=4
+export PYTHONPATH=/home/lyh/z100-vllm
+.venv/bin/python .s40/gemv_bw_bench.py --anchor   # 锚:read-only 792 GB/s
+```
+
+锚点带外(历史 780-800)说明设备状态漂移,当轮数字作废。示例脚本:
+`runs/fulldec/recal_down_bench.py`(down plain/smul 对照)、
+`runs/fulldec/recal_smul_sweep.py`(K/N 惩罚扫描)。服务级 GEMV 环境
+(`.s34/serve_deploy.sh`)与微测 env 保持一致,否则数字不可比。

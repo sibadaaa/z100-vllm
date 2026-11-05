@@ -97,6 +97,114 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+// S37 W4: push-mode one-shot all-reduce with a fused add-rmsnorm epilogue
+// (design docs/design/z100/s34/z100-s34-wp4-ar-fusion.md §2; S37
+// construction §2).  The all-reduce itself is the push kernel unchanged:
+// same push writes, same barrier sequence, same rank 0..ngpus-1 fp32
+// accumulation order.  The epilogue re-rounds the fp32 sum to T (matching
+// the unfused path, where the fp16 AR result is written to memory and the
+// norm kernel re-reads it) before adding the residual, so the only NEW
+// float order is the in-block sum-of-squares tree -- parity is governed by
+// the max|delta|/top5-logprob board, not torch.equal.
+//
+// Launch contract (host-validated, see CustomAllreduce::allreduce_fused):
+//   size (P-units) == rows * row_p, row_p <= blockDim.x, rows <= kMaxBlocks;
+//   grid = rows (one block per hidden row), block = 1024 threads.  The
+//   barriers are per-blockIdx cross-rank handshakes, so a different grid
+//   shape than the unfused kernel is safe as long as every rank launches
+//   the same geometry.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    cross_device_reduce_push_fused(RankData* _dp, RankSignals sg,
+                                   Signal* self_sg, const T* __restrict__ src,
+                                   T* __restrict__ result,
+                                   T* __restrict__ residual,
+                                   const T* __restrict__ norm_w, int rank,
+                                   int size, int chunk_p, int row_p,
+                                   float eps) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int kElems = P::size;  // T elements per packed unit
+  auto dp = *_dp;
+  const P* own_base = (const P*)dp.ptrs[rank];
+  const P* src_p = (const P*)src;
+  const int r0 = blockIdx.x * row_p;  // my row's P-unit offset
+  __shared__ float red[32];           // warp partials for sum(s^2)
+  __shared__ float s_rrms;
+
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  // push: write my row's activation slice into every peer's buffer region
+  // for my rank (same traffic pattern as the unfused kernel)
+  for (int idx = r0 + threadIdx.x; idx < r0 + row_p; idx += blockDim.x) {
+    const P v = src_p[idx];
+#pragma unroll
+    for (int p = 0; p < ngpus; p++) {
+      if (p == rank) continue;
+      ((P*)((P*)dp.ptrs[p] + (size_t)rank * chunk_p))[idx] = v;
+    }
+  }
+  barrier_mid_volatile<ngpus>(sg, self_sg, rank);
+  // local reduce over MY buffer regions (rank 0..ngpus-1 order, as 1stage /
+  // unfused push) + epilogue: s = round_T(sum) + residual; residual = s;
+  // result = s * rrms * (1 + w)
+  //
+  // S38 A1: the epilogue applies the Gemma RMSNorm convention -- out =
+  // (s * rrms) * (1 + w) with the +1 in fp32 -- exactly the math of the
+  // production norm on this stack (ir.ops.fused_add_rms_norm native impl as
+  // traced into the serving graphs: x_f32 = fp16(AR) + residual in fp32,
+  // residual stored back as fp16, out = (x * rrms) * (weight+1) in fp32,
+  // single downcast at the end).  norm_w is therefore the RAW Gemma weight
+  // parameter, not a pre-added one.
+  const int idx = r0 + threadIdx.x;
+  A sv = {};  // at most one packed unit per thread (row_p <= blockDim.x)
+  float ssq = 0.0f;
+  if (threadIdx.x < row_p) {
+    A acc = upcast(rank == 0 ? src_p[idx] : own_base[idx]);
+#pragma unroll
+    for (int p = 1; p < ngpus; p++) {
+      packed_assign_add(
+          acc,
+          upcast(rank == p ? src_p[idx] : own_base[(size_t)p * chunk_p + idx]));
+    }
+    sv = upcast(downcast<P>(acc));  // the AR quant point, kept identical
+    packed_assign_add(sv, upcast(((const P*)residual)[idx]));
+    ((P*)residual)[idx] = downcast<P>(sv);
+#pragma unroll
+    for (int j = 0; j < kElems; j++) {
+      const float x = sv.data[j];
+      ssq += x * x;
+    }
+  }
+  // block-wide sum of squares: warp tree, then the first warp reduces the
+  // 32 warp partials; inactive lanes contribute 0 so every warp converges
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) ssq += __shfl_down(ssq, off);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ssq;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float v = red[threadIdx.x];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
+    if (threadIdx.x == 0) {
+      const float n = (float)row_p * kElems;
+      s_rrms = rsqrtf(v / n + eps);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < row_p) {
+    // weight index is per-row: within-row P-unit offset == threadIdx.x;
+    // multiply order matches the standalone norm kernel: (s * rrms) * (1 + w)
+    // (Gemma convention, see the S38 A1 note above; the +1 stays in fp32)
+    const A w = upcast(((const P*)norm_w)[threadIdx.x]);
+    A outv = sv;
+#pragma unroll
+    for (int j = 0; j < kElems; j++)
+      outv.data[j] = (sv.data[j] * s_rrms) * (w.data[j] + 1.0f);
+    ((P*)result)[idx] = downcast<P>(outv);
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -401,6 +509,80 @@ class CustomAllreduce {
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  // S37 W4: all-reduce + fused add-rmsnorm epilogue on the push kernel.
+  // Same buffer/capture contract as allreduce(); additionally requires
+  // (host-checked): numel % hidden == 0, hidden / pack <= threads,
+  // rows <= kMaxBlocks, chunk_p >= size.  residual is updated in place.
+  template <typename T>
+  void allreduce_fused(cudaStream_t stream, T* input, const T* src,
+                       T* output, T* residual, const T* norm_w, int size,
+                       int hidden, float eps, int threads = 1024,
+                       int block_limit = defaultBlockLimit, int chunk_p = 0) {
+    auto d = packed_t<T>::P::size;
+    if (size % d != 0)
+      throw std::runtime_error(
+          "fused allreduce requires input length to be multiple of " +
+          std::to_string(d));
+    size /= d;  // elements -> packed units (same convention as allreduce)
+    const int row_p = hidden / d;  // packed units per hidden row
+    const int rows = row_p > 0 ? size / row_p : 0;
+    if (row_p <= 0 || row_p * rows != size)
+      throw std::runtime_error(
+          "fused allreduce: numel must be a multiple of hidden");
+    if (row_p > threads)
+      throw std::runtime_error(
+          "fused allreduce: hidden row exceeds one block (threads=" +
+          std::to_string(threads) + ")");
+    if (rows > kMaxBlocks)
+      throw std::runtime_error("fused allreduce: too many rows (" +
+                               std::to_string(rows) + ")");
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("max supported block limit is " +
+                               std::to_string(kMaxBlocks) + ". Got " +
+                               std::to_string(block_limit));
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " +
+            std::to_string(reinterpret_cast<uint64_t>(input)) +
+            " is not registered!");
+      ptrs = it->second;
+    }
+
+#define KLPUSH_FUSED(ngpus)                                                  \
+  cross_device_reduce_push_fused<T, ngpus><<<rows, threads, 0, stream>>>(    \
+      ptrs, sg_, self_sg_, src, output, residual, norm_w, rank_, size,       \
+      chunk_p, row_p, eps);
+    switch (world_size_) {
+      case 2:
+        KLPUSH_FUSED(2)
+        break;
+      case 4:
+        KLPUSH_FUSED(4)
+        break;
+      case 6:
+        KLPUSH_FUSED(6)
+        break;
+      case 8:
+        KLPUSH_FUSED(8)
+        break;
+      default:
+        throw std::runtime_error(
+            "fused allreduce only supports num gpus in (2,4,6,8). Actual "
+            "num gpus = " +
+            std::to_string(world_size_));
+    }
+#undef KLPUSH_FUSED
   }
 
   void allgather(cudaStream_t stream, void* input, void* output, int size_bytes,

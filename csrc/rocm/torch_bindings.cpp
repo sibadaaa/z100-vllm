@@ -53,6 +53,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
+  // S53-ATTN: gfx906 decode split-KV attention inner-loop rebuild (HIP);
+  // env-gated on the Python side (VLLM_GFX906_ATTN_DECODE_HIP_INNER),
+  // supported subset only, segm buffers shared with the Triton 3D kernel.
+  // B832: block_size % 16 == 0 (production hybrid page 832); optional fp32
+  // KV descales fold into the kernel's softmax scale / accumulator.
+  rocm_ops.def(
+      "gfx906_attnd_decode_inner(Tensor! segm_output, Tensor! segm_max, "
+      "Tensor! segm_expsum, Tensor query, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_tables, Tensor seq_lens, "
+      "Tensor cu_query_lens, float scale, int num_segments, "
+      "bool delayed_merge, int tps_hint, "
+      "Tensor? k_descale=None, Tensor? v_descale=None) -> ()");
+  rocm_ops.impl("gfx906_attnd_decode_inner", torch::kCUDA,
+                &gfx906_attnd_decode_inner);
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(
@@ -151,6 +166,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("fp8_emu_gemm_block_w8a16", torch::kCUDA,
                 &fp8_emu_gemm_block_w8a16);
 
+  // S45 N2a: W8A16 M==1 down-projection GEMV with the SiluAndMul activation
+  // folded into the whole-A staging (`a` = gate_up output [1, 2K]).  Gated in
+  // python by VLLM_DCU_W8A16_SILU_MUL, default off.
+  rocm_ops.def(
+      "fp8_emu_gemm_block_w8a16_smul(Tensor a, Tensor w, Tensor w_s, "
+      "Tensor lut, Tensor? bias, ScalarType out_dtype, int nthreads, "
+      "int block_n, int block_k) -> Tensor");
+  rocm_ops.impl("fp8_emu_gemm_block_w8a16_smul", torch::kCUDA,
+                &fp8_emu_gemm_block_w8a16_smul);
+
   // Materialize one layer's fp8 weight * block scales into an fp16 scratch kept
   // in [N, K] row order (the prefill fp16 route consumes out.t()).  In-place on
   // `out` so the caller can reuse one buffer across layers.
@@ -184,6 +209,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "bf16_emu_gemv(Tensor x, Tensor w, Tensor? bias, int nthreads, "
       "int route, bool range_safe) -> Tensor");
   rocm_ops.impl("bf16_emu_gemv", torch::kCUDA, &bf16_emu_gemv);
+
+  // S40 B1: fp16 dense GEMV in the streaming geometry (the lm_head decode
+  // kernel).  Routed by vllm/model_executor/layers/utils.py under
+  // VLLM_DCU_FP16_GEMV_STREAM=1 for M == 1, N >= 2048, K % 128 == 0.
+  rocm_ops.def(
+      "fp16_gemv_stream_m1(Tensor x, Tensor w, Tensor? bias, int nthreads) "
+      "-> Tensor");
+  rocm_ops.impl("fp16_gemv_stream_m1", torch::kCUDA, &fp16_gemv_stream_m1);
 }
 
 // Meta implementations: `torch.compile` / fake tensor propagation needs the
@@ -198,11 +231,14 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
   rocm_meta_ops.impl("fp8_emu_gemm_block", &fp8_emu_gemm_block_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_w8a16",
                      &fp8_emu_gemm_block_w8a16_meta);
+  rocm_meta_ops.impl("fp8_emu_gemm_block_w8a16_smul",
+                     &fp8_emu_gemm_block_w8a16_smul_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant",
                      &fp8_emu_gemm_block_quant_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant_x",
                      &fp8_emu_gemm_block_quant_x_meta);
   rocm_meta_ops.impl("bf16_emu_gemv", &bf16_emu_gemv_meta);
+  rocm_meta_ops.impl("fp16_gemv_stream_m1", &fp16_gemv_stream_m1_meta);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
