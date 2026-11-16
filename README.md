@@ -710,7 +710,7 @@ vllm serve /path/to/Qwen3.x-xxB-GGUF \
   [OPT-EFFECTIVE](docs/perf/OPT-EFFECTIVE-20261027.md)
 - **设计/施工**：[Z100 文档索引](docs/design/z100/README.md)
 - **实测结果**：`docs/result/z100-*.md`
-- **工具**：`tools/dcu/`（环境、构建、微基准、e2e、指纹、探针）
+- **工具**：`tools/dcu/`（环境、构建、指纹、基准入口、RCCL/Triton 配方，见其 `README.md`）
 
 常用检查：
 
@@ -732,7 +732,7 @@ hy-smi --showproductname
 | 借鉴点 | 1Cat 的做法 | Z100 的落地 | 证据 |
 |---|---|---|---|
 | W8A16 契约 | 权重 fp8 常驻 HBM，激活 fp16 直入，`apply_input_quant=False`，去掉激活量化 | `VLLM_DCU_FP8_W8A16` + fp16 prefill 物化；decode 1.2–2.1×，prefill M≥512 1.4–2× | [`w8a16`](docs/result/z100-w8a16-fp16-prefill-result.md) |
-| 五相位 profiling | `draft` / `draft→target` / `target` / `target→draft` / `round` | [`s27_five_phase_profile.py`](tools/dcu/s27_five_phase_profile.py) 直接采用该切分；五段和与 step 差 1.95% | [`decode-prefill`](docs/result/z100-decode-prefill-final-summary.md) |
+| 五相位 profiling | `draft` / `draft→target` / `target` / `target→draft` / `round` | S27 的五相位切分脚本（已随探针清理移除，见 git 历史）采用该切分；五段和与 step 差 1.95% | [`decode-prefill`](docs/result/z100-decode-prefill-final-summary.md) |
 | 门禁形式（+ Z100 自建指纹） | admission 谓词、可回滚开关、bitwise/质量门；1K/2K/4K/8K 不退化 | 同窗口 A/B、N≥2 重启、贪心 parity、30 min 长跑；另加自建 policy fingerprint | [`s29-pin`](docs/result/z100-s29-accept-pin.md) |
 | “只搬控制面”的判断 | 数据面 kernel 约 7 万行、控制面约 150–250 行；前者绑定专用矩阵核 | 把精力放在 GDN/GEMV/AR/attention 的调度与并行度，而不是复刻矩阵核 | [`1cat-v2`](docs/design/z100/research/z100-1cat-transfer-research-v2.md) |
 

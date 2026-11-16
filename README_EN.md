@@ -272,7 +272,8 @@ Implemented borrowings:
   `VLLM_DCU_FP8_W8A16` plus fp16 prefill materialization; decode 1.2–2.1×, prefill
   M≥512 1.4–2×.
 - **Five-phase round profile**: `draft / draft→target / target / target→draft / round`,
-  implemented in `tools/dcu/s27_five_phase_profile.py`.
+  implemented in the S27 five-phase profiling script (removed with the probe
+  cleanup; see git history).
 - **Gating discipline**: per-optimization admission predicates, rollback switches,
   bitwise/quality gates, 1K/2K/4K/8K non-regression, same-window A/B, N≥2 restarts.
   Z100 additionally uses its own policy fingerprint.
