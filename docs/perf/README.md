@@ -1,10 +1,11 @@
 # Z100 (gfx906) 推理性能优化 —— 报告驱动
 
-> **2026-10-27 更新（重要）**：本页是 2026-10-13 DFlash2 k=7 时代的基线，
-> 其数值与部分结论已被后续工作取代。当前生产 = **MTP k=2 + push one-shot AR
-> + GEMV stack**，7.5k 单流 51.6 t/s、128k 31.4 t/s。先读
-> [现状](STATUS-20261027.md) / [有效优化总结](OPT-EFFECTIVE-20261027.md) /
-> [后续路线](ROADMAP-20261027.md)；本页保留作历史记录，§3 的勘误见 §5。
+> **2026-11-15 更新**：本页是 2026-10-13 DFlash2 k=7 时代的基线，其数值与部分
+> 结论已被后续工作取代。当前生产 = **MTP k=2 + FULL_DECODE_ONLY 图 + push
+> one-shot AR + int8 KV + int8 prefill GEMM**：7.5k 单流 ≈51–52 t/s、128k ≈50 t/s、
+> 131k 冷 TTFT ≈203 s。当前数值以 [README.md](../../README.md)「当前性能」与
+> [DEPLOY.md](../../DEPLOY.md) 为准；本目录下 STATUS / ROADMAP / OPT-EFFECTIVE
+> 是 **2026-10-27 历史快照**，只作当时口径记录。
 > 硬件也已不是“2×Z100L + 2×Z100”混插：2026-10-27 `hy-smi --showproductname`
 > 实测 4/4 为 Z100L。
 
@@ -52,10 +53,11 @@ TP=4，`--enforce-eager`，MTP `num_speculative_tokens=2`，`--max-num-batched-t
 | L1 服务/配置 | `max-num-batched-tokens`、warmup、前缀缓存等 | task-2 | 进行中 |
 | L0 度量/验收 | e2e 基线 + 贪心 token 一致性 + 独立复核 | task-4 / task-5 | 进行中 |
 
-排期与验收标准见 [`PERF1-plan.md`](PERF1-plan.md)，实测结果见 [`PERF1-results.md`](PERF1-results.md)。
+首个任务板（PERF1）的排期与验收记录已于 2026-10-13 冻结，后续由 S34 起的轮次取代。
 
-> 本任务板的状态冻结在 2026-10-13；当前生产状态、已采纳项与下一步见
-> [STATUS](STATUS-20261027.md) 与 [ROADMAP](ROADMAP-20261027.md)。
+> 本任务板的状态冻结在 2026-10-13。2026-10-27 的快照见
+> [STATUS](STATUS-20261027.md) 与 [ROADMAP](ROADMAP-20261027.md)；两者均已被后续
+> 轮次取代，当前数值以 [README](../../README.md)「当前性能」为准。
 
 ---
 
@@ -90,11 +92,19 @@ TP=4，`--enforce-eager`，MTP `num_speculative_tokens=2`，`--max-num-batched-t
 |---|---|---|
 | 打开 custom all-reduce 收益 0，不要再做 | **已推翻**：gfx906 opt-in push one-shot AR 在 no-spec 臂 −2.0~−2.6 ms，MTP 臂 AR-off 代价 +10.07 ms/步 | [`s33-ar-fix`](../result/z100-s33-oneshot-ar-fix.md)、[`OPT-EFFECTIVE`](OPT-EFFECTIVE-20261027.md) §2.3 |
 | 靠 CUDAGraph 单纯降 launch 开销不值 | **部分推翻**：piecewise graph + 捕获 [1,2,4] 已采纳，step −11.67%；但收益来自整图重放，不是单纯 launch | [`routea`](../result/z100-routea-deploy.md) |
-| 降权重位宽（INT8/更低精度）换速度 | **仍不适用于“带宽”叙事**；但 INT8 `v_dot4_i32_i8` 是当前最大单项候选（step −9 ms 级），需 eval + 裁决 | [`s34-wp7`](../design/z100/s34/z100-s34-wp7-int8-ab.md) |
-| 测试对象：eager、MTP k=2、MBT 2048 | 现生产：piecewise graph、MTP k=2、MBT 8192、max-model-len 262144 | [`STATUS`](STATUS-20261027.md) |
+| 降权重位宽（INT8/更低精度）换速度 | **带宽叙事仍不成立**；但 INT8 `v_dot4_i32_i8` 已在 **S99 prefill GEMM** 采纳（decode 逐位同） | [`s34-wp7`](../design/z100/s34/z100-s34-wp7-int8-ab.md)、[S99 结果](../result/z100-s99-prefill-int8-pc-gemm-result.md) |
+| 测试对象：eager、MTP k=2、MBT 2048 | 2026-11-15 现生产：FULL_DECODE_ONLY 图 [2,3,6,12]、MTP k=2、MBT 8192、max-model-len 262144 | [`DEPLOY`](../../DEPLOY.md) |
 | 硬件：2×Z100L + 2×Z100 混插 | `hy-smi --showproductname` 实测 **4/4 Z100L** | 2026-10-27 现场 |
 | DFlash2 k=7 是生产配方 | **已退役**：新栈上 22.7 t/s，比无投机 36.9 低 38% | [`specbench`](../../runs/specbench/REPORT.md) |
 
 > 本页 §1 的 219.6 ms 基线、§3 的“不要做”清单仍可用于理解 2026-10-13 的
 > 墙位（fp8 GEMM 44%、AR 22%、GDN 16%）；但做新决策时以三份 2026-10-27
 > 文档为准。
+
+---
+
+> **统计数据已归档（2026-11-13）**：S77–S90 的 `runs/`、`docs/perf/data/` 与会话
+> `logs/`、`probe/`、`isa/` 已收进 [`archive/20261113-stats.tar.zst`](../../archive/README.md)
+> （2,274 个文件）。本目录文档里指向 `runs/...` 的路径改为包内路径，按
+> [`archive/README.md`](../../archive/README.md) 的说明解包即可；S91 本轮数据
+> 仍留在 `runs/attn-diag-20261113/`。

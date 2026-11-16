@@ -98,4 +98,4 @@
 - e2e/板:`runs/s44/{e2e-s44-ar-*,e2e-s44-final*,board-*,parity-*}.json`
 - `.so`:md5 全程不变(`.r3/so-backup/s44-before.md5` + 双 before 副本)
 - 服务变更:`serve_deploy.sh` S44-A4 注释块(两行 env + 禁令)+
-  `.s34/DEPLOY.md` S44 节(回滚 = 注释 + restart)
+  `DEPLOY.md` S44 节(回滚 = 注释 + restart)

@@ -1,0 +1,276 @@
+{
+ "meta": {
+  "tag": "",
+  "backend": "nccl",
+  "world_size": 4,
+  "device_names": [
+   "Z100L",
+   "Z100L",
+   "Z100L",
+   "Z100L"
+  ],
+  "torch": "2.11.0",
+  "torch_version_hip": "6.3.26113",
+  "hostname": "lyh",
+  "started_at": "2026-11-07T13:48:29+0000",
+  "finished_at": "2026-11-07T13:48:58+0000",
+  "iters": 20,
+  "warmup": 10,
+  "samples": 50,
+  "tol_bf16": 0.02,
+  "all_pass": true,
+  "env": {
+   "MASTER_PORT": "29611"
+  }
+ },
+ "sizes": [
+  {
+   "label": "10240B",
+   "elements": 5120,
+   "payload_bytes": 10240,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 130.19865399837727,
+   "p50_us": 146.79234991490375,
+   "p99_us": 226.60524991806597,
+   "min_us": 80.45645008678548,
+   "max_us": 226.60524991806597,
+   "std_us": 36.658586328605615,
+   "cv_pct": 28.155887332800315,
+   "payload_gbs": 0.07864904655717583,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "40960B",
+   "elements": 20480,
+   "payload_bytes": 40960,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 99.98253997036954,
+   "p50_us": 90.64799996849615,
+   "p99_us": 231.43629987316672,
+   "min_us": 89.71049974206835,
+   "max_us": 231.43629987316672,
+   "std_us": 31.474095718589254,
+   "cv_pct": 31.479592064691296,
+   "payload_gbs": 0.4096715287703108,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "81920B",
+   "elements": 40960,
+   "payload_bytes": 81920,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 100.51811300945701,
+   "p50_us": 90.30599976540543,
+   "p99_us": 280.5256001011003,
+   "min_us": 89.30805015552323,
+   "max_us": 280.5256001011003,
+   "std_us": 38.14215357505399,
+   "cv_pct": 37.94555272985026,
+   "payload_gbs": 0.8149774955712983,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "163840B",
+   "elements": 81920,
+   "payload_bytes": 163840,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 110.26858999684919,
+   "p50_us": 101.10855000675656,
+   "p99_us": 288.5921498091193,
+   "min_us": 99.18305004248396,
+   "max_us": 288.5921498091193,
+   "std_us": 36.59878871258441,
+   "cv_pct": 33.19058374976064,
+   "payload_gbs": 1.4858265622574984,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "1048576B",
+   "elements": 524288,
+   "payload_bytes": 1048576,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 177.90035097277723,
+   "p50_us": 172.05844997079112,
+   "p99_us": 296.22069996548817,
+   "min_us": 170.20349987433292,
+   "max_us": 296.22069996548817,
+   "std_us": 20.19554454687781,
+   "cv_pct": 11.352166781260697,
+   "payload_gbs": 5.894176117507806,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "8388608B",
+   "elements": 4194304,
+   "payload_bytes": 8388608,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 968.2498489928548,
+   "p50_us": 969.5945002022199,
+   "p99_us": 972.3219998704735,
+   "min_us": 959.9389999493724,
+   "max_us": 972.3219998704735,
+   "std_us": 3.5534135565857947,
+   "cv_pct": 0.36699345321684806,
+   "payload_gbs": 8.663681185931074,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "33554432B",
+   "elements": 16777216,
+   "payload_bytes": 33554432,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 3641.4347020108835,
+   "p50_us": 3640.2343001100235,
+   "p99_us": 3660.377999767661,
+   "min_us": 3637.162800077931,
+   "max_us": 3660.377999767661,
+   "std_us": 5.504338676626855,
+   "cv_pct": 0.15115851654808565,
+   "payload_gbs": 9.214618617620816,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  },
+  {
+   "label": "83886080B",
+   "elements": 41943040,
+   "payload_bytes": 83886080,
+   "iters": 20,
+   "samples": 50,
+   "mean_us": 8966.98021197517,
+   "p50_us": 8966.938050070894,
+   "p99_us": 8976.442000130191,
+   "min_us": 8958.699800132308,
+   "max_us": 8976.442000130191,
+   "std_us": 3.462169146550856,
+   "cv_pct": 0.03861020170343656,
+   "payload_gbs": 9.3549977826395,
+   "correctness": {
+    "constant": {
+     "input_per_rank": 1.0,
+     "expected_sum": 10.0,
+     "max_abs_err": 0.0,
+     "bf16_exact_possible": true,
+     "pass": true
+    },
+    "tolerance": {
+     "input": "base*(rank+1), common bf16 base",
+     "tol_rel": 0.02,
+     "max_abs_err": 0.0625,
+     "max_rel_err": 0.00625,
+     "pass": true
+    }
+   }
+  }
+ ]
+}
