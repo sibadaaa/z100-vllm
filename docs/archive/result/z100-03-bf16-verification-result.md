@@ -669,8 +669,8 @@ git status --short
 - [适配记录与实测证据 §2 bf16 专项](../hygon_z100.md)
 - 代码：[`vllm/platforms/hygon_dtk.py`](../../vllm/platforms/hygon_dtk.py)（`bf16_policy` / `dcu_bf16_probe` / `gfx906_bf16_enabled`）、
   [`vllm/platforms/rocm.py`](../../vllm/platforms/rocm.py)（`_rocm_supported_dtypes`）、
-  [`tools/dcu/check_bf16.py`](../../tools/dcu/check_bf16.py)、
-  [`tools/dcu/env.sh`](../../tools/dcu/env.sh)、[`tools/dcu/README.md`](../../tools/dcu/README.md)
+  [`tools/dcu/check_bf16.py`](../../../tools/dcu/check_bf16.py)、
+  [`tools/dcu/env.sh`](../../../tools/dcu/env.sh)、[`tools/dcu/README.md`](../../../tools/dcu/README.md)
 - 映像：`harbor.sourcefind.cn:5443/dcu/admin/base/custom:vllm018-ubuntu22.04-dtk26.04-gemma4-0413`
   （sha256:d1c08bf30382f6d8f49e0ad7130ceb4e3a31484ce4bdd3b1aeb7787b5d2fb14e）、
   `harbor.sourcefind.cn:5443/hcu/admin/base/pytorch:2.7.1-ubuntu22.04-dtk26.04-py3.10`（仅首次尝试使用）

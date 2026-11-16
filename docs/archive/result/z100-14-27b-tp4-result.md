@@ -1536,4 +1536,4 @@ docker inspect qwen38-vllm --format 'Status={{.State.Status}} ExitCode={{.State.
 - 原始日志：`/mnt/game/s14/hostlogs/`（`P2/P2b/P2e/P2e2/P4/P4e/P4g1..4[-monitor].log`、
   `smaps-*.txt`、`summary.tsv`）；聚合 JSON `/mnt/game/s14/openai-chat-infqps-*.json`；
   token/logprob 记录 `/mnt/game/s14/{greedy,flip}-*.jsonl`
-- ACS 工具：[`tools/dcu/dcu_p2p_acs.py`](../tools/dcu/dcu_p2p_acs.py)（本步只用 `show`）
+- ACS 工具：[`tools/dcu/dcu_p2p_acs.py`](../../../tools/dcu/dcu_p2p_acs.py)（本步只用 `show`）

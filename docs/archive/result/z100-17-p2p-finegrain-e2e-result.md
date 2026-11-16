@@ -30,9 +30,9 @@
   `--disable-custom-all-reduce`、`-cc.cudagraph_mode=PIECEWISE --cudagraph-capture-sizes 1 2 4 8`。
   **maxlen 取 8192（不是生产的 262144）**：集合通信消息尺寸由 hidden×token 决定，与 maxlen 无关；
   262144 会让宿主 pinned 内存翻 32 倍（本机 31 GB RAM，见 §4）。
-* 启动器 [`tools/dcu/s16_arm.sh`](../../tools/dcu/s16_arm.sh)：只把 `HSA_FORCE_FINE_GRAIN_PCIE=<0|1>`
-  导出后再调 [`tools/dcu/serve_z100_tp4.sh`](../../tools/dcu/serve_z100_tp4.sh)。
-* 压测 [`tools/dcu/s14_bench.sh`](../../tools/dcu/s14_bench.sh)（与 S13/S14 同口径）：
+* 启动器 `s16_arm.sh`：只把 `HSA_FORCE_FINE_GRAIN_PCIE=<0|1>`
+  导出后再调 `serve_z100_tp4.sh`。
+* 压测 `s14_bench.sh`（与 S13/S14 同口径）：
   `decode`(128/128, n=5)、`ttft`(3800/1, n=4)、`ttft8k`(8100/1, n=1)、`conc8`(512/128, np=16, conc=8)。
 * 两臂共用同一编译缓存 `/mnt/game/serve/vllm-cache`，日志显示两臂都
   `Directly load AOT compilation from .../torch_aot_compile/dee20878…`（各 4 次）⇒ **同一份 AOT 产物，key 不受该环境变量影响**。
@@ -72,7 +72,7 @@ graph 在两跑之间**本身不可复现**（S14e：同配置重跑 0/8 逐位�
 所以 token 流对照必须在 eager 下做（S14d：eager 1024 token 8/8 flip、重复 Δ=0.000）。
 
 * A2 `=0`、B2 `=1`，`--enforce-eager`，其余同 A/B；两臂各 `via SHM=112` / `via P2P=112` 确认生效。
-* 工具 [`tools/dcu/s14b_greedy.py`](../../tools/dcu/s14b_greedy.py) + `/mnt/game/s14b/prompts.txt`（4 条中文/英文 prompt），
+* 工具 `s14b_greedy.py` + `/mnt/game/s14b/prompts.txt`（4 条中文/英文 prompt），
   `temperature=0`、`max_tokens=128`、`logprobs + top_logprobs=5`。
 
 | prompt | token 数 | token_ids 逐位一致 | `max\|Δlogprob\|` | `mean\|Δlogprob\|` | 文本 sha256 一致 |
@@ -137,14 +137,14 @@ sudo swapoff /mnt/game/serve-swapfile && sudo swapoff /mnt/game/swapfile
 ## 8. 生产槽位重启 + P2P 上线（2026-10-11 23:16，用户授权）
 
 容器 `z100-vllm` 的 `:8000` 服务此前是**假活**（`/health` 200 但四卡 VRAM 0，worker 早在 14:08:36 被 host OOM 杀掉）。
-按生产配方重启（`/mnt/game/port/serve_fp8_8000.sh` → [`tools/dcu/s11f_e2e_fp8.sh`](../../tools/dcu/s11f_e2e_fp8.sh)，
+按生产配方重启（`/mnt/game/port/serve_fp8_8000.sh` → `s11f_e2e_fp8.sh`，
 模型 `/mnt/game/models/Qwen3.8-27B-FP8`，TP=4，maxlen 262144，eager），并开启 P2P。
 
 **改动（都已落地）**
 
 | 文件 | 改动 | 回滚 |
 |---|---|---|
-| [`tools/dcu/s11f_e2e_fp8.sh`](../../tools/dcu/s11f_e2e_fp8.sh) | 显式 `export HSA_FORCE_FINE_GRAIN_PCIE="${S11F_P2P:-${HSA_FORCE_FINE_GRAIN_PCIE:-1}}"` + 启动日志打印 | `S11F_P2P=0` 或 `HSA_FORCE_FINE_GRAIN_PCIE=0` |
+| `s11f_e2e_fp8.sh` | 显式 `export HSA_FORCE_FINE_GRAIN_PCIE="${S11F_P2P:-${HSA_FORCE_FINE_GRAIN_PCIE:-1}}"` + 启动日志打印 | `S11F_P2P=0` 或 `HSA_FORCE_FINE_GRAIN_PCIE=0` |
 | `/home/lyh/server/serve_27b_tp4.sh`（INT8 回滚槽，仓库外） | 生成的内层脚本加 `export HSA_FORCE_FINE_GRAIN_PCIE=${P2P:-1}`（备份 `serve_27b_tp4.sh.bak-20261011-s17`） | `P2P=0 bash serve_27b_tp4.sh` |
 | 宿主 swap | `/mnt/game/swapfile`(16 GB) + `serve-swapfile`(6 GB) **保持开启**（maxlen 262144 需要；`/swap.img` 4 GB 不够） | `sudo swapoff /mnt/game/serve-swapfile /mnt/game/swapfile` |
 

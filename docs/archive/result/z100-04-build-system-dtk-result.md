@@ -651,7 +651,7 @@ docker exec z100-build tail -n 40 /mnt/game/port/build-keepgoing.log
 - 本步设计文档：[docs/design/z100-04-build-system-dtk.md](../design/z100-04-build-system-dtk.md)
 - 后续步骤：[docs/design/z100-05-csrc-kernels.md](../design/z100-05-csrc-kernels.md)（§3 逐文件修复正是 §5.1 的接续）
 - 全局约束与门禁：[docs/z100-todolist.md](../z100-todolist.md)
-- DTK 环境变量与已知坑：[tools/dcu/README.md](../../tools/dcu/README.md)、[tools/dcu/env.sh](../../tools/dcu/env.sh)
+- DTK 环境变量与已知坑：[tools/dcu/README.md](../../../tools/dcu/README.md)、[tools/dcu/env.sh](../../../tools/dcu/env.sh)
 - 归档模板：[docs/result/README.md](README.md)
 - 相关上游代码：`setup.py`（本档 §2 行号）、`cmake/utils.cmake:536-570`（`override_gpu_arches` 读 `ENV{PYTORCH_ROCM_ARCH}`）、`CMakeLists.txt:52`（`HIP_SUPPORTED_ARCHS` 含 gfx906）、`cmake/external_projects/triton_kernels.cmake`（`TRITON_KERNELS_SRC_DIR` 分支）、`setuptools/command/editable_wheel.py:219,334`（editable 的 `TemporaryDirectory`）
 - DTK 缺陷位置：`/opt/dtk/include/rocprim/types/uninitialized_array.hpp:78`、`/opt/dtk-26.04-DCC2602-0317/llvm/lib/clang/18/include/cuda_wrappers/new`（只补非 placement new）、`/usr/include/c++/11/new:174`

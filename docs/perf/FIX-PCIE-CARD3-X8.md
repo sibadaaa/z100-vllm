@@ -12,7 +12,7 @@
 > 本手册按"代价从低到高"排序，每一步都有**明确的判据**和**回滚**。
 >
 > 关联：[SOL 文档 §1.2](SOL-DECODE-PREFILL-20261107.md) ·
-> 巡检工具 [`tools/dcu/pcie_link.py`](../../tools/dcu/pcie_link.py)
+> 巡检工具 `pcie_link.py`
 
 ---
 

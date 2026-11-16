@@ -4,7 +4,7 @@
 > 设计依据：DESIGN §1/L1、§7；前序实测：[`z100-cudagraph-route-a-20261021.md`](z100-cudagraph-route-a-20261021.md)
 > 属主：A（Lead）。日期：2026-10-24。树 SHA `7078b5fe137feeab3750ee243daeaf172dc439d8`（分支 `dtk`）。
 > 栈：4×Z100（gfx906）、DTK 26.04、torch 2.11.0、TP=4、DFlash2 k=7、c=1、greedy、MBT 8192、`max_num_seqs=4`、util 0.85。
-> 臂脚本：[`tools/dcu/s27_graph_launch.sh`](../../tools/dcu/s27_graph_launch.sh)（新增，从生产脚本逐字派生，功能 diff 仅两处）。
+> 臂脚本：`s27_graph_launch.sh`（新增，从生产脚本逐字派生，功能 diff 仅两处）。
 
 ---
 

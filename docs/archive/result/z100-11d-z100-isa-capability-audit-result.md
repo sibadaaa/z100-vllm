@@ -702,4 +702,4 @@ PY
 - 前序工程（只读）：`/home/lyh/server/int8_sdot4/w8a8_sdot4_kernel.hip`、`int8_sdot4_patch.py`、`w8a8_sdot4_build.py`、`/home/lyh/server/修复方案-INT8-sdot4.md`、`/home/lyh/server/gfx906_port/适配计划-gfx906-vLLM-DTK.md` §…（"int8_sdot4 patch ACTIVE（sdot4 GEMV+GEMM）"）
 - DTK 自带 clang 内建定义表：`/opt/dtk/llvm/lib/clang/15.0.0` 对应的 `/opt/dtk-24.04.3/llvm/include/clang/Basic/BuiltinsAMDGPU.def:286-297`
 - 外部：[LLVM《Syntax of gfx906 Instructions》](https://llvm.github.io/www-releases/22.1.8/docs/AMDGPU/AMDGPUAsmGFX906.html)（gfx906 专属 VOP3P 指令表：含 `v_dot4_i32_i8`/`v_dot8_i32_i4`/`v_fma_mix_f32`，不含 `v_mad_mix_f32`/`v_qsad_pk_u16_u8`）
-- 本步脚本：[`tools/dcu/isa_probe.sh`](../../tools/dcu/isa_probe.sh)、[`tools/dcu/triton_codegen_probe.py`](../../tools/dcu/triton_codegen_probe.py)
+- 本步脚本：`isa_probe.sh`、`triton_codegen_probe.py`

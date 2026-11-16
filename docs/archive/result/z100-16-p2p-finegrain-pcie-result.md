@@ -36,9 +36,9 @@
 
 | 文件 | 作用 |
 |---|---|
-| [`tools/dcu/p2p_capability_probe.py`](../../tools/dcu/p2p_capability_probe.py) | flag×尺寸的错误码、设备属性、`CanAccessPeer`、真实 `hipMemcpyPeer`、IPC |
-| [`tools/dcu/p2p_finegrain_sweep.py`](../../tools/dcu/p2p_finegrain_sweep.py) | 4 rank all-reduce 尺寸扫描 + 正确性指纹，含 `hipDeviceAttributeFineGrainSupport` |
-| [`tools/dcu/finegrain_side_effects.py`](../../tools/dcu/finegrain_side_effects.py) | 开关的副作用面：pinned H2D/D2H、pageable H2D、D2D、peer copy、fp16 GEMM 数值 |
+| `p2p_capability_probe.py` | flag×尺寸的错误码、设备属性、`CanAccessPeer`、真实 `hipMemcpyPeer`、IPC |
+| `p2p_finegrain_sweep.py` | 4 rank all-reduce 尺寸扫描 + 正确性指纹，含 `hipDeviceAttributeFineGrainSupport` |
+| `finegrain_side_effects.py` | 开关的副作用面：pinned H2D/D2H、pageable H2D、D2D、peer copy、fp16 GEMM 数值 |
 
 ### 2.1 开关直接决定 flag 可用性与设备属性
 

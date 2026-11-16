@@ -290,6 +290,6 @@ ENV=runs/prefill-lctx/incident/with_serve_env.py
 `POST /start_profile|/stop_profile` 端点可用
 ([profile/api_router.py](../../vllm/entrypoints/serve/profile/api_router.py));
 服务 stdout 为 socket(非文件),chunk 级时间戳归因以 profiler trace 为准。
-P2 探针 [s22_attn_prefill_probe.py](../../tools/dcu/s22_attn_prefill_probe.py)
+P2 探针 `s22_attn_prefill_probe.py`
 已支持 `--ctx 49152` 级、segments/block-m/tile/warps/stages 扫描与 fp32 参考对拍,
 仅需扩长 KV 档(128k/200k/262k)——注意其内核微测需停机窗口或 DCU3 空闲纪律。

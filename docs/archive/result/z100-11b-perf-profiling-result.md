@@ -480,4 +480,4 @@ grep -c 'v_dot4_i32_i8' \
 - [`docs/result/z100-11d-z100-isa-capability-audit-result.md`](z100-11d-z100-isa-capability-audit-result.md)（gfx906 ISA 清单；`v_dot4_i32_i8` 可用、无 MFMA/WMMA）
 - [`docs/z100-todolist.md`](../z100-todolist.md)（硬约束 1–21）、[`docs/result/README.md`](README.md)（归档模板）
 - 源码：`vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py:22,190–240`；`vllm/model_executor/kernels/linear/scaled_mm/triton.py:137`
-- 本步新增工具：[`tools/dcu/s11b_analyze2.py`](../../tools/dcu/s11b_analyze2.py)
+- 本步新增工具：`s11b_analyze2.py`

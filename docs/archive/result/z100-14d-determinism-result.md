@@ -649,7 +649,7 @@ sudo -n python3 tools/dcu/dcu_p2p_acs.py show | grep -c 0x0000   # 收尾仍应�
 * [`z100-14c-tp4-graph-memory-result.md`](z100-14c-tp4-graph-memory-result.md) §3.12/§3.13(生产候选配方)、§3.11(因子汇总)、§6
 * [`z100-14b-graph-vs-eager-result.md`](z100-14b-graph-vs-eager-result.md) §3.7/§3.9(`p2_zh_slip`)、§3.4(eager 逐位可复现)、§4(判定)、§6
 * [`z100-14c-lead-crosscheck.md`](z100-14c-lead-crosscheck.md)(E5 的来源:C2 142.59 vs P4e 126.83)
-* [`../tools/dcu/s14d_taskbook.md`](../../tools/dcu/s14d_taskbook.md)(任务书)
+* [`../tools/dcu/s14d_taskbook.md`](../../../tools/dcu/s14d_taskbook.md)(任务书)
 * 原始工件:`/mnt/game/s14d/probe-*.jsonl`(7 臂 × 12 prompt 的逐位 token 流 + 同上下文 logprobs)、
   `/mnt/game/s14d/conc2-*.jsonl`、`/mnt/game/s14d/seq2-E5SEQ.jsonl`、
   `/mnt/game/s14d/hostlogs/**`(逐 arm 完整日志)、`/mnt/game/s14d/*.csv`(逐 prompt 对照)、

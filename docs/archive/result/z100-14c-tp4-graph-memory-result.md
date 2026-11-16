@@ -1179,4 +1179,4 @@ cat /proc/swaps; free -m; hy-smi --showmeminfo vram
 * 内核原文：`sudo -n dmesg -T | grep -A3 "oom-kill:constraint"`（本步新增第 6 次 `global_oom`，§3.5）
 * 原始工件：`/mnt/game/s14c/hostlogs/**`（§3.16 索引）
 * 基线脚本（未改动，md5 见 §2）：`tools/dcu/s14_{arm_env,run_one,bench,monitor,stop_arm,smaps}.sh`
-* ACS 工具：[`tools/dcu/dcu_p2p_acs.py`](../tools/dcu/dcu_p2p_acs.py)（本步只用 `show`）
+* ACS 工具：[`tools/dcu/dcu_p2p_acs.py`](../../../tools/dcu/dcu_p2p_acs.py)（本步只用 `show`）

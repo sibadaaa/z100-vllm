@@ -199,7 +199,7 @@ vllm serve Qwen/Qwen3.5-0.8B --dtype bfloat16 --max-model-len 4096   # 需 probe
 
 - 源码/构建树/安装前缀/缓存全在 `/mnt/game/triton-gfx906/`（约 12 GB），`pip install --target`，**DTK 原装 triton 未触碰**。用法：
   `export PYTHONPATH=/mnt/game/triton-gfx906/install:$PYTHONPATH`、`export TRITON_CACHE_DIR=/mnt/game/triton-gfx906/cache`（别写 `/`）。
-- 补丁 [`tools/dcu/triton-gfx906-3.6.0.patch`](../tools/dcu/triton-gfx906-3.6.0.patch)（5 文件 48 行）：VEGA ISAFamily 3 文件（`isCDNA()` 保持 false、`supportsVDot()` 含 VEGA）+ `driver.py`（DTK 的 `hipDeviceProp_t` 是 792 B / `gcnArchName@396`，vendored 头是 1472 B/1160，必须用 DTK 头编译，否则设备属性乱码）+ `compiler.py`（SFU hazard，见 7.3）。
+- 补丁 [`tools/dcu/triton-gfx906-3.6.0.patch`](../../tools/dcu/triton-gfx906-3.6.0.patch)（5 文件 48 行）：VEGA ISAFamily 3 文件（`isCDNA()` 保持 false、`supportsVDot()` 含 VEGA）+ `driver.py`（DTK 的 `hipDeviceProp_t` 是 792 B / `gcnArchName@396`，vendored 头是 1472 B/1160，必须用 DTK 头编译，否则设备属性乱码）+ `compiler.py`（SFU hazard，见 7.3）。
 - 门禁：探针 `TRITON_OK`/`REDUCE_OK`/`INT8DOT_OK`/32 条 `v_dot`；`test_triton_unified_attention_gfx906.py` **39 passed**、`test_triton_unified_attn_gfx906_v1.py` **12 passed**；S5 遗留的 14 个 `unsupported target: 'gfx906'` **14/14 消除**，五文件同口径 **74 passed / 0 failed**。
 - `AMDGCN_USE_BUFFER_OPS=0` 与 hcu 后端（缺 `/opt/dtk/aillvm`）都不再需要——自编译后 Python 与 `libtriton.so` 同源。
 
@@ -237,7 +237,7 @@ vllm serve Qwen/Qwen3.5-0.8B --dtype bfloat16 --max-model-len 4096   # 需 probe
 
 ### 7.8 单卡内存 / KV cache / graph 与 `--enforce-eager` 的 NaN（S7 + Lead 复核）
 
-Lead 用 [`tools/dcu/s7_gate.sh`](../tools/dcu/s7_gate.sh) 在 `z100-serve` 容器里**独立复跑**（单卡 0、`Qwen3-0.6B`、fp16、`max-model-len 2048`、`gpu_memory_utilization=0.9`），与 S7 的结论逐项一致：
+Lead 用 `s7_gate.sh` 在 `z100-serve` 容器里**独立复跑**（单卡 0、`Qwen3-0.6B`、fp16、`max-model-len 2048`、`gpu_memory_utilization=0.9`），与 S7 的结论逐项一致：
 
 | 模式 | `Available KV cache memory` | `GPU KV cache size` | 输出 | decode |
 |---|---|---|---|---|
@@ -349,7 +349,7 @@ docker exec z100-s9 bash -lc 'source /opt/dtk/env.sh; python /src/tools/dcu/p2p_
 
 脚本只改**桥**（class `0x0604xx`），**绝不碰 DCU 端点本身**；`apply --keep-sv` 可只清 `RR|CR|UF`、保留 `SrcValid`；快照在 `/var/lib/dcu-p2p-acs.snapshot`。
 
-**开机自启（已落地）**：[`tools/dcu/dcu-p2p-acs.service`](../tools/dcu/dcu-p2p-acs.service) → `/etc/systemd/system/dcu-p2p-acs.service`，`enable` 且 `active (exited)`：
+**开机自启（已落地）**：[`tools/dcu/dcu-p2p-acs.service`](../../tools/dcu/dcu-p2p-acs.service) → `/etc/systemd/system/dcu-p2p-acs.service`，`enable` 且 `active (exited)`：
 
 ```bash
 systemctl status dcu-p2p-acs   # oneshot：ExecStart=apply、ExecStop=revert
@@ -363,7 +363,7 @@ systemctl start dcu-p2p-acs    # 再次清零（幂等）
 
 - **重启即失效**（改的是活跃 PCIe 配置）→ **已用 systemd unit 处理**（见上）；
 - **ACS 是 DMA 隔离特性**：单租户推理机无影响，**多租户/VFIO 场景不要关**；
-- 脚本已入仓：[`tools/dcu/dcu_p2p_acs.py`](../tools/dcu/dcu_p2p_acs.py)、[`tools/dcu/p2p_verify.py`](../tools/dcu/p2p_verify.py)（后者修正了旧 `p2p.py`"只同步 cuda:0 导致 1324 GB/s 假带宽"的坑）。
+- 脚本已入仓：[`tools/dcu/dcu_p2p_acs.py`](../../tools/dcu/dcu_p2p_acs.py)、`p2p_verify.py`（后者修正了旧 `p2p.py`"只同步 cuda:0 导致 1324 GB/s 假带宽"的坑）。
 
 ### 9.4 对本项目的影响（S12 量化 + S13 复核定稿）
 
@@ -387,7 +387,7 @@ systemctl start dcu-p2p-acs    # 再次清零（幂等）
 - **同 fabric 真实倍率：我们 TP=2 比生产栈 TP=4 快 1.43×–1.56×**（跨口径对 122.47 是 1.446×，与 S11l 的 1.458× 吻合）；
 - **唯一可能吃到 ACS 收益的机制：已证伪（S13）**。原假设是"去掉 `--disable-custom-all-reduce`，让 vLLM 自研 AR 走直接 peer 写（`copy_` 那条 4.1× 路径）"。实测：① **实际选中的 AR 后端是 NCCL**（两臂日志逐字 `Using ['PYNCCL'] all-reduce backends`）；② custom AR 在 gfx906 上被**双重结构性阻断** —— 平台门禁 [`rocm.py:1239-1241`](../vllm/platforms/rocm.py) 只认 gfx94/gfx95 ⇒ [`parallel.py:1104-1109`](../vllm/config/parallel.py) **强制** `disable_custom_all_reduce=True`（CLI 带不带这个 flag 是同一套配置，配置回显始终 True）；即使强闯，[`csrc/custom_all_reduce.cu:156-159`](../csrc/custom_all_reduce.cu) 走 `hipDeviceMallocUncached`，探针在该 flag 上返回 `hipErrorOutOfMemory`（同尺寸普通 `hipMalloc` 成功 ⇒ 非内存不足）；③ **A/B 收益 = 0**：不带 flag 84.12 / 8667.97(in=3854) / conc8 33.39 vs 带 flag 83.98 / 8650.34 / 33.51，**全部 ≤0.4%（噪声）**；④ 正确性过关且 flag **不进 AOT key**（同 vintage 双加载臂 **0/505 逐位一致**、Δlogprob 0.000000；跨 vintage 的 319–431/512 全是缓存 vintage 效应）。
   机理层面为什么不奇怪：`s13_pw_emul` 显示 10 KB 消息的 peer 写是**延迟受限**（59.8 µs ACS 关 vs 62.2 µs ACS 开，仅差 4%；RCCL 同尺寸 88–100 µs/call），**ACS 的 4.1× 要到 ≥1 MiB 才出现**（2 MiB 3.2×、128 MiB 4.07×）——而 TP=2 的 AR 消息只有 KB 量级 ⇒ 原方案里"5.7 ms/step、6–7%"的预期**高估了一个数量级**。**结论：生产配方不动（保留该 flag，既无害也无用），不为它改平台门禁/csrc。**
-   **〔S16 更正，2026-10-11〕"RCCL 全走 SHM 是平台能力限制"不成立——真因是缺 `HSA_FORCE_FINE_GRAIN_PCIE=1`。** 该变量决定 `hipDeviceAttributeFineGrainSupport`（未设 `0` / 设后 `1`），而 RCCL 的 `p2pCanConnect()` 在 AMD 平台上**硬门禁** `if (!info1->hasFineGrain || !info2->hasFineGrain) return 0;`（`src/transport/p2p.cc`），且其 shareable buffer 走的是 **`hipDeviceMallocFinegrained`(0x1)**（源码 `#if defined(HIP_UNCACHED_MEMORY) … #else hipDeviceMallocFinegrained`；Hygon 构建里 `HIP_UNCACHED_MEMORY` 未定义，反汇编 `ncclP2pAllocateShareableBuffer` 传 `$0x1` 亦证），**不是** `Uncached`(0x3)——S11f/S13 把 `Uncached` 当成共同根因是误判。实测 4 rank 同 PCIe switch：`via P2P=0 / via SHM=56` → **`via P2P=56 / via SHM=0`**；1 MiB all-reduce **1143 → 143 µs（8×）**、4 MiB **4388 → 318 µs（13.8×）**、≤64 KiB **持平**（80.9–84.3 → 79.1–141.0 µs，噪声内），两臂归约指纹**逐位一致**（`sha256=f7a09216326e43ba21b62ded89b5ae36`），pinned H2D/D2H、pageable H2D、peer `copy_`(28.0 GB/s)、fp16 GEMM 数值**无可测变化**。RCCL 启动时本就以 `NCCL WARN Missing "HSA_FORCE_FINE_GRAIN_PCIE=1" from environment …` 索要该变量。⇒ 已默认写入 [`tools/dcu/env.sh`](../tools/dcu/env.sh) §9（`HSA_FORCE_FINE_GRAIN_PCIE=0` 可还原旧行为）。**端到端已完成（S17，27B W8A8 INT8 TP=4，graph，maxlen 8192，仅该变量不同）**：引擎内 RCCL 通道 `via SHM=112/P2P=0` → **`via P2P/IPC=112/SHM=0`**；decode median TPOT **49.56 → 47.83 ms（快 3.6%）**、decode TTFT **654.45 → 403.21 ms（1.62×）**、prefill 3800in TTFT **8877 → 4125 ms（2.15×）**、8K TTFT **13053 → 6918 ms（1.89×）**、conc8 吞吐 **39.52 → 54.42 tok/s（1.38×）**；eager 臂 4 prompt × 128 token **逐位一致、`max|Δlogprob|=0`**（graph 臂因 S14e 的跨重启不可复现不做 token 对照）。证据：[`docs/result/z100-16-p2p-finegrain-pcie-result.md`](result/z100-16-p2p-finegrain-pcie-result.md)、[`z100-17-p2p-finegrain-e2e-result.md`](result/z100-17-p2p-finegrain-e2e-result.md)。
+   **〔S16 更正，2026-10-11〕"RCCL 全走 SHM 是平台能力限制"不成立——真因是缺 `HSA_FORCE_FINE_GRAIN_PCIE=1`。** 该变量决定 `hipDeviceAttributeFineGrainSupport`（未设 `0` / 设后 `1`），而 RCCL 的 `p2pCanConnect()` 在 AMD 平台上**硬门禁** `if (!info1->hasFineGrain || !info2->hasFineGrain) return 0;`（`src/transport/p2p.cc`），且其 shareable buffer 走的是 **`hipDeviceMallocFinegrained`(0x1)**（源码 `#if defined(HIP_UNCACHED_MEMORY) … #else hipDeviceMallocFinegrained`；Hygon 构建里 `HIP_UNCACHED_MEMORY` 未定义，反汇编 `ncclP2pAllocateShareableBuffer` 传 `$0x1` 亦证），**不是** `Uncached`(0x3)——S11f/S13 把 `Uncached` 当成共同根因是误判。实测 4 rank 同 PCIe switch：`via P2P=0 / via SHM=56` → **`via P2P=56 / via SHM=0`**；1 MiB all-reduce **1143 → 143 µs（8×）**、4 MiB **4388 → 318 µs（13.8×）**、≤64 KiB **持平**（80.9–84.3 → 79.1–141.0 µs，噪声内），两臂归约指纹**逐位一致**（`sha256=f7a09216326e43ba21b62ded89b5ae36`），pinned H2D/D2H、pageable H2D、peer `copy_`(28.0 GB/s)、fp16 GEMM 数值**无可测变化**。RCCL 启动时本就以 `NCCL WARN Missing "HSA_FORCE_FINE_GRAIN_PCIE=1" from environment …` 索要该变量。⇒ 已默认写入 [`tools/dcu/env.sh`](../../tools/dcu/env.sh) §9（`HSA_FORCE_FINE_GRAIN_PCIE=0` 可还原旧行为）。**端到端已完成（S17，27B W8A8 INT8 TP=4，graph，maxlen 8192，仅该变量不同）**：引擎内 RCCL 通道 `via SHM=112/P2P=0` → **`via P2P/IPC=112/SHM=0`**；decode median TPOT **49.56 → 47.83 ms（快 3.6%）**、decode TTFT **654.45 → 403.21 ms（1.62×）**、prefill 3800in TTFT **8877 → 4125 ms（2.15×）**、8K TTFT **13053 → 6918 ms（1.89×）**、conc8 吞吐 **39.52 → 54.42 tok/s（1.38×）**；eager 臂 4 prompt × 128 token **逐位一致、`max|Δlogprob|=0`**（graph 臂因 S14e 的跨重启不可复现不做 token 对照）。证据：[`docs/result/z100-16-p2p-finegrain-pcie-result.md`](result/z100-16-p2p-finegrain-pcie-result.md)、[`z100-17-p2p-finegrain-e2e-result.md`](result/z100-17-p2p-finegrain-e2e-result.md)。
    **同时复核排除的假设**（外部诊断清单逐条）：BAR0 = **32 GiB prefetchable**、驱动 `isLargeBar=1`（Large BAR 已开，非 256 MB）；12 个父桥 ACS 已清零 + `pci=disable_acs_redir`，`iommu=pt` 生效；容器 `IpcMode=host`/`/dev/kfd`+`/dev/dri`+`/dev/mkfd`/`group-add video`（`--privileged`/`IPC_LOCK` 非必需）；`hipDeviceCanAccessPeer=1`、`hipMemcpyPeer` **19.9–20.5 GB/s**、`hipIpcGetMemHandle=rc 0` ⇒ 硬件 IPC/P2P 通路本就可用，唯一缺的是上面那个用户态开关。
 - **补齐项（S13）**：**8K prefill = 2.578 ms/prefill-token**（in=8154、Median TTFT 21019.66 ms；S11l 口径 2.571、生产 2.789 ⇒ 优于生产 **1.082×**）。
 

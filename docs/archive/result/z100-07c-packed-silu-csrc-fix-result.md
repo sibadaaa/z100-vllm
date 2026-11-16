@@ -807,7 +807,7 @@ docker exec z100-build-211 bash -lc 'cp -p /mnt/game/port/s7c/_C_stable_libtorch
     `:613`（`silu_and_mul_with_clamp` schema）
   - `csrc/quantization/gptq/compat.cuh:28-36`（本仓库既有"`__DTK_ARCH__` 由 DTK hipify 注入"的先例）
 - 本步脚本/产物：
-  - [`tools/dcu/s7c_direct_check.py`](../../tools/dcu/s7c_direct_check.py)（裸算子探针）
+  - `s7c_direct_check.py`（裸算子探针）
   - [`tests/kernels/test_gfx906_packed_silu_fp16.py`](../../tests/kernels/test_gfx906_packed_silu_fp16.py)（回归单测）
   - `/mnt/game/port/s7c/`：`before-fix2.log`、`after-fix.log`、`build-s7c.log`、`s7c-gate-graph.log`、
     `s7c-gate-eager.log`、`s7c-gate-eager-csrc-only.log`、`s7c-gate-eager-prefix-csrc-only.log`、
