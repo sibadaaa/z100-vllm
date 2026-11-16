@@ -69,7 +69,7 @@ head count — is fixed by the checkpoint and is not user-configurable. Only the
 storage and sharding described below are configurable, via
 `--engram-config`, which takes a JSON object and can also be set field by
 field as `--engram-config.<field>`
-([CLI reference](../cli/serve.md#-engram-config)).
+(CLI reference).
 
 ## CPU offload
 

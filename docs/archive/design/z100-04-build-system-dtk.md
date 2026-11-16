@@ -81,4 +81,4 @@ python -c "import torch;print(hasattr(torch.ops,'_rocm_C')) "
 ## 参考
 
 - 前序计划 §5.4 构建配方（含 `/opt/rocm` 链接、MAX_JOBS、磁盘告警）
-- [tools/dcu/README.md](../../tools/dcu/README.md)
+- [tools/dcu/README.md](../../../tools/dcu/README.md)

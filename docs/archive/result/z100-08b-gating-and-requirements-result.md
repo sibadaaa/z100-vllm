@@ -72,12 +72,12 @@ fp32 反量化参考的 `mean_rel_err` 为 **0.000e+00 ~ 1.465e-07**（全 finit
 
 | # | 文件 | 位置 | 改动摘要 |
 |---|---|---|---|
-| A | [`tests/kernels/quantization/test_w4a16_kernel_selection.py`](../../tests/kernels/quantization/test_w4a16_kernel_selection.py) | `:19-22`、`:27-34`、`:36-49`、`:86-105` | 期望值补 gfx906 分支；新增 `has_g_idx=True ⇒ ValueError` 用例（锁"明确报错而非静默算错"） |
-| B | [`tools/dcu/env.sh`](../../tools/dcu/env.sh) | `:12`（注释）、`:108-113`（新第 8 节）、`:119`（banner） | 新增 `VLLM_CACHE_ROOT` 默认导出（`/mnt/game/vllm-cache`，`/mnt/game` 不存在或已被外部设置时不覆盖） |
-| C | [`requirements/dcu.txt`](../../requirements/dcu.txt) | `:50-56` | 从 `common.txt` **重述**（不换版本号）`compressed-tensors == 0.15.0.1`，附"镜像自带 0.14.0.1 不够"的原因注释 |
-| D | [`tools/dcu/README.md`](../../tools/dcu/README.md) | `env.sh` 第 6 条 + 新增 `## compressed-tensors must be >= 0.15.0.1`、`## s8b_gate.sh` 两节 | 文档同步 |
-| E | [`tools/dcu/s8b_fp8_block_probe.py`](../../tools/dcu/s8b_fp8_block_probe.py) | 新增 511 行 | FP8 选择面 + 17 组用例数值 sweep + 输入量化核 + 全 kernel 路径 + 计时；**带退出码**（全通过 0） |
-| F | [`tools/dcu/s8b_gate.sh`](../../tools/dcu/s8b_gate.sh) | 新增 256 行 | 14 项禁用清单/约定检查 + FP8 数值探针 + W4A16 选择测试；`ALL GREEN` 才 exit 0 |
+| A | [`tests/kernels/quantization/test_w4a16_kernel_selection.py`](../../../tests/kernels/quantization/test_w4a16_kernel_selection.py) | `:19-22`、`:27-34`、`:36-49`、`:86-105` | 期望值补 gfx906 分支；新增 `has_g_idx=True ⇒ ValueError` 用例（锁"明确报错而非静默算错"） |
+| B | [`tools/dcu/env.sh`](../../../tools/dcu/env.sh) | `:12`（注释）、`:108-113`（新第 8 节）、`:119`（banner） | 新增 `VLLM_CACHE_ROOT` 默认导出（`/mnt/game/vllm-cache`，`/mnt/game` 不存在或已被外部设置时不覆盖） |
+| C | [`requirements/dcu.txt`](../../../requirements/dcu.txt) | `:50-56` | 从 `common.txt` **重述**（不换版本号）`compressed-tensors == 0.15.0.1`，附"镜像自带 0.14.0.1 不够"的原因注释 |
+| D | [`tools/dcu/README.md`](../../../tools/dcu/README.md) | `env.sh` 第 6 条 + 新增 `## compressed-tensors must be >= 0.15.0.1`、`## s8b_gate.sh` 两节 | 文档同步 |
+| E | `s8b_fp8_block_probe.py` | 新增 511 行 | FP8 选择面 + 17 组用例数值 sweep + 输入量化核 + 全 kernel 路径 + 计时；**带退出码**（全通过 0） |
+| F | `s8b_gate.sh` | 新增 256 行 | 14 项禁用清单/约定检查 + FP8 数值探针 + W4A16 选择测试；`ALL GREEN` 才 exit 0 |
 | G | [`docs/result/z100-08b-gating-and-requirements-result.md`](z100-08b-gating-and-requirements-result.md) | 本档 | — |
 
 ### 2.2 **`vllm/model_executor/kernels/linear/scaled_mm/**` 零改动（这是本步最重要的"改动"）**
@@ -180,7 +180,7 @@ $ python -c "import torch; print([ (i, *[round(x/2**30,2) for x in torch.cuda.me
 
 ### 3.2 FP8 block-scaled：数值探针（本步核心）
 
-脚本 [`tools/dcu/s8b_fp8_block_probe.py`](../../tools/dcu/s8b_fp8_block_probe.py)，日志
+脚本 `s8b_fp8_block_probe.py`，日志
 `/mnt/game/port/s8b/s8b-fp8-block-probe.log`。它不做 monkey-patch，测的是引擎真正会选的路径。
 参考实现是上游自带的 fp32 反量化 matmul
 （`tests.kernels.quant_utils.native_w8a8_block_matmul`），与 triton 内核相互独立。
@@ -815,10 +815,10 @@ docker exec z100-s8 bash -lc '
   - 本步改动：`tests/kernels/quantization/test_w4a16_kernel_selection.py:19-22/27-34/36-49/86-105`、
     `tools/dcu/env.sh:108-119`、`requirements/dcu.txt:50-56`、`tools/dcu/README.md`
 - 本步脚本（仓库）：
-  [`tools/dcu/s8b_fp8_block_probe.py`](../../tools/dcu/s8b_fp8_block_probe.py)、
-  [`tools/dcu/s8b_gate.sh`](../../tools/dcu/s8b_gate.sh)、
-  [`tools/dcu/env.sh`](../../tools/dcu/env.sh)、
-  [`tools/dcu/README.md`](../../tools/dcu/README.md)
+  `s8b_fp8_block_probe.py`、
+  `s8b_gate.sh`、
+  [`tools/dcu/env.sh`](../../../tools/dcu/env.sh)、
+  [`tools/dcu/README.md`](../../../tools/dcu/README.md)
 - 本步原始日志（全部在 `/mnt/game/port/s8b/`，容器内）：
   `s8b-fp8-block-probe.log`、`s8b-gate.log`、`s8b-gate-fp8-probe.log`、`s8b-gate-w4a16-sel.log`、
   `s8b-pytest-w4a16-sel-BEFORE.log`、`s8b-pytest-w4a16-sel-AFTER.log`、`s8b-w4a16-download.log`、

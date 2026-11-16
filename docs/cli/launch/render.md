@@ -11,7 +11,7 @@ vllm launch render meta-llama/Llama-3.2-1B-Instruct --port 8100
 
 This command reuses the standard serving parser, so model, frontend,
 networking, and related CLI options follow the same conventions as
-[`vllm serve`](../serve.md).
+vllm serve.
 
 ## JSON CLI Arguments
 

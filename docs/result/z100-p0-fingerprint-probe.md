@@ -1,6 +1,6 @@
 # Z100 P0 测量基座：策略指纹（WP0.4）+ 真实文档探针（WP0.5）
 
-> 设计依据：[`z100-decode-prefill-optimization-design.md`](../design/z100-decode-prefill-optimization-design.md)（DESIGN）§5、[`z100-decode-prefill-optimization-construction.md`](../design/z100-decode-prefill-optimization-construction.md)（BUILD）§2/§4/§12。
+> 设计依据：`z100-decode-prefill-optimization-design.md`（DESIGN）§5、`z100-decode-prefill-optimization-construction.md`（BUILD）§2/§4/§12。
 > 属主：B。工作性质：**零卡**（本报告全部内容未启动/未占用任何 GPU 服务；Lead 独占 GPU）。
 > 树：`/home/lyh/z100-vllm`，分支 `dtk`，树 SHA `7078b5fe137feeab3750ee243daeaf172dc439d8`（脏树：`git status --porcelain` 非空，见 §WP0.4-3）。
 > 产物：

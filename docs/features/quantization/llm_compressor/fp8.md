@@ -31,7 +31,7 @@ The FP8 types typically supported in hardware have two distinct representations,
     use the separate `--moe-backend`. An explicit backend that is not
     supported on your hardware raises an error rather than falling back.
     The full list is documented under
-    [`KernelConfig`](../../../cli/serve.md#kernelconfig) in the CLI
+    KernelConfig in the CLI
     reference and shown by `vllm serve --help=KernelConfig`.
 
 ## Installation

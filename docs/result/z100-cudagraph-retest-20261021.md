@@ -38,9 +38,9 @@
 | **E2** 编译+图 | 开 | `piecewise` | 去掉 | `--compilation-config '{"cudagraph_mode":"piecewise","cudagraph_capture_sizes":[1,2,4,8,16]}' --cudagraph-metrics` | 8001 | `/mnt/game/vllm-cache-graph` |
 
 - 三个 launcher 都由生产脚本派生，只改表中列出的行：
-  [s26_graph_launch.sh](../../tools/dcu/s26_graph_launch.sh)（E2）、[s26_e1_compileonly_launch.sh](../../tools/dcu/s26_e1_compileonly_launch.sh)（E1）；E0 直接用 [serve_host_dflash2.sh](../../tools/dcu/serve_host_dflash2.sh)。
+  `s26_graph_launch.sh`（E2）、`s26_e1_compileonly_launch.sh`（E1）；E0 直接用 `serve_host_dflash2.sh`。
 - 其余 env 逐字保留：`VLLM_DCU_FP8_W8A16=1`、`VLLM_DCU_FP16_PREFILL=auto`、`VLLM_DCU_FP8_EMU_FASTPATH=1`、`VLLM_DCU_FP8_DECODE_CFG=35`、`VLLM_GFX906_TRITON_ATTN_PREFILL_3D=1`、`VLLM_S24_DYNK_*`、`--disable-custom-all-reduce`。
-- 客户端：c=1 用 [s23_probe.py](../../tools/dcu/s23_probe.py)（S20 单请求探针，服务端 `iteration_tokens_total` 算 step）；并发用本窗口新写的 [bench_conc.py](../../.s26/graph/bench_conc.py)（同一 `stream_once`/prompt builder，512-token prompt + 128 output，`temperature=0`）。
+- 客户端：c=1 用 `s23_probe.py`（S20 单请求探针，服务端 `iteration_tokens_total` 算 step）；并发用本窗口新写的 `bench_conc.py`（同一 `stream_once`/prompt builder，512-token prompt + 128 output，`temperature=0`）。
 
 ---
 
@@ -93,7 +93,7 @@ c=4 是 prefill 主导：每条 512-token 请求在编译臂要 ~3.35 s，4 条�
 ### 3.3 质量对拍（greedy token id）
 
 - 8 条固定 prompt（代码/翻译/算术/JSON 各型）× 32 token，`temperature=0`、`return_token_ids=true`：
-  **E0 与 E2 逐 token 完全一致，8/8**（[parity_eager.json](../../.s26/graph/parity_eager.json) vs [parity_graph.json](../../.s26/graph/parity_graph.json)）。
+  **E0 与 E2 逐 token 完全一致，8/8**（`parity_eager.json` vs `parity_graph.json`）。
 - 接受长度/每步 token 三臂一致 ⇒ DFlash drafter 的图路径（`DFlashCudaGraphManager`）没有改变投机语义。
 - 边界仍然成立：S14d/S14e 证明图模式**跨重启不可复现**，本次只证明"同窗口、跨臂"一致。质量门禁/SLA 仍应走 eager。
 

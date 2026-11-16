@@ -10,9 +10,10 @@
 
 > **Current production stack**: DTK 26.04 + torch 2.11.0+das + self-built Triton 3.6
 > + Qwen3.8-27B-FP8, TP=4.
-> Measured 2026-10-27: **51.6 t/s** at 7.5k single-stream (MTP k=2, engine generation
-> phase), **31.4 t/s** at 128k, 30-minute decode run with 0 failures.
-> Detailed performance notes (Chinese):
+> Measured 2026-11-15 (same protocol): **≈51–52 t/s** at 7.5k single-stream (MTP k=2,
+> engine generation phase), **≈50 t/s** at 128k (131k measured 50.65), 131k cold
+> TTFT **203 s**; 30-minute decode run with 0 failures.
+> Performance history (2026-10-27 snapshot; current numbers in “Performance” below):
 > [STATUS](docs/perf/STATUS-20261027.md) ·
 > [ROADMAP](docs/perf/ROADMAP-20261027.md) ·
 > [OPT-EFFECTIVE](docs/perf/OPT-EFFECTIVE-20261027.md).
@@ -33,7 +34,7 @@ non-DTK wheels can crash the engine or silently produce wrong results.
 | torch | 2.11.0+das.opt1.dtk2604 |
 | Triton | **self-built** 3.6.0+git7c56a5e4 (gfx906 patch + SFU hazard fix) |
 | vLLM extensions | `_C`, `_C_stable_libtorch`, `_moe_C_stable_libtorch`, `_rocm_C` |
-| Production model | Qwen3.8-27B-FP8, TP=4, MTP k=2, piecewise graph |
+| Production model | Qwen3.8-27B-FP8, TP=4, MTP k=2, FULL_DECODE_ONLY graph [2,3,6,12] |
 
 > Only the **DTK 26.04** stack is covered here. DTK 26.10 and other vendor stacks are
 > not validated.
@@ -44,19 +45,34 @@ non-DTK wheels can crash the engine or silently produce wrong results.
 
 ## Performance
 
-Qwen3.8-27B-FP8, TP=4, single stream, 7469-token document, MTP k=2.
-`t/s` is the engine generation-phase rate (`tok/step ÷ step_p50`, excluding TTFT).
+Qwen3.8-27B-FP8, TP=4, single stream, MTP `num_speculative_tokens=2`.
+Production config = **FULL_DECODE_ONLY graph, capture sizes [2,3,6,12]** + dynamic-k
+off (S55). `step p50` is the per-decode-step median; `t/s ≈ tok/step ÷ step_p50`
+(MTP k=2, `tok/step≈2.35–2.40`, TTFT excluded). The table is the **c=1 decode**
+protocol (measured 2026-11-05); later rounds improved prefill/TTFT, not the decode path.
 
-| Context | step p50 | tok/step | t/s |
-|---:|---:|---:|---:|
-| 7.5k | 46.5 ms | 2.40 | **51.6** |
-| 32k | 52.6 ms | 2.27 | 43.0 |
-| 60k | 60.6 ms | 2.23 | 36.7 |
-| 128k | 62.2 ms | 1.95 | 31.4 |
+| Context | step p50 | t/s |
+|---:|---:|---:|
+| 16k | 36.6 ms | ≈66 |
+| 32k | 38.4 ms | ≈62 |
+| 64k | 41.9 ms | ≈56 |
+| 128k | 47.9 ms | ≈50 (131k measured **50.65**) |
 
-- No-spec baseline: 36.9 t/s → MTP k=2: 51.6 t/s (greedy, +40%); sampled 34.7 → 40.6 t/s (+17%).
-- MTP raises warm TTFT from 0.72 s to 2.40 s; below ~220–230 output tokens it can be slower end-to-end.
-- c=4 aggregate: 59–70 t/s (decode phase 66–70); only 1.2–1.4× single-stream.
+### Cold prefill / TTFT (2026-11-15)
+
+| prompt | cold TTFT p50 | source |
+|---:|---:|---|
+| 2k | **2.17 s** | S100a (`MIN_M=1024`), 3 reps |
+| 4k | **4.45 s** | same |
+| 8k | **6.52 s** | same (6.82 s right after S99) |
+| 32k | **29.8 s** | S99 window A/B (36.9 → 29.8) |
+| 131k | **203 s** | S99 window A/B (230.3 → 203.1) |
+
+- Decode is unaffected by the 2026-11 prefill work (c=4 improved separately by
+  S81 int8 KV and S89 G2: ITL 125.3 → 82.8 ms).
+- MTP k=2 vs no-spec (2026-10-27, greedy): 36.9 → 51.6 t/s (+40%); warm TTFT
+  0.72 → 2.40 s, so replies below ~220–230 output tokens may be slower end-to-end.
+- Sources: `.s99/README.md`, `runs/s100a-minm1024/RESULT.md`, [DEPLOY.md](DEPLOY.md).
 
 ## Get DTK
 
@@ -134,6 +150,10 @@ docker run -d --name z100-dev \
   automatically.
 
 ## Build
+
+> End-to-end recipe (environment → build → production `_rocm_C` relink → gates
+> → swap/rollback) is in [`BUILD.md`](BUILD.md) (Chinese). This section keeps
+> the generic steps and per-extension responsibilities.
 
 ```bash
 cd /src
@@ -218,7 +238,8 @@ The production recipe adds a set of `VLLM_DCU_*` / `VLLM_GFX906_*` switches
 1. First inference is slow while Triton compiles kernels (1–2 minutes).
 2. KV cache pre-allocation uses a large amount of device memory; use `util 0.85` for 27B.
 3. MTP k=2 raises warm TTFT (0.72 → 2.4 s); short replies can be slower end-to-end.
-4. Long-context cold prefill is expensive (60k/128k ≈ 178 s/520 s); prefix caching is critical.
+4. Long-context cold prefill is expensive (131k ≈ 203 s as of 2026-11-15; prefix-cache hits
+   can cut it to seconds), so reuse prefixes in long sessions.
 5. `hipBLASLt` has no usable gfx906 kernel; `torch.mm` uses rocBLAS.
 6. `dccobjdump` is broken in the DTK image; use `strings`/`clang` for ISA checks.
 
@@ -227,7 +248,9 @@ The production recipe adds a set of `VLLM_DCU_*` / `VLLM_GFX906_*` switches
 - Repository: [sibadaaa/z100-vllm](https://github.com/sibadaaa/z100-vllm)
 - Issues: [sibadaaa/z100-vllm/issues](https://github.com/sibadaaa/z100-vllm/issues)
 - Detailed Chinese README: [README.md](README.md)
-- Performance: [STATUS](docs/perf/STATUS-20261027.md),
+- Build & swap kernels: [BUILD.md](BUILD.md)
+- Deployment & operations: [DEPLOY.md](DEPLOY.md)
+- Performance history (2026-10-27): [STATUS](docs/perf/STATUS-20261027.md),
   [ROADMAP](docs/perf/ROADMAP-20261027.md),
   [OPT-EFFECTIVE](docs/perf/OPT-EFFECTIVE-20261027.md)
 - Design/construction: [Z100 docs index](docs/design/z100/README.md)
@@ -249,7 +272,8 @@ Implemented borrowings:
   `VLLM_DCU_FP8_W8A16` plus fp16 prefill materialization; decode 1.2–2.1×, prefill
   M≥512 1.4–2×.
 - **Five-phase round profile**: `draft / draft→target / target / target→draft / round`,
-  implemented in `tools/dcu/s27_five_phase_profile.py`.
+  implemented in the S27 five-phase profiling script (removed with the probe
+  cleanup; see git history).
 - **Gating discipline**: per-optimization admission predicates, rollback switches,
   bitwise/quality gates, 1K/2K/4K/8K non-regression, same-window A/B, N≥2 restarts.
   Z100 additionally uses its own policy fingerprint.

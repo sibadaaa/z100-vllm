@@ -43,7 +43,7 @@
 
 ### ③ breakable
 
-只加了一个 arm launcher：[tools/dcu/s26_breakable_launch.sh](../../tools/dcu/s26_breakable_launch.sh)（生产 launcher + `VLLM_USE_BREAKABLE_CUDAGRAPH=1`，port 8003，无代码改动）。
+只加了一个 arm launcher：`s26_breakable_launch.sh`（生产 launcher + `VLLM_USE_BREAKABLE_CUDAGRAPH=1`，port 8003，无代码改动）。
 
 ### 测试（本次新增，全部通过）
 

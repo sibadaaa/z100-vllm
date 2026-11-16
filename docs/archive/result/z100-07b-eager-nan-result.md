@@ -630,12 +630,12 @@ grep -nE "v_(exp|rcp|ldexp)_f32" /mnt/game/port/s7b/repro_act_gfx906.s | head
   - `vllm/model_executor/layers/fused_moe/activation.py:311 / :356 / :387`（直调 `_C`，修复未覆盖）
   - `vllm/model_executor/layers/fused_moe/utils.py:590`、`vllm/model_executor/layers/quantization/gguf.py:1720`
   - `vllm/platforms/rocm.py:270-272`（`on_gfx906()`）
-- 本步脚本（仓库）：[`tools/dcu/s7b_min_repro.py`](../../tools/dcu/s7b_min_repro.py)、
-  [`tools/dcu/s7b_hooks.py`](../../tools/dcu/s7b_hooks.py)、[`tools/dcu/s7b_scan.py`](../../tools/dcu/s7b_scan.py)、
-  [`tools/dcu/s7b_activation_scope.py`](../../tools/dcu/s7b_activation_scope.py)、
-  [`tools/dcu/s7b_activation_vecpath.py`](../../tools/dcu/s7b_activation_vecpath.py)、
-  [`tools/dcu/s7b_moe_activation_check.py`](../../tools/dcu/s7b_moe_activation_check.py)、
-  [`tools/dcu/s7b_repro_act_sfu.cu`](../../tools/dcu/s7b_repro_act_sfu.cu)（其余 `s7b_*` 见 §2.2）
+- 本步脚本（仓库）：`s7b_min_repro.py`、
+  `s7b_hooks.py`、`s7b_scan.py`、
+  `s7b_activation_scope.py`、
+  `s7b_activation_vecpath.py`、
+  `s7b_moe_activation_check.py`、
+  `s7b_repro_act_sfu.cu`（其余 `s7b_*` 见 §2.2）
 - 原始日志/数据（全部在 `/mnt/game/port/s7b/`）：`layer_scan-eager.jsonl`、`layer_scan-eager-fixed.jsonl`、
   `scan-eager.log`、`scan-eager-fixed.log`、`s7b-eager-fixed.log`、`s7b-matrix-cudagraph-none.log`、
   `s7b-prompts-eager-fixed.log`、`repro_act_gfx906.s`

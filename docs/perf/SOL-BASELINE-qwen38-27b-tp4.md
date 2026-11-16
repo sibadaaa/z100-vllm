@@ -7,7 +7,7 @@
 > **【规格】**、**【实测】**、**【推算】**。
 > **看到实测与本文冲突时以实测为准**，然后把常量改回脚本 §`SOURCES`。
 
-> ⚠️ **2026-10-25 已实测校准**：[SOL-MEASURED-20261025.md](SOL-MEASURED-20261025.md)（4 卡空闲，原始 JSON 在 `docs/perf/data/`）。
+> ⚠️ **2026-10-25 已实测校准**：SOL-MEASURED-20261025（4 卡空闲，原始 JSON 在 `docs/perf/data/`）。
 > prefill 的算法口径成立（1452 t/s；计入 AR 税后 **1208 t/s**）；
 > **decode 的"8.7 ms"被推翻**——它隐含"权重按 copy 带宽读"，实测 GEMV 只有 197–292 GB/s。
 > 校准后的单流 decode 是 **29.3 ms / 97 tok/s（stream GEMV）～37.1 ms / 76 tok/s（rocBLAS）**，
@@ -162,7 +162,7 @@ TP1 时是 34.8 ms/步（≈82 tok/s × acc），TP4 时 8.7 ms/步。
 
 > **2026-10-25 校准**：下表按 copy 口径 + 20 µs/op 通信算出，两项都被实测修正
 > （GEMV 280–414 GB/s、AR 90 µs/op）。校准后的同一张表见
-> [SOL-MEASURED-20261025.md](SOL-MEASURED-20261025.md) §2.1，两者不要混用。
+> SOL-MEASURED-20261025 §2.1，两者不要混用。
 
 | ctx | KV dtype | SOL step ms | tok/s (acc 2.84) |
 |---:|---|---:|---:|

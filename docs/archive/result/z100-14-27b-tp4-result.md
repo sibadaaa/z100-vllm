@@ -461,9 +461,9 @@ cgroup 是新容器从 0 起算的累计值；P2 自身尚未发生任何 OOM）
 > 该禁令的原文立论是"`CompilationMode.NONE` 下 logits 全 NaN、输出退化成 `"lock"`×N，**待 S7b 定位根因**"。
 > **其事实基础已被移除**：
 > * **S7b** 已定位根因 = `_C.silu_and_mul` 的 **fp16 `__half2` packed 分支被 DTK 编译坏**；
-> * **S7c** 已在 [`csrc/libtorch_stable/activation_kernels.cu`](../csrc/libtorch_stable/activation_kernels.cu)
+> * **S7c** 已在 csrc/libtorch_stable/activation_kernels.cu
 >   完成 **csrc 根修**，并留下回归测试
->   [`tests/kernels/test_gfx906_packed_silu_fp16.py`](../tests/kernels/test_gfx906_packed_silu_fp16.py)
+>   [`tests/kernels/test_gfx906_packed_silu_fp16.py`](../../../tests/kernels/test_gfx906_packed_silu_fp16.py)
 >   （修的就是 `_C_stable_libtorch`）。
 > * 本次运行**实证**该修复生效：被加载的正是 S7c canonical 的那份扩展
 >   （md5 `93bf7b4a391ac97e2f67cc7141633cb1  _C_stable_libtorch.abi3.so`，§3.7 smaps 原文），
@@ -1536,4 +1536,4 @@ docker inspect qwen38-vllm --format 'Status={{.State.Status}} ExitCode={{.State.
 - 原始日志：`/mnt/game/s14/hostlogs/`（`P2/P2b/P2e/P2e2/P4/P4e/P4g1..4[-monitor].log`、
   `smaps-*.txt`、`summary.tsv`）；聚合 JSON `/mnt/game/s14/openai-chat-infqps-*.json`；
   token/logprob 记录 `/mnt/game/s14/{greedy,flip}-*.jsonl`
-- ACS 工具：[`tools/dcu/dcu_p2p_acs.py`](../tools/dcu/dcu_p2p_acs.py)（本步只用 `show`）
+- ACS 工具：[`tools/dcu/dcu_p2p_acs.py`](../../../tools/dcu/dcu_p2p_acs.py)（本步只用 `show`）

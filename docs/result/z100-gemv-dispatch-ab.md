@@ -1,6 +1,6 @@
 # WP0.2 GEMV 派发 A/B（`VLLM_DCU_FP8_GEMV_MAX_M` 8 vs 1）
 
-> 施工依据：BUILD [`z100-decode-prefill-optimization-construction.md`](../design/z100-decode-prefill-optimization-construction.md) §4 WP0.2
+> 施工依据：BUILD `z100-decode-prefill-optimization-construction.md` §4 WP0.2
 > 设计依据：DESIGN §1/L2、§4/D2、§8（"`GEMV_MAX_M=16` 被编译期上限静默截到 8"）
 > 属主：A（Lead）。日期：2026-10-24。树 SHA `7078b5fe137feeab3750ee243daeaf172dc439d8`（分支 `dtk`）。
 > 栈：4×Z100（gfx906）、DTK 26.04、torch 2.11.0、TP=4、DFlash2 k=7、c=1、greedy、MBT 8192、`max_num_seqs=4`、util 0.85、`--enforce-eager`。

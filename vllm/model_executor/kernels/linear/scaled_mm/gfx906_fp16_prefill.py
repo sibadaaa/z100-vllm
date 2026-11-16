@@ -40,7 +40,7 @@ from vllm import envs
 from vllm.logger import init_logger
 
 from .BlockScaledMMLinearKernel import FP8BlockParams
-from .gfx906_fp8 import _device_lut
+from .gfx906_fp8 import _device_lut, _int8_pc_prefill
 
 logger = init_logger(__name__)
 
@@ -329,6 +329,13 @@ def materialize_or_tile(
     K = x.shape[-1]
     m = x.numel() // K
     if _enabled() and m >= min_m and m >= _FORCE_MIN_M:
+        # S99: this is the body that runs eagerly at *runtime* under
+        # torch.compile (`vllm::fp8_emu_mm_block_w8a16_auto`), i.e. the real
+        # production prefill path -- the eager `_try_prefill` above is only
+        # reached when tracing is not involved.
+        out = _int8_pc_prefill(x, w, w_s, bias, out_dtype, block_n, block_k)
+        if out is not None:
+            return out
         out = _materialize(x, w, w_s, bias, out_dtype, block_n, block_k, "auto")
         if out is not None:
             return out
@@ -448,6 +455,19 @@ def _try_prefill(
     block_k = int(kernel.weight_group_shape.col)
     if not _layout_ok(params.weight, params.block_scale, K, block_n, block_k):
         return None
+    # S99: per-channel int8 replaces dequant+rocBLAS when the switch is on and
+    # the shape/geometry gates hold.  Returns None (incumbent route) otherwise.
+    out = _int8_pc_prefill(
+        x,
+        params.weight,
+        params.block_scale,
+        bias,
+        kernel.config.out_dtype,
+        block_n,
+        block_k,
+    )
+    if out is not None:
+        return out
     return _materialize(
         x,
         params.weight,

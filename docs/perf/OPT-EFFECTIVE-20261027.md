@@ -1,5 +1,9 @@
 # Qwen3.8-27B-FP8 有效优化总结（截至 2026-10-27）
 
+> **历史快照（2026-10-27）**：当前生产性能与配置以
+> [README.md](../../README.md)「当前性能」和 [DEPLOY.md](../../DEPLOY.md) 为准；
+> 本文只记录当时的数值与结论。
+
 > **范围**：只收录“已进入生产或已在服务级同口径 A/B 中过门”的项；
 > 被证伪/拒绝的另列 §5，避免重开。
 > **口径**：除特别注明外，7469-token 真实文档 / 96 tok / 3 reps / TP=4；
@@ -25,7 +29,7 @@
 | 8 | gfx906 push one-shot AR | 通信 | no-spec **−2.0~−2.6 ms**；MTP 臂 AR-off 代价 **+10.07 ms** | 采纳 | [`s33-ar-fix`](../result/z100-s33-oneshot-ar-fix.md) |
 | 9 | AR size 门 64→128 KiB | 通信 | c4 **−4.6 ms/步**（聚合 +3.4%）；c1 无回归 | 采纳 | [`STATUS`](STATUS-20261027.md) §2.3 |
 | 10 | GEMV stack（rows=4 + M1） | 内核 | MTP **−2.03 ms（−4.1%）**；no-spec −1.0~−1.4 ms | 采纳 | [`STATUS`](STATUS-20261027.md) §2.3 |
-| 11 | MTP k=2 | 投机 | 贪心 **36.9→51.6 t/s（+40%）**；采样 34.7→40.6（+17%） | 采纳 | [`specbench`](../../runs/specbench/REPORT.md) |
+| 11 | MTP k=2 | 投机 | 贪心 **36.9→51.6 t/s（+40%）**；采样 34.7→40.6（+17%） | 采纳 | specbench |
 | 12 | 退役 DFlash2 k=7 | 投机 | 22.7→36.9 t/s（**移除 −38% 回归**） | 采纳 | 同上 |
 | 13 | O1/O2 host fastpath | 宿主 | c≥4 **+6.6% / +3.55%**；c1 持平 | 采纳（条件收益） | [`fp8-emu`](../result/z100-fp8-emu-optimization-result.md) §8 |
 | 14 | prefix caching + `mamba align` | 配置 | 生产命中率 **91.5%**；60k 冷 prefill 178 s / 128k 520 s | 采纳 | [`STATUS`](STATUS-20261027.md) §2.4 |
@@ -186,7 +190,7 @@ prefill M≥512 走 dequant + rocBLAS，0.50–0.70×（1.4–2× 快），rocBL
 | 尝试 | 结果 | 原因 / 证据 |
 |---|---|---|
 | W4 `v_dot8_i32_i4` GEMV | **No-Go** | 实测 54 GB/s(fp8-eq)，距 450 门 8×；ISA 是 i4×i4，不是 int8×int4（[`W4`](W4-RESEARCH-20261025.md) §6） |
-| DFlash2 k=7 | 退役 | 22.7 t/s vs 无投机 36.9；draft 塔 + M=8 verify 绕开 M=1 特化（[`specbench`](../../runs/specbench/REPORT.md)） |
+| DFlash2 k=7 | 退役 | 22.7 t/s vs 无投机 36.9；draft 塔 + M=8 verify 绕开 M=1 特化（specbench） |
 | DFlash2 k=4 | 不可用 | 启动 `_selector_walk_kernel` VM fault；外推 26–29 t/s 仍低（同上） |
 | SMALLM=rocblas | 拒绝 | 当次按净亏拒绝：step −4.65 ms，但长文档 accept 2.909→2.667（−8.3%）。S28d 后来指出 accept 证据受彩票污染；即便如此，step 收益也不足以单独立项（[`s28-a1`](../result/z100-s28-a1-smallm-ab.md)） |
 | whole-A M=1 GEMV | 停 | 两变体 +5–17%，qkv 387–402 / o 361 <450 门；后由 rows=4+M1 拿 −2 ms（[`s33-wholea`](../result/z100-s33-wholea-gemv.md)） |
@@ -215,4 +219,4 @@ prefill M≥512 走 dequant + rocBLAS，0.50–0.70×（1.4–2× 快），rocBL
 - [S28 A1](../result/z100-s28-a1-smallm-ab.md)
 - [S23 fp8 emu](../result/z100-fp8-emu-optimization-result.md)
 - [W8A16/prefill](../result/z100-w8a16-fp16-prefill-result.md)
-- [投机 TPS](../../runs/specbench/REPORT.md)
+- 投机 TPS

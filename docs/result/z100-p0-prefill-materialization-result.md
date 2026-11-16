@@ -1,6 +1,6 @@
 # Z100 P0 复测结果:prefill fp16 物化路由 A/B(2026-10-21)
 
-按 [z100-p0-retest-plan.md](../design/z100-p0-retest-plan.md) 执行的双臂 A/B。
+按 `z100-p0-retest-plan.md` 执行的双臂 A/B。
 **结论:全面采纳,`VLLM_DCU_FP16_PREFILL=auto` 建议直接量产。**
 
 ## 1. 臂定义与运行

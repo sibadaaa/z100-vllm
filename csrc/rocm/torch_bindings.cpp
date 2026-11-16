@@ -68,6 +68,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gfx906_attnd_decode_inner", torch::kCUDA,
                 &gfx906_attnd_decode_inner);
 
+  // S81: int8_per_token_head sibling of the op above (KV cache stored as int8
+  // codes with a per-(token, head) fp32 scale inline in each page slot).
+  // Dispatched from the same Triton unified-attention entry point when the
+  // cache dtype is int8_per_token_head and the layout gate holds; the
+  // segment buffers and reduce_segments are shared with the fp16 kernel.
+  rocm_ops.def(
+      "gfx906_attnd_decode_inner_kvint8(Tensor! segm_output, "
+      "Tensor! segm_max, Tensor! segm_expsum, Tensor query, "
+      "Tensor key_cache, Tensor value_cache, Tensor k_scale_cache, "
+      "Tensor v_scale_cache, Tensor block_tables, Tensor seq_lens, "
+      "Tensor cu_query_lens, float scale, int num_segments, "
+      "bool delayed_merge, int tps_hint, int seg_stride = 0) -> ()");
+  rocm_ops.impl("gfx906_attnd_decode_inner_kvint8", torch::kCUDA,
+                &gfx906_attnd_decode_inner_kvint8);
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(
@@ -201,6 +216,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("fp8_emu_gemm_block_quant_x", torch::kCUDA,
                 &fp8_emu_gemm_block_quant_x);
 
+  // S99: prefill per-channel int8 GEMM (single int32 accumulator) with the
+  // fp8 E4M3 checkpoint weight staged to int8 inside the op, per 128x128
+  // block scale * per-channel amax.  Variant only for now: the Python
+  // dispatch (VLLM_DCU_PREFILL_INT8_PC) lands separately and defaults off.
+  rocm_ops.def(
+      "fp8_stage_int8_pc(Tensor w, Tensor w_s, Tensor lut, int block_n, "
+      "int block_k) -> (Tensor, Tensor)");
+  rocm_ops.impl("fp8_stage_int8_pc", torch::kCUDA, &fp8_stage_int8_pc);
+
+  rocm_ops.def(
+      "w8a8_sdot4_gemm_pc(Tensor xq, Tensor w, Tensor x_s, Tensor w_s, "
+      "Tensor? bias, ScalarType out_dtype, int cfg) -> Tensor");
+  rocm_ops.impl("w8a8_sdot4_gemm_pc", torch::kCUDA, &w8a8_sdot4_gemm_pc);
+
+  rocm_ops.def(
+      "fp8_emu_mm_int8_pc(Tensor xq, Tensor w, Tensor w_s, Tensor x_s, "
+      "Tensor lut, Tensor? bias, ScalarType out_dtype, int block_n, "
+      "int block_k) -> Tensor");
+  rocm_ops.impl("fp8_emu_mm_int8_pc", torch::kCUDA, &fp8_emu_mm_int8_pc);
+
   // Dense fp16/bf16 decode GEMV (M <= 8) for gfx906: the replacement for the
   // rocBLAS fallback on unquantized linear layers, used by
   // vllm/model_executor/layers/utils.py (rocm_unquantized_gemm_impl) behind
@@ -237,6 +272,9 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, rocm_meta_ops) {
                      &fp8_emu_gemm_block_quant_meta);
   rocm_meta_ops.impl("fp8_emu_gemm_block_quant_x",
                      &fp8_emu_gemm_block_quant_x_meta);
+  rocm_meta_ops.impl("fp8_stage_int8_pc", &fp8_stage_int8_pc_meta);
+  rocm_meta_ops.impl("w8a8_sdot4_gemm_pc", &w8a8_sdot4_gemm_pc_meta);
+  rocm_meta_ops.impl("fp8_emu_mm_int8_pc", &fp8_emu_mm_int8_pc_meta);
   rocm_meta_ops.impl("bf16_emu_gemv", &bf16_emu_gemv_meta);
   rocm_meta_ops.impl("fp16_gemv_stream_m1", &fp16_gemv_stream_m1_meta);
 }

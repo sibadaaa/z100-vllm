@@ -9,9 +9,10 @@
 **专为海光 DCU Z100/Z100L（gfx906）优化的 LLM 推理引擎。**
 
 > **当前主线**：DTK 26.04 + torch 2.11.0+das + 自编 Triton 3.6 + Qwen3.8-27B-FP8 TP=4。
-> 2026-10-27 生产实测：7.5k 单流 **51.6 t/s**（MTP k=2，引擎生成段），128k **31.4 t/s**，
+> 生产实测（同口径）：7.5k 单流 **≈51–52 t/s**（MTP k=2，引擎生成段），
+> 128k **≈50 t/s**（131k 实测 50.65），131k 冷 TTFT **203 s**（2026-11-15，S99）；
 > 30 min decode 长跑 0 失败。
-> 性能现状 / 优化路线 / 有效优化总结：
+> 2026-10-27 的历史快照（当前数值以下文「当前性能」与 [DEPLOY.md](DEPLOY.md) 为准）：
 > [STATUS](docs/perf/STATUS-20261027.md) ·
 > [ROADMAP](docs/perf/ROADMAP-20261027.md) ·
 > [OPT-EFFECTIVE](docs/perf/OPT-EFFECTIVE-20261027.md)。
@@ -43,15 +44,18 @@
 | torch | 2.11.0+das.opt1.dtk2604 |
 | Triton | **自编** 3.6.0+git7c56a5e4（gfx906 补丁 + SFU hazard 修复） |
 | vLLM 扩展 | `_C` / `_C_stable_libtorch` / `_moe_C_stable_libtorch` / `_rocm_C`，只含 gfx906 |
-| 生产模型 | Qwen3.8-27B-FP8，TP=4，MTP k=2，piecewise graph |
+| 生产模型 | Qwen3.8-27B-FP8，TP=4，MTP k=2，FULL_DECODE_ONLY 图 [2,3,6,12] |
 
-> **支持范围**：本 README 只覆盖 **DTK 26.04** 栈。DTK 26.10/其他厂商栈未验证；
-> `/opt/dtk` 或 `DTK_ROOT` 必须指向 DTK 26.04。
+> **支持范围**：本 README 只覆盖 **DTK 26.04** 栈。DTK 26.10/其他厂商栈未验证。
+> 本机宿主 `/opt/dtk` 指向 **26.10**（`libhipblas.so.3`，与生产轮子不兼容），
+> 生产与编译必须 `export DTK_ROOT=/mnt/game/host-runtime/dtk2604`（见 [BUILD.md](BUILD.md) §1）。
 
-## 当前性能（2026-11-05）
+## 当前性能（2026-11-15）
 
 Qwen3.8-27B-FP8，TP=4，单流，MTP `num_speculative_tokens=2`。
 生产配置 = **FULL_DECODE_ONLY 图捕获 [2,3,6,12] + dynamic-k 关闭**（S55 投产）。
+下表为 **decode(c=1)** 口径（2026-11-05 测）；此后两轮收益集中在 prefill/TTFT，
+decode 路径未改（c=4 另有 S81/S89 改善，见下文）。
 `decode 步时 p50` 为单步 decode 耗时中位；`引擎 t/s ≈ tok/step ÷ 步时`（MTP k=2，`tok/step≈2.35–2.40`，不含 TTFT）。
 
 | 上下文 | decode 步时 p50 | 引擎 t/s |
@@ -61,14 +65,30 @@ Qwen3.8-27B-FP8，TP=4，单流，MTP `num_speculative_tokens=2`。
 | 64k | 41.9 ms | ≈56 |
 | 128k | 47.9 ms | ≈50（131k 实测 **50.65**） |
 
-> 表中 `引擎 t/s` 为派生值（`tok/step ÷ 步时`）；131k 为在役同口径实测 50.65 t/s，较在役 piecewise 臂 **+22%**。
+> 表中 `引擎 t/s` 为派生值（`tok/step ÷ 步时`）；131k 为在役同口径实测 50.65 t/s，较上一代 piecewise 臂 **+22%**。
 
 - 长上下文无悬崖：16k→128k 步时仅 36.6→47.9 ms（2026-10-27 同档 128k 为 62.2 ms / 31.4 t/s）。
 - 131k 50.65 t/s = S53 注意力内核（在役 +15.7%）叠加 S55 图模式长 ctx 修复（+22%）。
 - 10/10 boot TPOT 带内 0 fault、greedy 双 boot 逐位一致；c=4 无回退。
 - MTP k=2 收益（2026-10-27 短 ctx 口径）：无投机 36.9 → 51.6 t/s（+40%）；warm TTFT 0.72→2.40 s，输出 <220–230 tok 时端到端可能不如无投机。
 
-## 已落地优化（截至 2026-11-05）
+### 冷 prefill / TTFT（2026-11-15 现役）
+
+| prompt | 冷 TTFT p50 | 口径 |
+|---:|---:|---|
+| 2k | **2.17 s** | S100a（MIN_M=1024），3 reps |
+| 4k | **4.45 s** | 同上 |
+| 8k | **6.52 s** | 同上（S99 刚采纳时为 6.82 s） |
+| 32k | **29.8 s** | S99 窗口 A/B（36.9 → 29.8） |
+| 131k | **203 s** | S99 窗口 A/B（230.3 → 203.1） |
+
+- 相关轮次（各自同口径）：S77 131k −5.9%（295.6→278.0 s）、S80/S81 8k/16k
+  −14.7%/−7.2%、S82b 128k/131k −7.1%、S97 131k −0.5%、S99 131k −11.8%（230.3→203.1 s）。
+- 2k/4k 的台阶来自 mamba 对齐切分：1616/1712/2032 段原先 < 2048 会回落 fp16，
+  S100a 把门降到 1024 后这些段走 int8。
+- 数据出处：`.s99/README.md`、`runs/s100a-minm1024/RESULT.md`、`DEPLOY.md`。
+
+## 已落地优化（截至 2026-11-15）
 
 > 完整逐项证据见 [`docs/perf/OPT-EFFECTIVE-20261027.md`](docs/perf/OPT-EFFECTIVE-20261027.md) 与各轮判定；
 > 此处只列**已进生产 / 服务级 A/B 过门**的项。一句话：有效的都是**拆串行、压每-op 延迟、
@@ -82,9 +102,16 @@ Qwen3.8-27B-FP8，TP=4，单流，MTP `num_speculative_tokens=2`。
 | 通信 | gfx906 push one-shot AR、AR size 门 64→128 KiB、hybrid AR+norm 融合（S44） | MTP 臂 AR-off 代价 +10 ms；c4 −4.6 ms/步；S44 +2.8–4.3% |
 | 投机 | MTP k=2（目标自带 mtp 层，verify M=3 近免费）；退役 DFlash2 k=7 | 贪心 +40%；移除 −38% 回归 |
 | 宿主/配置 | O1/O2 host fastpath、prefix caching + mamba align、accept workspace pin | c≥4 +3.5~6.6%；生产命中 91.5% |
+| 注意力（长 ctx） | S58 prefill HIP inner、S80/S81 3D 门 16384→4096、S97 phsr（p 保 half、alpha==1 跳过 rescale） | 131k 内核 1491→1126 ms；长 ctx TTFT 逐轮 −5~−15% |
+| 精度/KV | S81 `int8_per_token_head` KV + v_dot4 内层 | KV 容量 1.03M→1.97M token；c=4 TPOT −10%，c=1 −1.4% |
+| prefill GEMM | S99 per-channel int8 + in-op fp8 staging；S100a `MIN_M` 2048→1024 | S99 窗口：8k −16.9%、32k −19.4%、131k −11.8%；S100a：2k −16.0%、4k −7.3%、8k −4.8% |
+| 缓存 | S59 前缀缓存三开关（match 16 + mamba checkpoint + retention 1616） | 131k 共享前缀 332.7→44.4 s；5 轮稳态 ~9.6× |
 
 **累计**：同一 Qwen3.8-27B-FP8 / TP=4 单流，128k 从 2026-10-27 的 31.4 t/s 提升到
 2026-11-05 的 ≈50 t/s（131k 实测 50.65 t/s）。
+
+> 2026-11-15 增补（prefill 侧；decode 口径未变）：冷 TTFT 131k **230.3 → 203.1 s**，
+> 2k/4k/8k 分别 **−16.0% / −7.3% / −4.8%**（S100a，同 `.so` 仅 env）。
 
 ## 1. 硬件与软件栈
 
@@ -135,9 +162,10 @@ cmake 3.29（容器内；宿主 3.22 太旧，不要用宿主 cmake）
 | `csrc/` | HIP/C++ 内核：GDN、fp8 emu、W8A16、custom AR、GGUF、MoE |
 | `tools/dcu/` | DTK 环境、构建、微基准、e2e、指纹、探针 |
 | `requirements/dcu*.txt` | DTK 26.04 的 torch/triton/依赖固定版本 |
-| `docs/perf/` | 性能现状、路线、有效优化总结、SOL/GEMV/ATTN 报告 |
-| `docs/design/` | 各轮设计/施工图（S29–S35） |
+| `docs/perf/` | 历史状态/路线快照、SOL/GEMV/ATTN 报告（当前性能见下文「当前性能」） |
+| `docs/design/` | 各轮设计/施工图（S34–S100b） |
 | `docs/result/` | 各轮实测结果与门禁记录 |
+| `BUILD.md` / `DEPLOY.md` | 编译换装 / 生产运维（根目录，见 §11） |
 | `docker/` | 上游 vLLM Dockerfile，**不是本 fork 的 DTK 构建入口** |
 
 ## 3. 获取 DTK、torch/triton 与依赖
@@ -336,6 +364,9 @@ source tools/dcu/env.sh
 
 ## 5. 编译
 
+> 端到端流程（环境 → 编译 → 生产 `_rocm_C` relink → 门禁 → 换装/回滚）见
+> [`BUILD.md`](BUILD.md)。本节保留通用步骤与各扩展职责说明。
+
 ### 5.1 Python 环境
 
 - 必须 **Python 3.10**（DTK 轮子只有 cp310）。
@@ -354,7 +385,8 @@ uv pip install -r requirements/dcu-build.txt
 
 ```bash
 cd /src
-source /opt/dtk/env.sh          # 容器内；宿主机用 source tools/dcu/env.sh
+source /opt/dtk/env.sh          # 仅容器内（镜像里 /opt/dtk 就是 26.04）
+# 宿主机：export DTK_ROOT=/mnt/game/host-runtime/dtk2604 后再 source
 source tools/dcu/env.sh
 
 export PYTORCH_ROCM_ARCH=gfx906
@@ -448,9 +480,10 @@ ls -l vllm/*.abi3.so
 # 1) 四个扩展可导入
 python -c "import vllm, vllm._C, vllm._rocm_C; print('IMPORT_OK')"
 
-# 2) 只含 gfx906（dccobjdump 在 DTK 镜像里是断链，用 strings 回退）
-strings vllm/_C.abi3.so | grep -o 'gfx[0-9]*' | sort -u
-strings vllm/_rocm_C.abi3.so | grep -o 'gfx[0-9]*' | sort -u
+# 2) offload 目标只含 gfx906（dccobjdump 在 DTK 镜像里是断链，用 strings 回退）
+#    注意别用 `grep -o 'gfx[0-9]*'`：库里的 gfx11/gfx12 字符串噪声会混进来
+strings vllm/_C.abi3.so | grep -oE '(hipv[0-9]+-)?amdgcn-amd-amdhsa--gfx[0-9a-z]+' | sort -u
+strings vllm/_rocm_C.abi3.so | grep -oE '(hipv[0-9]+-)?amdgcn-amd-amdhsa--gfx[0-9a-z]+' | sort -u
 
 # 3) 扩展清单与软链
 bash tools/dcu/use_stack.sh status
@@ -523,32 +556,39 @@ vllm serve /mnt/game/models/Qwen3.8-27B-FP8 \
 
 ### 6.3 生产配方与运维
 
-生产部署建议由进程管理器（systemd / supervisor / 容器编排）托管，并只暴露必要端口。
-以 systemd 为例：
+生产由 systemd 托管，配置真源就在仓库根目录：
 
-```bash
-systemctl status <vllm-service>
-systemctl start  <vllm-service>
-journalctl -u <vllm-service> -f
+```text
+z100-vllm-mtp2.service -> serve_deploy.sh (env) -> launch_mtp2.sh (CLI) -> vllm serve
 ```
 
-- 监听地址/端口：按部署需要设置（示例 `<host>:<port>`）。
-- API key：通过环境变量或密钥管理服务注入，不要写进仓库或启动脚本。
-- 启动/回滚：使用你自己的部署脚本/服务单元；回滚 = 切回上一稳定配置
-  （去掉上一轮的 AR/GEMV/`MAX_KIB` 环境开关，或恢复上一版扩展）。
+```bash
+bash start.sh restart      # 启动/重启并等 /health（带编译缓存冷启 215–260 s）
+bash start.sh status       # 单元 / 端口 / 健康 / .so / 指纹
+bash start.sh logs -f      # 跟随日志
+```
 
-生产 env 摘要：
+- 监听 `0.0.0.0:8000`；鉴权 key 放 `/mnt/game/host-serve/api-key`（0600，不进仓库）。
+- 启动链、回滚点、禁令与完整 env 表见 [DEPLOY.md](DEPLOY.md)；
+  编译与换内核见 [BUILD.md](BUILD.md)。
+
+生产 env 摘要（2026-11-15 现役；完整清单以 `serve_deploy.sh` 为准）：
 
 | 组 | 关键开关 |
 |---|---|
-| 通信 | `VLLM_DCU_CUSTOM_AR=1`、`VLLM_DCU_CUSTOM_AR_ALLOC=finegrained`、`VLLM_CUSTOM_ALLREDUCE_ALGO=oneshot`、`VLLM_DCU_CUSTOM_AR_MAX_KIB=128` |
-| 线性 | `VLLM_DCU_FP8_W8A16=1`、`VLLM_DCU_FP16_PREFILL=auto`、`VLLM_DCU_FP8_GEMV_STREAM_ROWS=4`、`VLLM_DCU_FP8_GEMV_M1=1`、`VLLM_DCU_FP8_DECODE_CFG=35` |
-| GDN | `VLLM_GFX906_GDN_DEC_M1=1`、`VLLM_QWEN35_MTP_GDN_TRITON=1` |
-| Attention | `VLLM_GFX906_ATTN_DECODE_BLOCK_M=16`、`VLLM_GFX906_ATTN_VERIFY_3D=1` |
+| 通信 | `VLLM_DCU_CUSTOM_AR=1`、`VLLM_DCU_CUSTOM_AR_ALLOC=finegrained`、`VLLM_CUSTOM_ALLREDUCE_ALGO=oneshot`、`VLLM_DCU_CUSTOM_AR_MAX_KIB=128`、`VLLM_DCU_CUSTOM_AR_FUSION=1`（`_MLP=0` 硬锁） |
+| 线性 | `VLLM_DCU_FP8_W8A16=1`、`VLLM_DCU_FP16_PREFILL=auto`、`VLLM_DCU_FP8_GEMV_STREAM_ROWS=4`、`VLLM_DCU_FP8_GEMV_M1=1`、`VLLM_DCU_FP8_GEMV_MAX_M=16`（内核上限 clamp 到 8）、`VLLM_DCU_FP8_DECODE_CFG=35` |
+| GDN | `VLLM_GFX906_GDN_DEC_M1=1`、`VLLM_QWEN35_MTP_GDN_TRITON=1`、`VLLM_GFX906_GDN_CHUNKED_PREFILL=1` |
+| Attention | `VLLM_GFX906_ATTN_DECODE_BLOCK_M=16`、`VLLM_GFX906_ATTN_VERIFY_3D=1`、`VLLM_GFX906_ATTN_DECODE_HIP_INNER=1`、`VLLM_GFX906_ATTN_PREFILL_HIP_INNER=1`、`VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX=4096` |
+| 精度/KV | `KV_DTYPE=int8_per_token_head`、`VLLM_DCU_PREFILL_INT8_PC=1`、`VLLM_DCU_PREFILL_INT8_PC_MIN_M=1024` |
+| 缓存 | `S59_PREFIX_CACHE=1`（match 16 + mamba shared checkpoint + retention 1616，三开关同开） |
+| 投机 | `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'` |
+| 图 | `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[2,3,6,12]}'` |
 | 数值 | `ROCBLAS_WORKSPACE_CONFIG=:4096:8`、`HIPBLAS_WORKSPACE_CONFIG=:4096:8` |
 
-> **运维注意**：若已有手工 `vllm serve` 占用端口，先确认无在飞请求并停止，
-> 再启动托管单元；不要直接 `systemctl restart`。
+> **运维注意**：不要手工 `vllm serve` 抢 8000 端口；停止用 `bash start.sh stop`
+> （会等 worker 退出并清理孤儿进程）。改配置改 `serve_deploy.sh`，改完
+> `bash start.sh restart` 生效。
 
 ### 6.4 API 冒烟
 
@@ -580,7 +620,7 @@ vllm serve /path/to/Qwen3.x-xxB-GGUF \
 ```
 
 > GGUF 路径仍建议 `--enforce-eager`；只有 FP8 safetensors 的 Qwen3.8-27B
-> 生产臂验证过 piecewise graph + MTP。两者不要混用配方。
+> 生产臂验证过 FULL_DECODE_ONLY 图 + MTP。两者不要混用配方。
 
 ## 7. 模型支持
 
@@ -633,8 +673,8 @@ vllm serve /path/to/Qwen3.x-xxB-GGUF \
 4. **MoE + GPTQ 兼容性**：见 §7；不要在生产直接试。
 5. **MTP k=2 的 TTFT 代价**：7.5k warm TTFT 0.72→2.4 s；短回复
    （约 <220–230 输出 token）端到端可能更慢。
-6. **长上下文冷启动**：60k/128k 冷 prefill 约 178 s/520 s；prefix cache
-   命中率决定 TTFT，长会话尽量复用前缀。
+6. **长上下文冷启动**：131k 冷 prefill ≈203 s（2026-11-15，S99）；prefix cache
+   命中率决定 TTFT（共享前缀命中后可降到秒级），长会话尽量复用前缀。
 7. **`/v1/completions` + `logprobs≥2`**：本 fork 存在可致 API server 退出的
    历史缺陷；生产建议用 chat completions 或 `logprobs=1`，使用前先验证。
 8. **MoE e2e 未在本机当前栈验证**：S35 是独立轨，见
@@ -663,13 +703,14 @@ vllm serve /path/to/Qwen3.x-xxB-GGUF \
 ## 11. 开发与文档
 
 - **贡献前必读**：[AGENTS.md](AGENTS.md)（重复工作检查、测试、PR 纪律）
-- **性能**：[STATUS](docs/perf/STATUS-20261027.md)、
+- **编译与换装**：[BUILD.md](BUILD.md)（源码编译、生产 `_rocm_C` relink、门禁、回滚）
+- **部署与运维**：[DEPLOY.md](DEPLOY.md)（启动链、已采纳配置、禁令、回滚点）
+- **性能（2026-10-27 历史快照）**：[STATUS](docs/perf/STATUS-20261027.md)、
   [ROADMAP](docs/perf/ROADMAP-20261027.md)、
   [OPT-EFFECTIVE](docs/perf/OPT-EFFECTIVE-20261027.md)
 - **设计/施工**：[Z100 文档索引](docs/design/z100/README.md)
 - **实测结果**：`docs/result/z100-*.md`
-- **工具**：`tools/dcu/`（环境、构建、微基准、e2e、指纹、探针）
-- **生产配置**：见 [STATUS](docs/perf/STATUS-20261027.md) §1.3
+- **工具**：`tools/dcu/`（环境、构建、指纹、基准入口、RCCL/Triton 配方，见其 `README.md`）
 
 常用检查：
 
@@ -691,7 +732,7 @@ hy-smi --showproductname
 | 借鉴点 | 1Cat 的做法 | Z100 的落地 | 证据 |
 |---|---|---|---|
 | W8A16 契约 | 权重 fp8 常驻 HBM，激活 fp16 直入，`apply_input_quant=False`，去掉激活量化 | `VLLM_DCU_FP8_W8A16` + fp16 prefill 物化；decode 1.2–2.1×，prefill M≥512 1.4–2× | [`w8a16`](docs/result/z100-w8a16-fp16-prefill-result.md) |
-| 五相位 profiling | `draft` / `draft→target` / `target` / `target→draft` / `round` | [`s27_five_phase_profile.py`](tools/dcu/s27_five_phase_profile.py) 直接采用该切分；五段和与 step 差 1.95% | [`decode-prefill`](docs/result/z100-decode-prefill-final-summary.md) |
+| 五相位 profiling | `draft` / `draft→target` / `target` / `target→draft` / `round` | S27 的五相位切分脚本（已随探针清理移除，见 git 历史）采用该切分；五段和与 step 差 1.95% | [`decode-prefill`](docs/result/z100-decode-prefill-final-summary.md) |
 | 门禁形式（+ Z100 自建指纹） | admission 谓词、可回滚开关、bitwise/质量门；1K/2K/4K/8K 不退化 | 同窗口 A/B、N≥2 重启、贪心 parity、30 min 长跑；另加自建 policy fingerprint | [`s29-pin`](docs/result/z100-s29-accept-pin.md) |
 | “只搬控制面”的判断 | 数据面 kernel 约 7 万行、控制面约 150–250 行；前者绑定专用矩阵核 | 把精力放在 GDN/GEMV/AR/attention 的调度与并行度，而不是复刻矩阵核 | [`1cat-v2`](docs/design/z100/research/z100-1cat-transfer-research-v2.md) |
 

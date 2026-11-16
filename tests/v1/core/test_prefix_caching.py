@@ -2652,6 +2652,52 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     manager.free(req_2)
 
 
+def test_mamba_partial_tail_split_switch(monkeypatch):
+    """S100b: the partial-tail stop can be dropped, keeping block stops only.
+
+    gfx906 runs the triton GDN prefill backend, which cannot export the
+    checkpoint inside the chunk, so the tail stop costs a whole extra forward
+    pass while the block-aligned stops already cover prefix reuse.
+    """
+    import vllm.v1.core.sched.scheduler as sched_mod
+
+    block_size = 32
+    mock = SimpleNamespace(
+        block_size=block_size,
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=64,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle_block_drop=True,
+        hash_block_size=16,
+        mamba_partial_cache_hit=True,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    req = SimpleNamespace(
+        num_computed_tokens=0,
+        num_prompt_tokens=48,
+        num_tokens=48,
+        shared_prefix_boundary=0,
+    )
+
+    # Default: stop at the partial-tail hash boundary (48 - 16 = 32).
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=req, num_new_tokens=48
+        )
+        == 32
+    )
+
+    # Knob off: the 48-token prompt runs in one chunk; block stops still apply.
+    monkeypatch.setattr(sched_mod, "_MAMBA_PARTIAL_TAIL_SPLIT", False)
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=req, num_new_tokens=48
+        )
+        == 48
+    )
+
+
 def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
     """Regression test for https://github.com/vllm-project/vllm/issues/39271.
 

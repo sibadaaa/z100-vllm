@@ -40,7 +40,7 @@
 | DEP | 投产复验 | 留操作员决策(§4) | 未触发 |
 
 臂指纹:图臂 FP `0050c4a7bc9a8f07`(SPEC_OFF=1 + FULL_DECODE_ONLY [1,2,4]);
-生产臂 FP 见 `.s34/serve_deploy.sh` 原状(SILU_MUL=0,FUSION=1/_MLP=0,
+生产臂 FP 见 `serve_deploy.sh` 原状(SILU_MUL=0,FUSION=1/_MLP=0,
 .so md5 `6dee7fad`/`54cc2e2` 开工核对未变)。
 
 ## 2. decode 各项速度(本轮实测,两臂同工具同窗口型)
@@ -145,7 +145,7 @@ torch profiler 窗强相关;restart 5 min 恢复,parity 逐字节复验通过,
 | 工具 | `.s49/a3_profile.py`(前缀参数化)、`b2_profile.py`、`s49b_run.sh`、`s49d_run.sh`、`vm_a3_boot.sh`、`vm_a3_conc4.sh` |
 | trace | `/mnt/game/s30c-prof/s49a3_rank0.*`、`s49b2G_rank0.*`、`s49b2P_rank0.*`、`s49prod_rank0.*`(.gz) |
 | 观测硬化 | `tools/dcu/dcu_policy_fingerprint.py`(KNOBS +15,selftest 42/42)、`tools/dcu/README.md`(E1/E3 段)、`runs/tritonq/decode_stages.py`(.gz) |
-| 现场还原 | `/etc/systemd/system/z100-vllm-mtp2.service.d/` 无 S49 drop-in;`.s34/serve_deploy.sh` md5 `75c2aab8` = S49-A1 回退后在役状态(A1 前为 `1551fff3`,备份 `.s49/serve_deploy.sh.s49-before`;P2 临时翻转已还原) |
+| 现场还原 | `/etc/systemd/system/z100-vllm-mtp2.service.d/` 无 S49 drop-in;`serve_deploy.sh` md5 `75c2aab8` = S49-A1 回退后在役状态(A1 前为 `1551fff3`,备份 `.s49/serve_deploy.sh.s49-before`;P2 临时翻转已还原) |
 
 ## 6. 风险与注记
 

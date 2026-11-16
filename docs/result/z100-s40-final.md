@@ -100,4 +100,4 @@
   `.s40/s40-after-a1b1.md5` / `s40-after-b1fix.md5`(改后,现役 f72bb39d)
 - 判定:`.s40/{a-close,b-adopt,c-close}.md`;S29 板 json
   `runs/s38/parity-s40-{a1,b1}.json`(副本 `runs/s40/`)
-- 服务在役:`.s34/serve_deploy.sh` S40 ADOPTED 段(`VLLM_DCU_FP16_GEMV_STREAM=1`)
+- 服务在役:`serve_deploy.sh` S40 ADOPTED 段(`VLLM_DCU_FP16_GEMV_STREAM=1`)

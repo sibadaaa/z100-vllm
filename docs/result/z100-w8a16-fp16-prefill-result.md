@@ -1,6 +1,6 @@
 # Z100 W8A16 + prefill fp16 物化 — P0 施工记录
 
-> 施工依据：[`docs/design/z100-w8a16-prefill-fp16-construction.md`](../design/z100-w8a16-prefill-fp16-construction.md)。
+> 施工依据：docs/design/z100-w8a16-prefill-fp16-construction.md。
 > 本文档记录 **P0（不碰卡）** 阶段的交付与门禁原始日志；§6.2/§6.3 的数值与性能门禁
 > 留待 P1（卡空后）填写。最后更新：2026-10-20。
 

@@ -1,0 +1,263 @@
+{
+ "measured_at": "2026-11-08T00:49-09:20+08",
+ "service": "Qwen3.8-27B-FP8 TP4 MTP k=2 cudagraph FULL_DECODE_ONLY (PID 955, started 00:33:32)",
+ "note": "end-to-end via /v1/completions streaming; itl from inter-chunk stamps; body_itl drops first 8-10",
+ "prefill": [
+  {
+   "tokens": 512,
+   "ttft_s": 0.7812,
+   "tps": 662.5
+  },
+  {
+   "tokens": 2048,
+   "ttft_s": 2.5945,
+   "tps": 790.5
+  },
+  {
+   "tokens": 8192,
+   "ttft_s": 9.7686,
+   "tps": 838.5
+  },
+  {
+   "tokens": 20480,
+   "ttft_s": 28.6085,
+   "tps": 716.4
+  },
+  {
+   "tokens": 32768,
+   "ttft_s": 46.2999,
+   "tps": 707.6
+  },
+  {
+   "tokens": 131072,
+   "ttft_s": 293.2,
+   "tps": 447.0
+  }
+ ],
+ "itl_vs_ctx": [
+  {
+   "ctx": 1024,
+   "p50_ms": 35.96
+  },
+  {
+   "ctx": 4096,
+   "p50_ms": 35.7
+  },
+  {
+   "ctx": 8192,
+   "p50_ms": 35.93
+  },
+  {
+   "ctx": 16384,
+   "p50_ms": 36.82
+  },
+  {
+   "ctx": 32768,
+   "p50_ms": 39.51
+  },
+  {
+   "ctx": 65536,
+   "p50_ms": 43.62
+  },
+  {
+   "ctx": 131072,
+   "p50_ms": 51.05
+  }
+ ],
+ "itl_fit": {
+  "intercept_ms": 35.31,
+  "slope_us_per_token": 0.12127,
+  "formula": "itl_ms = 35.31 + 0.1213 * ctx_k",
+  "note": "fit over all 7 points"
+ },
+ "batch": [
+  {
+   "batch": 1,
+   "ctx": 512,
+   "itl_p50_ms": 35.61,
+   "peak_running": 1,
+   "agg_tps": 67.4
+  },
+  {
+   "batch": 4,
+   "ctx": 512,
+   "itl_p50_ms": 127.08,
+   "peak_running": 4,
+   "agg_tps": 75.5
+  },
+  {
+   "batch": 1,
+   "ctx": 8192,
+   "itl_p50_ms": 36.76,
+   "peak_running": 1,
+   "agg_tps": 65.3
+  },
+  {
+   "batch": 2,
+   "ctx": 8192,
+   "itl_p50_ms": 60.36,
+   "peak_running": 2,
+   "agg_tps": 79.5
+  },
+  {
+   "batch": 4,
+   "ctx": 8192,
+   "itl_p50_ms": 137.21,
+   "peak_running": 4,
+   "agg_tps": 70.0
+  }
+ ],
+ "batch_fit_ctx512": {
+  "intercept_ms": 5.1,
+  "marginal_ms_per_request": 30.5,
+  "formula": "step_ms = 5.1 + 30.5*B"
+ },
+ "acceptance": [
+  {
+   "ctx": 512,
+   "acc_per_step": 2.759,
+   "accept_rate": 0.879
+  },
+  {
+   "ctx": 8192,
+   "acc_per_step": 2.5,
+   "accept_rate": 0.742
+  },
+  {
+   "ctx": 32768,
+   "acc_per_step": 2.222,
+   "accept_rate": 0.604
+  }
+ ],
+ "effective_prefill_tflops": {
+  "roof_aggregate": 78.6,
+  "points": [
+   {
+    "tokens": 8192,
+    "tf": 46.4,
+    "ratio": 1.69
+   },
+   {
+    "tokens": 20480,
+    "tf": 41.1,
+    "ratio": 1.91
+   },
+   {
+    "tokens": 32768,
+    "tf": 42.0,
+    "ratio": 1.87
+   },
+   {
+    "tokens": 131072,
+    "tf": 33.7,
+    "ratio": 2.33
+   }
+  ]
+ },
+ "prefill_attribution_8k": {
+  "wall_s": 9.84,
+  "kernel_total_s": 9.08,
+  "gemm": {
+   "calls": 522,
+   "s": 5.082,
+   "tflops_effective": 20.8,
+   "note": "rocBLAS HBH MT128x128x16"
+  },
+  "attention": {
+   "calls": 34,
+   "s": 2.819,
+   "us_per_call": 82919.4,
+   "tflops_effective": 1.56,
+   "pct_of_roof": 2.0
+  },
+  "allreduce": {
+   "calls": 264,
+   "s": 0.67,
+   "us_per_call": 2538.3,
+   "kernel": "ncclDevKernel_AllReduce_Ring_Simple_Sum_f16"
+  },
+  "gdn_conv": {
+   "s": 0.33
+  },
+  "other": {
+   "s": 0.18
+  }
+ },
+ "gemm_shape_tflops_per_card": {
+  "shapes": [
+   "gate_up 8704x5120",
+   "down 5120x4352",
+   "qkv 4096x5120",
+   "o 5120x5120",
+   "gdn 3584x5120"
+  ],
+  "M": [
+   512,
+   2048,
+   4352,
+   8192
+  ],
+  "values": [
+   [
+    16.9,
+    19.9,
+    20.8,
+    20.8
+   ],
+   [
+    16.1,
+    19.9,
+    20.6,
+    20.8
+   ],
+   [
+    15.1,
+    19.3,
+    19.9,
+    20.5
+   ],
+   [
+    16.1,
+    20.0,
+    20.6,
+    20.7
+   ],
+   [
+    17.5,
+    18.5,
+    20.2,
+    20.9
+   ]
+  ],
+  "note": "roof 19.65 at 4096^3; prefill M=8192 exceeds it"
+ },
+ "kernel_path_by_batch": {
+  "B=1": {
+   "gemv_stream_calls": 9546,
+   "gemm_w8a16_calls": 0,
+   "gemv_us_per_call": 78.6
+  },
+  "B=2": {
+   "gemv_stream_calls": 9774,
+   "gemm_w8a16_calls": 0,
+   "gemv_us_per_call": 139.1
+  },
+  "B=4": {
+   "gemv_stream_calls": 662,
+   "gemm_w8a16_calls": 8320,
+   "gemm_us_per_call": 364.0
+  },
+  "threshold": "M = B*(1+k) > VLLM_DCU_FP8_GEMV_MAX_M=8; k=2 so B=4 -> M=12"
+ },
+ "ar_path_split": {
+  "decode_B1": {
+   "push": 4863,
+   "nccl_ring": 132
+  },
+  "prefill_8192": {
+   "push": 6,
+   "nccl_ring": 264
+  },
+  "reason": "prefill AR payload 80 MiB vs VLLM_DCU_CUSTOM_AR_MAX_KIB=128 (640x over)"
+ }
+}

@@ -34,6 +34,20 @@ hydcu 驱动层的 P2P 默认就是开的(pcie_p2p=Y / PeerDirect),但 PCIe fabr
 * ACS 是 DMA 隔离特性,关掉意味着同 fabric 上的设备可以互相 DMA。
   单租户推理机上没有影响;多租户场景请勿关闭。
 * 不依赖 setpci / pciutils,直接读写 /sys/bus/pci/devices/*/config。
+
+【BDF 会漂移 —— 2026-11-07 的教训】
+一次断电重启后 PCI 重新枚举,4 张卡的 BDF 从 2e/33/38/3b 变成 2d/30/35/3b,
+链上桥名几乎全换。当时本 service 恰好是 disabled/inactive,于是没人清 ACS,
+结果**链路已是 Gen4 x16,但 P2P 只有 11/12 满速**:gpu0->gpu1 稳定 6.97 GB/s,
+反向却是 28.38(单向重定向回根复合体,正是 ReqRedir/CmpltRedir 的签名)。
+`show` 一查,12 个桥里有 5 个是 0x001d;`apply` 后 12/12 全部 28.4 GB/s。
+
+⇒ 本脚本用**动态发现**(glob /sys/class/drm/renderD* + 沿父链向上),
+换卡/重插/重启后不需要改代码;但有两处必须人工+自动化兜住:
+  1. 本 service 必须 `enabled`(`systemctl enable dcu-p2p-acs`),否则重启后没人清;
+  2. 内核 cmdline `pci=disable_acs_redir=...` 的 BDF 白名单**是写死的**,
+     BDF 一漂移就静默失效。两者互补:cmdline 开机即生效,service 用户态补刀。
+重启/换卡后务必 `show` 复核 12 × 0x0000,再做性能测量。
 """
 
 import os

@@ -105,4 +105,4 @@
 - `.so`:改前备份 `.r3/so-backup/_rocm_C.s41-before.so` +
   `s41-before.md5`(f72bb39d,与现役一致——本轮无换库)
 - 判定:`.s41/{a-adopt,b-close,c-close}.md`
-- 服务在役:`.s34/serve_deploy.sh` S41 段(`VLLM_DCU_FP8_GEMV_WA=1`)
+- 服务在役:`serve_deploy.sh` S41 段(`VLLM_DCU_FP8_GEMV_WA=1`)

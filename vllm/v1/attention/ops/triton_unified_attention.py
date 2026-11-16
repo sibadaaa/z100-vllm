@@ -122,6 +122,16 @@ GFX906_PREFILL_3D_STAGES = _gfx906_env_int("VLLM_GFX906_ATTN_PREFILL_3D_STAGES",
 GFX906_PREFILL_3D_MIN_CTX = _gfx906_env_int(
     "VLLM_GFX906_ATTN_PREFILL_3D_MIN_CTX", 16384
 )
+# PREFILL-LCTX (S56) WP2: fp16 segment workspace for the prefill split-KV
+# path (segm_output 184 -> 92 MB at the 7488-token chunk, halving the write +
+# reduce read round trip). segm_max/segm_expsum stay fp32 (log-sum-exp
+# statistics); the producer store and reduce_segments both follow the buffer
+# dtype. Acceptance gate: fp32-reference |d| <= 1e-3 (WP2 discipline) -- the
+# merge weights cancel the expsum factor, so the fp16 rounding lands on the
+# same order as the final fp16 output cast. Default off.
+GFX906_PREFILL_SEGM_FP16 = os.getenv(
+    "VLLM_GFX906_ATTN_PREFILL_SEGM_FP16", "0"
+).lower() in {"1", "true", "yes", "on"}
 
 # S24 L3.1 decode/verify scheduling overrides (0 = module heuristic).  The
 # kernel-level scan (.s24/probes/l31_verify_scan.py, 180 rows, service down)
@@ -197,6 +207,27 @@ def _decode_hip_inner_env() -> bool:
     return os.getenv("VLLM_GFX906_ATTN_DECODE_HIP_INNER", "0").lower() in {
         "1", "true", "yes", "on"}
 
+# PREFILL-LCTX (S56) WP3: route the long-context prefill split-KV launch
+# through the same HIP inner-loop kernel the S53-ATTN decode path uses
+# (csrc/rocm/attnd_inner.hip). The kernel is q_len-generic (causal bound =
+# ctx + qpos is built in, the B832 page walk is stride-parameterized, the
+# segment buffers share the Triton 3D contract) and the prefill grid
+# (q_len/2, 1, segments) is ~30x the verify shape, so the CTA-residency
+# ceiling that capped decode at 2.13x does not apply. Default off; read live
+# at every dispatch for per-forward A/B, same as the decode knob.
+def _prefill_hip_inner_env() -> bool:
+    return os.getenv("VLLM_GFX906_ATTN_PREFILL_HIP_INNER", "0").lower() in {
+        "1", "true", "yes", "on"}
+
+# S68 WP-A1: merge_qtok CTA form -- one CTA covers 16 query TOKENS of one q
+# head (grid.y = nq), each lane keeps its full Q row in registers for the
+# segment. The flag is read by the C++ dispatch itself (live getenv, so
+# stale bindings keep the exact pre-S68 ABI); the Python-side helper below
+# exists only for diagnostics/gate tests to see the same condition.
+def _prefill_merge_qtok_env() -> bool:
+    return os.getenv("VLLM_GFX906_ATTN_PREFILL_MERGE_QTOK", "0").lower() in {
+        "1", "true", "yes", "on"}
+
 # S28: extend the small-q decode routing beyond the tuned target shape
 # (head 256/GQA6) to the DFlash2 draft tower (head 128/GQA4, 5 sliding-2048
 # layers).  At its 7-token block draft the draft ran the unsplit 2D kernel
@@ -225,6 +256,7 @@ def _prefill_segment_buffers(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     global _prefill_segm_state
     rows = triton.next_power_of_2(num_tokens)
+    dtype = torch.float16 if GFX906_PREFILL_SEGM_FP16 else torch.float32
     st = _prefill_segm_state
     if (
         st is None
@@ -233,6 +265,7 @@ def _prefill_segment_buffers(
         or st["segs"] != num_segments
         or st["dim"] != headdim_padded
         or st["device"] != device
+        or st["dtype"] != dtype
     ):
         _prefill_segm_state = {
             "rows": rows,
@@ -240,9 +273,10 @@ def _prefill_segment_buffers(
             "segs": num_segments,
             "dim": headdim_padded,
             "device": device,
+            "dtype": dtype,
             "output": torch.empty(
                 (rows, num_query_heads, num_segments, headdim_padded),
-                dtype=torch.float32,
+                dtype=dtype,
                 device=device,
             ),
             "max": torch.empty(
@@ -275,6 +309,56 @@ def _gfx906_sched_tuning_enabled() -> bool:
     return ENABLE_GFX906_ATTN_SCHED_TUNING and _is_gfx906_rocm()
 
 
+def _hip_inner_layout_mismatch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+    segm_output: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+) -> str | None:
+    """First layout/stride/type condition that keeps a dispatch off the HIP path.
+
+    The HIP inner-loop gates are long conjunctions; a mismatch silently swaps
+    the kernel (attn is ~2x slower on the Triton path, e2e 1-2%). Shape-class
+    misses (batch size, dtype, head count, capture) are expected and stay
+    quiet; this reports only the layout/stride/type conditions, which no
+    intended workload changes but a refactor easily can. Evaluated off the hot
+    path, only when the gate already returned False with the env on.
+
+    Returns:
+        The name of the first failing condition, or None when they all hold.
+
+    """
+    checks = (
+        ("q_stride2", q.stride(2) == 1),
+        ("q_stride1", q.stride(1) == head_size),
+        ("k_stride3", k.stride(3) == 1),
+        ("v_stride3", v.stride(3) == 1),
+        ("k_head_stride", num_kv_heads == 1 or k.stride(2) == head_size),
+        ("v_head_stride", num_kv_heads == 1 or v.stride(2) == head_size),
+        ("k_token_stride_min", k.stride(1) >= head_size),
+        ("k_token_stride_align8", k.stride(1) % 8 == 0),
+        ("v_token_stride_eq_k", v.stride(1) == k.stride(1)),
+        ("k_page_stride_align8", k.stride(0) % 8 == 0),
+        ("v_page_stride_eq_k", v.stride(0) == k.stride(0)),
+        ("block_table_int32", block_table.dtype == torch.int32),
+        ("seqused_k_int32", seqused_k.dtype == torch.int32),
+        ("cu_seqlens_q_int32", cu_seqlens_q.dtype == torch.int32),
+        ("segm_output_dtype",
+         segm_output.dtype in (torch.float32, torch.float16)),
+        ("segm_output_stride3", segm_output.stride(3) == 1),
+        ("segm_output_stride2", segm_output.stride(2) == head_size),
+    )
+    for name, ok in checks:
+        if not ok:
+            return name
+    return None
+
+
 def _hip_inner_available() -> bool:
     """Whether the S53-ATTN HIP inner-loop op is present and usable.
 
@@ -288,6 +372,59 @@ def _hip_inner_available() -> bool:
         return hasattr(torch.ops._rocm_C, "gfx906_attnd_decode_inner")
     except (AttributeError, RuntimeError):
         return False
+
+
+def _kvint8_inner_available() -> bool:
+    """Whether the S81 int8-KV HIP inner loop is present in this .so.
+
+    Lives in csrc/rocm/attnd_inner_kvint8.hip; a rollback to an older .so
+    drops every int8 forward back onto the Triton path with the dequant
+    branch, so the feature degrades instead of hard-failing.
+    """
+    if not _is_gfx906_rocm():
+        return False
+    try:
+        return hasattr(torch.ops._rocm_C, "gfx906_attnd_decode_inner_kvint8")
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _kvint8_inner_gate(
+    q, k, v, num_kv_heads, head_size, block_size, block_table, seqused_k,
+    cu_seqlens_q, segm_output, num_seqs, causal, capturing_ok,
+) -> bool:
+    """Shape/layout gate for the int8-KV HIP inner loop.
+
+    Mirrors the kernel's TORCH_CHECKs; anything else stays on the Triton path
+    (which now dequantizes per-token-head tiles itself).
+    """
+    return (
+        causal
+        and num_seqs == 1
+        and head_size == 256
+        and block_size >= 16
+        and block_size % 16 == 0
+        and (q.shape[1] // num_kv_heads) == 6
+        and q.dtype == torch.float16
+        and k.dtype == torch.int8
+        and v.dtype == torch.int8
+        and q.stride(2) == 1
+        and q.stride(1) == head_size
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and k.stride(1) % 4 == 0
+        and v.stride(1) == k.stride(1)
+        and k.stride(0) % 4 == 0
+        and v.stride(0) == k.stride(0)
+        and block_table.dtype == torch.int32
+        and seqused_k.dtype == torch.int32
+        and cu_seqlens_q.dtype == torch.int32
+        and segm_output.dtype in (torch.float32, torch.float16)
+        and segm_output.stride(3) == 1
+        and segm_output.stride(2) == head_size
+        and capturing_ok
+        and _kvint8_inner_available()
+    )
 
 
 def gfx906_decode_segments_capacity() -> int:
@@ -390,6 +527,37 @@ def _decode_num_segments(
                max(16, triton.next_power_of_2(segments)))
 
 
+def _per_token_head_kwargs(k_scale_cache, v_scale_cache):
+    """Kernel kwargs for the per-(token, head) KV scale caches (S81).
+
+    Both kernels take the pointers plus their strides; when the caches are
+    absent the constexpr flips the branch off and Triton drops the params.
+    """
+    if k_scale_cache is None or v_scale_cache is None:
+        return {
+            "k_scale_cache_ptr": None,
+            "v_scale_cache_ptr": None,
+            "stride_ks_blk": 0,
+            "stride_ks_slot": 0,
+            "stride_ks_head": 0,
+            "stride_vs_blk": 0,
+            "stride_vs_slot": 0,
+            "stride_vs_head": 0,
+            "USE_PER_TOKEN_HEAD_SCALES": False,
+        }
+    return {
+        "k_scale_cache_ptr": k_scale_cache,
+        "v_scale_cache_ptr": v_scale_cache,
+        "stride_ks_blk": k_scale_cache.stride(0),
+        "stride_ks_slot": k_scale_cache.stride(1),
+        "stride_ks_head": k_scale_cache.stride(2),
+        "stride_vs_blk": v_scale_cache.stride(0),
+        "stride_vs_slot": v_scale_cache.stride(1),
+        "stride_vs_head": v_scale_cache.stride(2),
+        "USE_PER_TOKEN_HEAD_SCALES": True,
+    }
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -442,6 +610,17 @@ def kernel_unified_attention_2d(
     v_scale,  # float32
     out_scale,  # float32
     softcap,  # float32
+    # Per-(token, head) KV scales (int8_per_token_head only). Loaded tile-wise
+    # inside the loop so the K/V tiles can stay in their int8 storage form.
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    USE_PER_TOKEN_HEAD_SCALES: tl.constexpr,
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_table_stride: tl.int64,  # int
@@ -641,7 +820,20 @@ def kernel_unified_attention_2d(
             other=0.0,
         )
 
-        if K_load.dtype.is_fp8():
+        if USE_PER_TOKEN_HEAD_SCALES:
+            # int8_per_token_head: a per-(token, head) fp32 scale rides along
+            # with each K/V row, so the tile is dequantized here and the dot
+            # sees plain fp16 like every other path.
+            ks_idx = (
+                physical_block_idx * stride_ks_blk
+                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                + kv_head_idx * stride_ks_head
+            )
+            k_tok_scale = tl.load(
+                k_scale_cache_ptr + ks_idx, mask=tile_mask, other=0.0
+            ).to(tl.float32)
+            K = (K_load.to(tl.float32) * k_tok_scale[None, :]).to(Q.dtype)
+        elif K_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 K = K_load
             else:
@@ -659,7 +851,17 @@ def kernel_unified_attention_2d(
             other=0.0,
         )
 
-        if V_load.dtype.is_fp8():
+        if USE_PER_TOKEN_HEAD_SCALES:
+            vs_idx = (
+                physical_block_idx * stride_vs_blk
+                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                + kv_head_idx * stride_vs_head
+            )
+            v_tok_scale = tl.load(
+                v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0.0
+            ).to(tl.float32)
+            V = (V_load.to(tl.float32) * v_tok_scale[:, None]).to(Q.dtype)
+        elif V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 V = V_load
             else:
@@ -820,6 +1022,17 @@ def kernel_unified_attention_3d(
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
+    # Per-(token, head) KV scales (int8_per_token_head only). Loaded tile-wise
+    # inside the loop so the K/V tiles can stay in their int8 storage form.
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    USE_PER_TOKEN_HEAD_SCALES: tl.constexpr,
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_table_stride: tl.int64,  # int
@@ -1061,7 +1274,20 @@ def kernel_unified_attention_3d(
             other=0.0,
         )
 
-        if K_load.dtype.is_fp8():
+        if USE_PER_TOKEN_HEAD_SCALES:
+            # int8_per_token_head: a per-(token, head) fp32 scale rides along
+            # with each K/V row, so the tile is dequantized here and the dot
+            # sees plain fp16 like every other path.
+            ks_idx = (
+                physical_block_idx * stride_ks_blk
+                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                + kv_head_idx * stride_ks_head
+            )
+            k_tok_scale = tl.load(
+                k_scale_cache_ptr + ks_idx, mask=tile_mask, other=0.0
+            ).to(tl.float32)
+            K = (K_load.to(tl.float32) * k_tok_scale[None, :]).to(Q.dtype)
+        elif K_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 K = K_load
             else:
@@ -1079,7 +1305,17 @@ def kernel_unified_attention_3d(
             other=0.0,
         )
 
-        if V_load.dtype.is_fp8():
+        if USE_PER_TOKEN_HEAD_SCALES:
+            vs_idx = (
+                physical_block_idx * stride_vs_blk
+                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                + kv_head_idx * stride_vs_head
+            )
+            v_tok_scale = tl.load(
+                v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0.0
+            ).to(tl.float32)
+            V = (V_load.to(tl.float32) * v_tok_scale[:, None]).to(Q.dtype)
+        elif V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 V = V_load
             else:
@@ -1452,8 +1688,14 @@ def reduce_segments(
     HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int, ACTIVE segments
     USE_FP8: tl.constexpr,  # bool
+    SEG_STRIDE: tl.constexpr,  # int, segment dim of the buffers; when the
+    # buffers are sized by a capacity policy (e.g. gfx906 decode 256) this
+    # exceeds NUM_SEGMENTS_PER_SEQ and the address math must use it.
+    # 0 (default) = buffers are sized exactly NUM_SEGMENTS_PER_SEQ.
+    SEG_ARANGE: tl.constexpr,  # int, next_power_of_2(SEG_STRIDE); the host
+    # passes it because tl.arange needs a power-of-2 bound.
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -1469,20 +1711,25 @@ def reduce_segments(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
+    SEG_STRIDE_C: tl.constexpr = SEG_STRIDE
+    SEG_ARANGE_C: tl.constexpr = SEG_ARANGE
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
-    # create masks for subsequent loads
+    # create masks for subsequent loads; tl.arange needs a power-of-2 range,
+    # so the host passes SEG_ARANGE = next_pow2(SEG_STRIDE); everything else
+    # masks by NUM_SEGMENTS_PER_SEQ / act_num_segments.
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+    seg_idx = tl.arange(0, SEG_ARANGE_C)
+    segm_mask = (seg_idx < NUM_SEGMENTS_PER_SEQ) & (
+        seg_idx < tl.full([SEG_ARANGE], act_num_segments, dtype=tl.int32)
     )
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
 
     # load segment maxima
     segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        query_token_idx.to(tl.int64) * (num_query_heads * SEG_STRIDE_C)
+        + query_head_idx * SEG_STRIDE_C
+        + seg_idx
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
@@ -1495,9 +1742,9 @@ def reduce_segments(
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
         query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
+        * (num_query_heads * SEG_STRIDE_C * HEAD_SIZE_PADDED)
+        + query_head_idx * (SEG_STRIDE_C * HEAD_SIZE_PADDED)
+        + seg_idx[:, None] * HEAD_SIZE_PADDED
         + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
     )
     segm_output = tl.load(
@@ -1618,20 +1865,33 @@ def unified_attention(
         causal = True
     assert q_descale is None, "Q scales not supported"
 
+    # S81: int8_per_token_head KV caches are supported (tile-wise dequant with
+    # the per-(token, head) scales, plus the HIP int8 inner loop for the tuned
+    # shape). The other per-token-head / INT4 / R-SWA / chunked paths remain
+    # unimplemented in this fork.
+    use_per_token_head_scales = kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+    if use_per_token_head_scales:
+        assert k_scale_cache is not None and v_scale_cache is not None, (
+            "int8_per_token_head needs k_scale_cache / v_scale_cache"
+        )
     if (
         rswa_prefix_lens is not None
         or rswa_window is not None
         or chunk_lookback != -1
         or mm_prefix_clamp_sliding_window
-        or k_scale_cache is not None
-        or v_scale_cache is not None
-        or kv_quant_mode not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR)
+        or (
+            (k_scale_cache is not None or v_scale_cache is not None)
+            and not use_per_token_head_scales
+        )
+        or kv_quant_mode
+        not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR,
+                KVQuantMode.INT8_PER_TOKEN_HEAD)
     ):
         # Per-tensor FP8 needs no new plumbing: its scales arrive through
         # the k_descale / v_descale args above, as before the refactor.
         raise NotImplementedError(
             "The gfx906 Triton unified-attention fork does not implement "
-            "R-SWA, chunked attention, per-token-head/INT4 KV caches, or "
+            "R-SWA, chunked attention, INT4 KV caches, or "
             f"mm-prefix sliding-window clamping (kv_quant_mode={kv_quant_mode}, "
             f"chunk_lookback={chunk_lookback}, rswa_window={rswa_window})."
         )
@@ -1791,6 +2051,7 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            **_per_token_head_kwargs(k_scale_cache, v_scale_cache),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
@@ -1823,6 +2084,8 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_segments,
+            SEG_STRIDE=segm_output.shape[2],
+                SEG_ARANGE=triton.next_power_of_2(segm_output.shape[2]),
             USE_FP8=output_scale is not None,
         )
 
@@ -1869,6 +2132,157 @@ def unified_attention(
             triton.next_power_of_2(head_size),
             q.device,
         )
+        # PREFILL-LCTX (S56) WP3: HIP inner-loop bypass for the single-sequence
+        # long-context prefill. The gate list mirrors the kernel's TORCH_CHECKs
+        # and the decode-side use_hip_inner checks (stride/type/layout); the
+        # decode BLOCK_M/BLOCK_Q conditions are intentionally absent -- the
+        # kernel's grid (ceil(q_len/2), kv_heads, segments) is q_len-generic.
+        # Anything that differs falls through to the Triton 3D launch
+        # unchanged, and reduce_segments is shared by both producers.
+        # S81: int8_per_token_head prefill runs the same split-KV shape but on
+        # the int8 (v_dot4) inner loop, which reads K/V straight out of the
+        # quantized page. The Triton 3D kernel below is the fallback (it
+        # dequantizes tile-wise itself).
+        if use_per_token_head_scales and _kvint8_inner_gate(
+            q, k, v, num_kv_heads, head_size, block_size, block_table,
+            seqused_k, cu_seqlens_q, segm_output, num_seqs, causal,
+            not torch.cuda.is_current_stream_capturing(),
+        ):
+            logger.info_once(
+                "gfx906 int8-KV prefill inner loop enabled: head=%d, "
+                "block_size=%d, segments=%d", head_size, block_size,
+                num_segments)
+            torch.ops._rocm_C.gfx906_attnd_decode_inner_kvint8(
+                segm_output,
+                segm_max,
+                segm_expsum,
+                q,
+                k,
+                v,
+                k_scale_cache,
+                v_scale_cache,
+                block_table,
+                seqused_k,
+                cu_seqlens_q,
+                softmax_scale,
+                num_segments,
+                True,
+                (max_seqlen_k + num_segments * 16 - 1) // (num_segments * 16),
+            )
+            reduce_segments[(q.shape[0], num_query_heads)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_seqs=num_seqs,
+                num_query_heads=num_query_heads,
+                out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                TILE_SIZE=TILE_SIZE_PREFILL,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=BLOCK_Q,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                SEG_STRIDE=segm_output.shape[2],
+                SEG_ARANGE=triton.next_power_of_2(segm_output.shape[2]),
+                USE_FP8=output_scale is not None,
+            )
+            return
+        use_prefill_hip_inner = (
+            _prefill_hip_inner_env()
+            and causal
+            and num_seqs == 1
+            and q.shape[0] >= 16
+            and kv_quant_mode == KVQuantMode.NONE
+            and q.dtype == torch.float16
+            and k.dtype == q.dtype
+            and v.dtype == q.dtype
+            and head_size == 256
+            and block_size >= 16
+            and block_size % 16 == 0
+            and num_queries_per_kv == 6
+            and q.stride(2) == 1
+            and q.stride(1) == head_size
+            and k.stride(3) == 1
+            and v.stride(3) == 1
+            # Single-KV-head ranks leave the head stride degenerate; the
+            # hybrid cache packs K|V per token.
+            and (num_kv_heads == 1 or k.stride(2) == head_size)
+            and (num_kv_heads == 1 or v.stride(2) == head_size)
+            and k.stride(1) >= head_size
+            and k.stride(1) % 8 == 0
+            and v.stride(1) == k.stride(1)
+            and k.stride(0) % 8 == 0
+            and v.stride(0) == k.stride(0)
+            and block_table.dtype == torch.int32
+            and seqused_k.dtype == torch.int32
+            and cu_seqlens_q.dtype == torch.int32
+            and segm_output.dtype in (torch.float32, torch.float16)
+            and segm_output.stride(3) == 1
+            and segm_output.stride(2) == head_size
+            and not torch.cuda.is_current_stream_capturing()
+            and _hip_inner_available()
+        )
+        if use_prefill_hip_inner:
+            torch.ops._rocm_C.gfx906_attnd_decode_inner(
+                segm_output,
+                segm_max,
+                segm_expsum,
+                q,
+                k,
+                v,
+                block_table,
+                seqused_k,
+                cu_seqlens_q,
+                softmax_scale,
+                num_segments,
+                True,
+                # Compile-time trip-count hint (buckets inside the op).
+                (max_seqlen_k + num_segments * 16 - 1) // (num_segments * 16),
+                k_descale,
+                v_descale,
+            )
+            reduce_segments[(q.shape[0], num_query_heads)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_seqs=num_seqs,
+                num_query_heads=num_query_heads,
+                out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                TILE_SIZE=TILE_SIZE_PREFILL,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=BLOCK_Q,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                SEG_STRIDE=segm_output.shape[2],
+                SEG_ARANGE=triton.next_power_of_2(segm_output.shape[2]),
+                USE_FP8=output_scale is not None,
+            )
+            return
+        if _prefill_hip_inner_env():
+            # The env asked for the HIP kernel but the gate refused it. Layout
+            # misses are never intended, so surface them once instead of
+            # silently paying the ~2x Triton kernel (H1, S62).
+            _mismatch = _hip_inner_layout_mismatch(
+                q, k, v, num_kv_heads, head_size, segm_output,
+                block_table, seqused_k, cu_seqlens_q
+            )
+            if _mismatch is not None:
+                logger.info_once(
+                    "gfx906 prefill HIP inner loop skipped: layout condition "
+                    f"'{_mismatch}' does not hold; falling back to the Triton "
+                    "3D kernel."
+                )
         _launch_split_kv(
             segm_output,
             segm_max,
@@ -1952,6 +2366,7 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            **_per_token_head_kwargs(k_scale_cache, v_scale_cache),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
@@ -2070,6 +2485,8 @@ def unified_attention(
                 query_start_len_ptr=cu_seqlens_q,
                 BLOCK_Q=BLOCK_Q,
                 NUM_SEGMENTS_PER_SEQ=num_segments,
+                SEG_STRIDE=softmax_segm_output.shape[2],
+                SEG_ARANGE=triton.next_power_of_2(softmax_segm_output.shape[2]),
                 USE_FP8=output_scale is not None,
             )
             return
@@ -2083,6 +2500,76 @@ def unified_attention(
         # arithmetic is bit-identical to the descale-free form). The gate
         # list mirrors the kernel's TORCH_CHECKs; anything else falls
         # through to the Triton 3D kernel unchanged.
+        # S81: decode (and MTP verify, which is decode-shaped) on the int8 KV
+        # cache goes through the int8 inner loop when the layout matches.
+        use_kvint8_inner = (
+            _decode_hip_inner_env()
+            and gfx906_sched
+            and sliding_window_val == 0
+            and not use_mm_prefix
+            and not use_qq_bias
+            and not use_alibi_slopes
+            and sinks is None
+            and softcap == 0
+            and output_scale is None
+            and BLOCK_M == 16
+            and BLOCK_Q == 2
+            and num_queries_per_kv == 6
+            and (num_kv_heads == 1 or k.stride(2) == head_size)
+            and (num_kv_heads == 1 or v.stride(2) == head_size)
+            and softmax_segm_output.stride(3) == 1
+            and not is_batch_invariant
+            and _kvint8_inner_gate(
+                q, k, v, num_kv_heads, head_size, block_size, block_table,
+                seqused_k, cu_seqlens_q, softmax_segm_output, num_seqs, causal,
+                True,
+            )
+        )
+        if use_kvint8_inner:
+            logger.info_once(
+                "gfx906 int8-KV decode inner loop enabled: head=%d, "
+                "block_size=%d, segments=%d", head_size, block_size,
+                num_segments)
+            torch.ops._rocm_C.gfx906_attnd_decode_inner_kvint8(
+                softmax_segm_output,
+                softmax_segm_max,
+                softmax_segm_expsum,
+                q,
+                k,
+                v,
+                k_scale_cache,
+                v_scale_cache,
+                block_table,
+                seqused_k,
+                cu_seqlens_q,
+                softmax_scale,
+                num_segments,
+                True,
+                (max_seqlen_k + num_segments * 16 - 1) // (num_segments * 16),
+            )
+            reduce_segments[(q.shape[0], num_query_heads)](
+                output_ptr=out,
+                segm_output_ptr=softmax_segm_output,
+                segm_max_ptr=softmax_segm_max,
+                segm_expsum_ptr=softmax_segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_seqs=num_seqs,
+                num_query_heads=num_query_heads,
+                out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                TILE_SIZE=TILE_SIZE_DECODE,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=BLOCK_Q,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                SEG_STRIDE=softmax_segm_output.shape[2],
+                SEG_ARANGE=triton.next_power_of_2(softmax_segm_output.shape[2]),
+                USE_FP8=output_scale is not None,
+            )
+            return
         use_hip_inner = (
             _decode_hip_inner_env()
             and gfx906_sched
@@ -2164,9 +2651,23 @@ def unified_attention(
                 query_start_len_ptr=cu_seqlens_q,
                 BLOCK_Q=BLOCK_Q,
                 NUM_SEGMENTS_PER_SEQ=num_segments,
+                SEG_STRIDE=softmax_segm_output.shape[2],
+                SEG_ARANGE=triton.next_power_of_2(softmax_segm_output.shape[2]),
                 USE_FP8=output_scale is not None,
             )
             return
+        if _decode_hip_inner_env() and gfx906_sched:
+            # See the prefill-side note above (H1, S62).
+            _mismatch = _hip_inner_layout_mismatch(
+                q, k, v, num_kv_heads, head_size, softmax_segm_output,
+                block_table, seqused_k, cu_seqlens_q
+            )
+            if _mismatch is not None:
+                logger.info_once(
+                    "gfx906 decode HIP inner loop skipped: layout condition "
+                    f"'{_mismatch}' does not hold; falling back to the Triton "
+                    "3D kernel."
+                )
         _launch_split_kv(
             softmax_segm_output,
             softmax_segm_max,

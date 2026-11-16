@@ -790,6 +790,15 @@ class RocmPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
+        # DTK 26.10: hipHostMalloc stops working after the model weights are
+        # resident (every later request, even 1 MiB, returns
+        # hipErrorOutOfMemory while the device still has >20 GiB free). The
+        # UVA path in vllm/v1/worker/gpu/buffer_utils.py then cannot allocate
+        # its pinned staging buffers. Setting VLLM_DCU_NO_PIN_MEMORY=1 makes
+        # vLLM take the NonUvaBuffer fallback (pageable host buffer + explicit
+        # copy) instead of failing the engine.
+        if os.environ.get("VLLM_DCU_NO_PIN_MEMORY", "0") == "1":
+            return False
         if in_wsl():
             version = _get_wsl_kernel_version()
             if version is None or version < (4, 19, 121):

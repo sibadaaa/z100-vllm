@@ -6,6 +6,7 @@
 
 #include "rocm/bf16_emu_gemv.h"
 #include "rocm/fp8_emu_gemm.h"
+#include "rocm/sdot4_pc.h"
 #include "rocm/w8a8_sdot4.h"
 
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
@@ -72,3 +73,17 @@ void gfx906_attnd_decode_inner(
     int64_t num_segments, bool delayed_merge, int64_t tps_hint,
     std::optional<torch::Tensor> k_descale,
     std::optional<torch::Tensor> v_descale);
+
+// S81: the int8_per_token_head sibling of the op above. Same signature plus
+// the two per-(token, head) scale caches; the KV page is
+// (blocks, nkv, block_size, 2 * (head + pad)) with an inline fp32 scale after
+// each head's data. Q is fp16 and quantized per (token, head) inside the
+// kernel prologue, matching the write path.
+void gfx906_attnd_decode_inner_kvint8(
+    torch::Tensor& segm_output, torch::Tensor& segm_max,
+    torch::Tensor& segm_expsum, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, torch::Tensor& k_scale_cache,
+    torch::Tensor& v_scale_cache, torch::Tensor& block_tables,
+    torch::Tensor& seq_lens, torch::Tensor& cu_query_lens, double scale,
+    int64_t num_segments, bool delayed_merge, int64_t tps_hint,
+    int64_t seg_stride);

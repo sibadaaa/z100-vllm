@@ -88,12 +88,13 @@ if __name__ == "__main__":
         ``"This file should not be included when either TORCH_STABLE_ONLY or
         TORCH_TARGET_VERSION is defined."``
 
-        The only thing the include contributes is ``#define __DTK_ARCH__``
-        (DTK's hipify renames ``__CUDA_ARCH__`` to ``__DTK_ARCH__`` in the
-        generated code). Expand it in place, without the header's
-        ``TORCH_TARGET_VERSION`` guard, so the generated tree builds with both
-        stable and regular extensions. Behaviour is otherwise byte-for-byte
-        identical.
+        The only thing the include contributes is the arch/version macro set.
+        DTK's hipify renames ``__CUDA_ARCH__`` to ``__DTK_ARCH__`` (torch 2.13
+        renames it to ``__FPT_DTK_ARCH__`` instead) and the generated code also
+        tests ``DTK_VERSION`` / ``FPT_DTK_VERSION``, so define both spellings.
+        Expand it in place, without the header's ``TORCH_TARGET_VERSION``
+        guard, so the generated tree builds with both stable and regular
+        extensions. Behaviour is otherwise byte-for-byte identical.
         """
         marker = "#include <ATen/dtk_macros.h>"
         replacement = (
@@ -103,8 +104,11 @@ if __name__ == "__main__":
             "// fail with #error, yet __DTK_ARCH__ itself is still needed.\n"
             "#if defined(USE_ROCM)\n"
             "#define __DTK_ARCH__ 520\n"
+            "#define __FPT_DTK_ARCH__ 520\n"
             "#define DTK_VERSION 11800\n"
             "#define DTKRT_VERSION 11080\n"
+            "#define FPT_DTK_VERSION 11800\n"
+            "#define FPT_DTKRT_VERSION 11080\n"
             "#endif"
         )
         for root, _dirs, files in os.walk(args.output_dir):

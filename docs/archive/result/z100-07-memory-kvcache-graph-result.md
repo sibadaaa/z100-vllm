@@ -769,9 +769,9 @@ docker exec z100-serve bash -lc 'pkill -f "vllm.entrypoints.cli.main"'
   `s7-eager.log`、`s7-graph.log`、`s7-matrix-cudagraph-none.log`、`s7-matrix-compile-none.log`、
   `s7-compare-cg-off-nocompile.log`、`s7-compare-compile-nocg.log`、`s7-compare-nocompile-native{,2}.log`、
   `s7-prompts-eager-multi.log`、`s7-serve.log`；补装轮子在 `pip-wheels/`
-- 本步脚本（仓库）：[`tools/dcu/s7_env.sh`](../../tools/dcu/s7_env.sh)、
-  [`tools/dcu/s7_usercustomize.py`](../../tools/dcu/s7_usercustomize.py)、
-  [`tools/dcu/s7_gate.sh`](../../tools/dcu/s7_gate.sh)、
-  [`tools/dcu/s7_compile_matrix.sh`](../../tools/dcu/s7_compile_matrix.sh)、
-  [`tools/dcu/s7_compare.sh`](../../tools/dcu/s7_compare.sh)、
-  [`tools/dcu/s7_prompts.sh`](../../tools/dcu/s7_prompts.sh)
+- 本步脚本（仓库）：`s7_env.sh`、
+  `s7_usercustomize.py`、
+  `s7_gate.sh`、
+  `s7_compile_matrix.sh`、
+  `s7_compare.sh`、
+  `s7_prompts.sh`

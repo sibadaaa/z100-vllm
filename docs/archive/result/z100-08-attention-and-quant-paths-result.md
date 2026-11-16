@@ -1073,10 +1073,10 @@ docker exec -d z100-s8 bash -lc '
   - `vllm/model_executor/layers/quantization/{awq.py:36-49/125-141/305-355, gptq.py:174-191, moe_wna16.py:415-432/506-521}`
   - `vllm/config/model.py:1560-1575`（`_verify_quantization` 的 override 探测循环，调用点）
   - `vllm/platforms/hygon_dtk.py:329-345`（bf16 设备探针）、`:408-415`（`gfx906_bf16_enabled`）
-- 本步脚本（仓库）：[`tools/dcu/s8_env.sh`](../../tools/dcu/s8_env.sh)、
-  [`tools/dcu/s8_path_probe.py`](../../tools/dcu/s8_path_probe.py)、
-  [`tools/dcu/s8_quant_probe.py`](../../tools/dcu/s8_quant_probe.py)、
-  [`tools/dcu/s8_int8_gfx906_check.py`](../../tools/dcu/s8_int8_gfx906_check.py)
+- 本步脚本（仓库）：`s8_env.sh`、
+  `s8_path_probe.py`、
+  `s8_quant_probe.py`、
+  `s8_int8_gfx906_check.py`
 - 本步原始日志（全部在 `/mnt/game/port/s8/`）：
   `s8-path-probe.log`、`s8-quant-probe.log`（修复前）、`s8-quant-probe-AFTER.log`（修复后）、
   `s8-serve-8k.log`（8K 门禁，1055+ 行，含 DEBUG）、`s8-serve-int8-27b.log`（27B 尝试 + 停摆）、

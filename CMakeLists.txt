@@ -1542,6 +1542,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/fp8_emu_gemm.cu"
     "csrc/rocm/bf16_emu_gemv.cu"
     "csrc/rocm/attnd_inner.hip"
+    "csrc/rocm/attnd_inner_kvint8.hip"
+    "csrc/rocm/sdot4_pc.hip"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/attention.cu")

@@ -2,7 +2,7 @@
 
 > 归档时间：2026-10-10（边做边写）
 > 执行者：子 agent（S14e）
-> 对应任务书：[`tools/dcu/s14e_taskbook.md`](../../tools/dcu/s14e_taskbook.md)
+> 对应任务书：[`tools/dcu/s14e_taskbook.md`](../../../tools/dcu/s14e_taskbook.md)
 > 状态：🔄 进行中
 > 原始数据：`/mnt/game/s14e/**`；日志 `/mnt/game/s14e/hostlogs/**`
 
