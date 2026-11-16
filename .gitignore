@@ -164,6 +164,10 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-dtk2604
+.venv-dtk2610
+.dtk2610/
+.tools/
 env/
 venv/
 ENV/
