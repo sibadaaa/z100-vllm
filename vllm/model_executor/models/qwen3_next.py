@@ -118,6 +118,17 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# S60 WP0 (diagnostic, default off): dump per-KV-block attention mass for the
+# full-attention layers so the sparse stop-loss gate can be answered offline.
+# Zero effect on the production path when the env var is unset.
+_s60_probe_enabled = os.getenv("VLLM_S60_MASS_PROBE", "0").lower() in {
+    "1", "true", "yes", "on"}
+
+if _s60_probe_enabled:
+    from vllm.v1.attention.ops.s60_mass_probe import observe as _s60_probe_observe
+else:
+    _s60_probe_observe = None
+
 # S45 zero-fill audit: same switch as gdn_linear_attn's
 # ENABLE_QWEN35_EMPTY_CORE_ATTN_OUT -- torch.empty for core_attn_out is only
 # safe when the core op writes every position (no padded tail).
@@ -1394,6 +1405,7 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.layer_idx = extract_layer_index(prefix)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -1519,6 +1531,9 @@ class Qwen3NextAttention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+
+        if _s60_probe_enabled:
+            _s60_probe_observe(self.layer_idx, q, k, self.scaling, positions)
 
         attn_output = self.attn(q, k, v)
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -80,6 +81,16 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# S100b: stop only at block boundaries when the Mamba backend cannot export a
+# checkpoint inside the chunk.  gfx906 runs the triton GDN prefill backend, so
+# the flashinfer in-chunk path is unavailable and the partial-tail hash stop
+# costs a full extra forward pass (~0.35-0.49 s/request at 512-8192 tokens)
+# while only buying sub-block prefix reuse.  Set 0 to drop that stop; the
+# block-aligned stops are unaffected.  Default 1 keeps upstream behaviour.
+_MAMBA_PARTIAL_TAIL_SPLIT = os.environ.get(
+    "VLLM_GFX906_MAMBA_PARTIAL_TAIL_SPLIT", "1"
+).strip().lower() not in ("0", "false", "off", "no")
 
 
 class Scheduler(SchedulerInterface):
@@ -591,7 +602,11 @@ class Scheduler(SchedulerInterface):
                 self.hash_block_size,
                 self.use_eagle_block_drop,
             )
-            if self.mamba_partial_cache_hit and not use_internal_checkpoint
+            if (
+                self.mamba_partial_cache_hit
+                and _MAMBA_PARTIAL_TAIL_SPLIT
+                and not use_internal_checkpoint
+            )
             else 0
         )
         junction = request.shared_prefix_boundary

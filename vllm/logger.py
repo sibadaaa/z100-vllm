@@ -139,13 +139,24 @@ LogScope = Literal["process", "global", "local"]
 
 
 def _should_log_with_scope(scope: LogScope) -> bool:
-    """Decide whether to log based on scope."""
+    """Decide whether to log based on scope.
+
+    Falls back to True when the parallel-state import is not safely
+    completable (e.g. a bare probe process resolving the platform mid-import);
+    a scoped log line must never abort module import.
+    """
     if scope == "global":
-        from vllm.distributed.parallel_state import is_global_first_rank
+        try:
+            from vllm.distributed.parallel_state import is_global_first_rank
+        except ImportError:
+            return True
 
         return is_global_first_rank()
     if scope == "local":
-        from vllm.distributed.parallel_state import is_local_first_rank
+        try:
+            from vllm.distributed.parallel_state import is_local_first_rank
+        except ImportError:
+            return True
 
         return is_local_first_rank()
     return True

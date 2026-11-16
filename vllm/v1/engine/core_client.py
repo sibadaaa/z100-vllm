@@ -397,15 +397,36 @@ class InprocClient(EngineCoreClient):
         # otherwise. The callback must not reference self, or self would stay
         # reachable and the finalizer would never run.
         self._finalizer = weakref.finalize(self, self.engine_core.shutdown)
+        # PREFILL-LCTX (S56): created lazily on the running loop by
+        # _ensure_async_lock; serializes the threaded engine step with the
+        # async add/abort entry points.
+        self._async_step_lock: asyncio.Lock | None = None
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
 
+    # PREFILL-LCTX (S56): one engine step can run for a minute or more on a
+    # long-context prefill chunk. Running it inline froze the API server's
+    # event loop for the whole step (health/metrics/new connections starve;
+    # metrics logging coalesced over 41 min in the 256k multi-turn probe),
+    # which long-conversation clients experience as a dead service. Run the
+    # step on a worker thread instead. The lock keeps the historical
+    # single-threaded invariant that add/abort never interleave with a step
+    # (they now wait for the step boundary, as they effectively did before),
+    # while everything else on the loop stays live.
+    def _ensure_async_lock(self) -> asyncio.Lock:
+        if self._async_step_lock is None:
+            self._async_step_lock = asyncio.Lock()
+        return self._async_step_lock
+
     async def get_output_async(self) -> EngineCoreOutputs:
+        lock = self._ensure_async_lock()
         while True:
-            outputs = self.get_output()
+            async with lock:
+                outputs = await asyncio.get_running_loop().run_in_executor(
+                    None, self.get_output)
             if (
                 outputs.outputs
                 or outputs.utility_output
@@ -426,14 +447,16 @@ class InprocClient(EngineCoreClient):
         self.engine_core.add_request(req, request_wave)
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        self.add_request(request)
+        async with self._ensure_async_lock():
+            self.add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
-        self.abort_requests(request_ids)
+        async with self._ensure_async_lock():
+            self.abort_requests(request_ids)
 
     def shutdown(self) -> None:
         self.resources.engine_dead = True

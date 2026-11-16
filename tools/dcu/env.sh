@@ -58,27 +58,73 @@ for _dcu_cxx in /usr/include/c++/*; do
 done
 unset _dcu_cxx _dcu_inc
 
+# 2b. Linker search path for libstdc++. DTK's dcc/clang default to the newest
+#     gcc installation they find (gcc 12 here), but this host only ships the
+#     libstdc++.so development symlink under gcc 11, so HIP compiler
+#     detection fails with "ld.lld: error: unable to find library -lstdc++".
+for _dcu_libdir in /usr/lib/gcc/x86_64-linux-gnu/*; do
+  [ -e "${_dcu_libdir}/libstdc++.so" ] || continue
+  case ":${LIBRARY_PATH}:" in
+    *":${_dcu_libdir}:"*) ;;
+    *) export LIBRARY_PATH="${LIBRARY_PATH:+${LIBRARY_PATH}:}${_dcu_libdir}" ;;
+  esac
+done
+unset _dcu_libdir
+
 # 3. GCN arch: read the KFD topology instead of trusting DTK's amdsmi, which
 #    can report gfx18446744073709551615. Setting this also avoids
 #    initializing a HIP context while importing vLLM (Ray workers).
 #    gfx_target_version 90106 == gfx906 == Z100.
+#
+#    After a host reboot the KFD nodes appear seconds after multi-user.target
+#    (hycu probes each board in turn), so the first read can see no GPU nodes
+#    at all.  Leaving VLLM_DCU_GCN_ARCH unset here is NOT silent: it feeds
+#    vLLM's compile-cache hash (envs.compile_factors), so a boot that raced
+#    the driver lands on a different torch_aot_compile/<hash> directory and
+#    may silently load a stale graph (S89 incident, 2026-11-12: decode fell
+#    to the ~36x-slow Triton block-scaled path, 2.5 s/token).  So: retry
+#    while the arch is unreadable, and -- when VLLM_DCU_REQUIRE_ARCH=1 --
+#    abort the shell instead of continuing with an unknown arch.  Probes and
+#    A/B scripts that source this file without a serving boot keep the old
+#    warn-and-continue behaviour.
 if [ -z "${VLLM_DCU_GCN_ARCH:-}" ]; then
-  _dcu_ver=""
-  _dcu_uniform=1
-  for _dcu_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
-    [ -e "${_dcu_props}" ] || continue
-    _dcu_v="$(sed -n 's/^gfx_target_version //p' "${_dcu_props}" 2>/dev/null)"
-    # CPU nodes report gfx_target_version 0.
-    [ -n "${_dcu_v}" ] && [ "${_dcu_v}" != "0" ] || continue
-    if [ -n "${_dcu_ver}" ] && [ "${_dcu_v}" != "${_dcu_ver}" ]; then
-      _dcu_uniform=0
+  _dcu_arch_tries="${VLLM_DCU_ARCH_WAIT_TRIES:-30}"
+  _dcu_arch_wait="${VLLM_DCU_ARCH_WAIT_SECS:-2}"
+  while :; do
+    _dcu_ver=""
+    _dcu_uniform=1
+    for _dcu_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+      [ -e "${_dcu_props}" ] || continue
+      _dcu_v="$(sed -n 's/^gfx_target_version //p' "${_dcu_props}" 2>/dev/null)"
+      # CPU nodes report gfx_target_version 0.
+      [ -n "${_dcu_v}" ] && [ "${_dcu_v}" != "0" ] || continue
+      if [ -n "${_dcu_ver}" ] && [ "${_dcu_v}" != "${_dcu_ver}" ]; then
+        _dcu_uniform=0
+      fi
+      _dcu_ver="${_dcu_v}"
+    done
+    # Uniform 90106 -> resolved; mixed/other arches are answered as-is below.
+    if [ "${_dcu_uniform}" = "1" ] && [ "${_dcu_ver}" = "90106" ]; then
+      export VLLM_DCU_GCN_ARCH=gfx906
+      break
     fi
-    _dcu_ver="${_dcu_v}"
+    # Any non-empty answer (e.g. a future non-Z100 node) is not a "topology
+    # not ready" miss; hand it to the caller instead of spinning.
+    [ -n "${_dcu_ver}" ] && break
+    _dcu_arch_tries=$((_dcu_arch_tries - 1))
+    [ "${_dcu_arch_tries}" -le 0 ] && break
+    echo "[dcu] KFD topology not ready (no GPU node); retrying" \
+         "(${_dcu_arch_tries} left, ${_dcu_arch_wait}s)" >&2
+    sleep "${_dcu_arch_wait}"
   done
-  if [ "${_dcu_uniform}" = "1" ] && [ "${_dcu_ver}" = "90106" ]; then
-    export VLLM_DCU_GCN_ARCH=gfx906
-  fi
   unset _dcu_ver _dcu_uniform _dcu_props _dcu_v
+  unset _dcu_arch_tries _dcu_arch_wait
+  if [ -z "${VLLM_DCU_GCN_ARCH:-}" ] && [ "${VLLM_DCU_REQUIRE_ARCH:-0}" = "1" ]; then
+    echo "[dcu] FATAL: VLLM_DCU_GCN_ARCH unresolved (KFD topology never" \
+         "became ready); refusing to boot with a compile-cache-shifting" \
+         "arch. Wait for the hycu driver, or set VLLM_DCU_GCN_ARCH=gfx906." >&2
+    return 1 2>/dev/null || exit 1
+  fi
 fi
 
 # 4. Triton: DTK ships ld.lld under its LLVM tree.

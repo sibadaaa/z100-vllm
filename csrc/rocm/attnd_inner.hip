@@ -141,15 +141,18 @@ attnd_inner_decode_kernel(
   // the fetch stream is continuous and the write/read sides never touch the
   // same buffer, so ONE barrier per tile suffices. Unit (row r, 16-B unit
   // cu) lives at r*32 + ((cu + r) & 31).
-  __shared__ uint4 k_lds[2][kTile * kRowUnits];
-  __shared__ uint4 v_lds[2][kTile * kRowUnits];
+  __shared__ uint4 k_lds[2 * kTile * kRowUnits];
+  __shared__ uint4 v_lds[2 * kTile * kRowUnits];
   const uint4 zero4 = zero_uint4();
-  const int st_row = tid >> 4;         // staging: token-major lane map
-  const int st_cu0 = (tid & 15) * 2;   // first uint4 unit of this lane's pair
+  const int st_row = tid >> 3;         // 32 tokens x 4 uint4 per lane
+  const int st_cu0 = (tid & 7) * 4;
+  const int st_half = st_row >> 4;
+  const int st_rr = st_row & 15;
 
   const int j_lo = seg * tiles_per_seg;
   const int j_hi = min((seg + 1) * tiles_per_seg,
                        (seq_len + kTile - 1) / kTile);
+  // S77 T1: 32 keys per iteration, one Q read each. See wp1 台账.
 
   float m_run = -INFINITY;
   float l_run = 0.0f;
@@ -157,167 +160,201 @@ attnd_inner_decode_kernel(
 #pragma unroll
   for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
 
-  // Q row: all 32 uint4 units of this lane's row, streamed from L2/L1 (the
-  // same address broadcasts to the whole 16-lane phase - 4 tags/inst).
   const uint4* q4 = reinterpret_cast<const uint4*>(
       query + ((size_t)token_abs * num_query_heads + head) * (kHead / 2));
 
-  // Software-pipelined staging: tile j's K/V loads are issued while tile
-  // j-1 is still being computed; the LDS write at the bottom of iteration j
-  // only waits for data already in flight. B832: tiles ride an incremental
-  // (page id, in-page token offset) cursor - one block-table read per page
-  // instead of per tile, no division in the loop.
-  const int tpp = kv_block_size >> 4;  // tiles per page (block_size % 16 == 0)
+  const int tpp = kv_block_size >> 4;
   const float scale_eff =
       scale * (k_descale ? k_descale[kvh * k_descale_stride] : 1.0f);
-  uint4 kreg0, kreg1, vreg0, vreg1;
+
+  // Two-half page cursor, kept in tokens (matches the per-tile walk).
   int page_idx = j_lo / tpp;
-  int page_off = (j_lo - page_idx * tpp) * kTile;
-  int page_next = block_tables[page_idx];
-  int off_next = page_off;
+  int off_a = (j_lo - page_idx * tpp) * kTile;
+  int page_a = block_tables[page_idx];
+  int off_b = off_a + kTile;
+  int page_b = page_a;
+  if (off_b >= kv_block_size) {
+    off_b -= kv_block_size;
+    if (j_lo + 1 < j_hi) page_b = block_tables[page_idx + 1];
+  }
+
+  uint4 kreg0, kreg1, kreg2, kreg3, vreg0, vreg1, vreg2, vreg3;
+
+  // stage the first group of 32 tokens
   {
-    const bool ok0 = j_lo * kTile + st_row < seq_len;
-    const uint4* ksrc0 = reinterpret_cast<const uint4*>(
-        key_cache +
-        ((size_t)page_next * kv_page_stride + (size_t)kvh * kv_head_stride +
-         (size_t)(page_off + st_row) * kv_token_stride) /
-            2);
-    const uint4* vsrc0 = reinterpret_cast<const uint4*>(
-        value_cache +
-        ((size_t)page_next * kv_page_stride + (size_t)kvh * kv_head_stride +
-         (size_t)(page_off + st_row) * kv_token_stride) /
-            2);
-    kreg0 = ok0 ? ksrc0[st_cu0] : zero4;
-    kreg1 = ok0 ? ksrc0[st_cu0 + 1] : zero4;
-    vreg0 = ok0 ? vsrc0[st_cu0] : zero4;
-    vreg1 = ok0 ? vsrc0[st_cu0 + 1] : zero4;
-    // stage tile j_lo before its compute
-    k_lds[(j_lo & 1)][lds_slot(st_row, st_cu0)] = kreg0;
-    k_lds[(j_lo & 1)][lds_slot(st_row, st_cu0 + 1)] = kreg1;
-    v_lds[(j_lo & 1)][lds_slot(st_row, st_cu0)] = vreg0;
-    v_lds[(j_lo & 1)][lds_slot(st_row, st_cu0 + 1)] = vreg1;
+    const int pg = st_half ? page_b : page_a;
+    const int of = st_half ? off_b : off_a;
+    const bool ok = j_lo * kTile + st_row < seq_len;
+    const uint4* ksrc = reinterpret_cast<const uint4*>(
+        key_cache + ((size_t)pg * kv_page_stride +
+                     (size_t)kvh * kv_head_stride +
+                     (size_t)(of + st_rr) * kv_token_stride) / 2);
+    const uint4* vsrc = reinterpret_cast<const uint4*>(
+        value_cache + ((size_t)pg * kv_page_stride +
+                       (size_t)kvh * kv_head_stride +
+                       (size_t)(of + st_rr) * kv_token_stride) / 2);
+    const int r = st_row * kRowUnits;
+    kreg0 = ok ? ksrc[st_cu0 + 0] : zero4;
+    kreg1 = ok ? ksrc[st_cu0 + 1] : zero4;
+    kreg2 = ok ? ksrc[st_cu0 + 2] : zero4;
+    kreg3 = ok ? ksrc[st_cu0 + 3] : zero4;
+    vreg0 = ok ? vsrc[st_cu0 + 0] : zero4;
+    vreg1 = ok ? vsrc[st_cu0 + 1] : zero4;
+    vreg2 = ok ? vsrc[st_cu0 + 2] : zero4;
+    vreg3 = ok ? vsrc[st_cu0 + 3] : zero4;
+    k_lds[r + ((lds_f0(st_cu0 + 0) + st_row) & (kRowUnits - 1))] = kreg0;
+    k_lds[r + ((lds_f0(st_cu0 + 1) + st_row) & (kRowUnits - 1))] = kreg1;
+    k_lds[r + ((lds_f0(st_cu0 + 2) + st_row) & (kRowUnits - 1))] = kreg2;
+    k_lds[r + ((lds_f0(st_cu0 + 3) + st_row) & (kRowUnits - 1))] = kreg3;
+    v_lds[r + ((lds_f0(st_cu0 + 0) + st_row) & (kRowUnits - 1))] = vreg0;
+    v_lds[r + ((lds_f0(st_cu0 + 1) + st_row) & (kRowUnits - 1))] = vreg1;
+    v_lds[r + ((lds_f0(st_cu0 + 2) + st_row) & (kRowUnits - 1))] = vreg2;
+    v_lds[r + ((lds_f0(st_cu0 + 3) + st_row) & (kRowUnits - 1))] = vreg3;
     __syncthreads();
   }
-  for (int j = j_lo; j < j_hi; ++j) {
-    const int token_base = j * kTile;
-    const int cur = j & 1;
-    const int nxt = (j + 1) & 1;
 
-    // ---- issue tile j+1's staging loads (in flight during compute) ----
-    // Advance the page cursor by one tile; crossing a page boundary pulls
-    // the next block-table entry (uniform branch, taken 1/(B/16) tiles).
-    // The increment and the load are kept in separate statements: this
-    // toolchain has miscompiled pre-increment expressions feeding the same
-    // loop-carried scalar (off-by-one page pull, seen in the ISA).
-    if (j + 1 < j_hi) {
-      off_next += kTile;
-      if (off_next >= kv_block_size) {
-        off_next -= kv_block_size;
+  for (int j = j_lo; j < j_hi; j += 2) {
+    const bool has_h1 = (j + 1 < j_hi);
+    const int jn = j + 2;
+    if (jn < j_hi) {
+      off_a += 2 * kTile;
+      if (off_a >= kv_block_size) {
+        off_a -= kv_block_size;
         ++page_idx;
-        page_next = block_tables[page_idx];
+        page_a = block_tables[page_idx];
+      }
+      off_b = off_a + kTile;
+      page_b = page_a;
+      if (off_b >= kv_block_size) {
+        off_b -= kv_block_size;
+        page_b = block_tables[page_idx + 1];
       }
     }
-    const bool st_ok =
-        (j + 1) * kTile + st_row < seq_len && j + 1 < j_hi;
-    const uint4* ksrc = reinterpret_cast<const uint4*>(
-        key_cache +
-        ((size_t)page_next * kv_page_stride + (size_t)kvh * kv_head_stride +
-         (size_t)(off_next + st_row) * kv_token_stride) /
-            2);
-    const uint4* vsrc = reinterpret_cast<const uint4*>(
-        value_cache +
-        ((size_t)page_next * kv_page_stride + (size_t)kvh * kv_head_stride +
-         (size_t)(off_next + st_row) * kv_token_stride) /
-            2);
-    kreg0 = st_ok ? ksrc[st_cu0] : zero4;
-    kreg1 = st_ok ? ksrc[st_cu0 + 1] : zero4;
-    vreg0 = st_ok ? vsrc[st_cu0] : zero4;
-    vreg1 = st_ok ? vsrc[st_cu0 + 1] : zero4;
 
-    // ---- QK^T: one 256-deep dot2 chain, K row from buf[cur] ----
-    const uint4* krow = k_lds[cur] + t * kRowUnits;
-    float s = 0.0f;
+    // ---- one Q read feeds two independent score chains ----
+    const int r0 = t;
+    const int r1 = kTile + t;
+    const uint4* krow0 = k_lds + r0 * kRowUnits;
+    const uint4* krow1 = k_lds + r1 * kRowUnits;
+    float sa = 0.0f, sb = 0.0f;
 #pragma unroll 4
-    for (int c = 0; c < kRowUnits; ++c) {  // 32 x uint4 = 256 fp16
-      const uint4 kv = krow[lds_slot(t, c) - t * kRowUnits];
+    for (int c = 0; c < kRowUnits; ++c) {
       const uint4 qv = q4[c];
-      s = dot2(qv.x, kv.x, s);
-      s = dot2(qv.y, kv.y, s);
-      s = dot2(qv.z, kv.z, s);
-      s = dot2(qv.w, kv.w, s);
-    }
-    s *= scale_eff;
-    if (!row_valid || token_base + t > bound) s = -INFINITY;
-
-    // ---- row max over the row's 16 lanes: 4-step XOR butterfly ----
-    float mt = s;
-#pragma unroll
-    for (int off = 1; off < 16; off <<= 1)
-      mt = fmaxf(mt, __shfl_xor(mt, off, 16));
-
-    const float mn = fmaxf(m_run, mt) > -INFINITY ? fmaxf(m_run, mt) : 0.0f;
-    const float alpha = __expf(m_run - mn);
-    const float p = __expf(s - mn);
-    m_run = mn;
-
-    if (kDelayMerge) {
-      l_run = l_run * alpha + p;
-    } else {
-      float lj = p;
-#pragma unroll
-      for (int off = 1; off < 16; off <<= 1)
-        lj += __shfl_xor(lj, off, 16);
-      l_run = l_run * alpha + lj;
+      {
+        const uint4 kv = krow0[(lds_f0(c) + r0) & (kRowUnits - 1)];
+        sa = dot2(qv.x, kv.x, sa);
+        sa = dot2(qv.y, kv.y, sa);
+        sa = dot2(qv.z, kv.z, sa);
+        sa = dot2(qv.w, kv.w, sa);
+      }
+      {
+        const uint4 kv = krow1[(lds_f0(c) + r1) & (kRowUnits - 1)];
+        sb = dot2(qv.x, kv.x, sb);
+        sb = dot2(qv.y, kv.y, sb);
+        sb = dot2(qv.z, kv.z, sb);
+        sb = dot2(qv.w, kv.w, sb);
+      }
     }
 
-#pragma unroll
-    for (int i = 0; i < 16; ++i) acc[i] *= alpha;
-
-    // ---- PV: gather the row's 16 weights (indexed shuffles), fp32 FMA ----
     const int gbase = tid & ~(16 - 1);
-    float pr[16];
-#pragma unroll
-    for (int j2 = 0; j2 < kTile; ++j2)
-      pr[j2] = __shfl(p, gbase | j2, 16);
+#define S77_HALF(H, S_IN, RV0)                                                \
+  {                                                                           \
+    const int token_base = (j + (H)) * kTile;                                  \
+    float sh = (S_IN) * scale_eff;                                            \
+    if (!row_valid || token_base + t > bound) sh = -INFINITY;                  \
+    float mt = sh;                                                            \
+    _Pragma("unroll") for (int off = 1; off < 16; off <<= 1) mt =              \
+        fmaxf(mt, __shfl_xor(mt, off, 16));                                    \
+    const float mn = fmaxf(m_run, mt) > -INFINITY ? fmaxf(m_run, mt) : 0.0f;    \
+    const float alpha = __expf(m_run - mn);                                    \
+    const float p = __expf(sh - mn);                                           \
+    m_run = mn;                                                               \
+    if (kDelayMerge) {                                                        \
+      l_run = l_run * alpha + p;                                              \
+    } else {                                                                  \
+      float lj = p;                                                           \
+      _Pragma("unroll") for (int off = 1; off < 16; off <<= 1) lj =            \
+          lj + __shfl_xor(lj, off, 16);                                        \
+      l_run = l_run * alpha + lj;                                             \
+    }                                                                         \
+    _Pragma("unroll") for (int i = 0; i < 16; ++i) acc[i] *= alpha;            \
+    float pr[16];                                                             \
+    _Pragma("unroll") for (int j2 = 0; j2 < kTile; ++j2) pr[j2] =              \
+        __shfl(p, gbase | j2, 16);                                            \
+    _Pragma("unroll 2") for (int j2 = 0; j2 < kTile; ++j2) {                   \
+      const int rv = (RV0) + j2;                                              \
+      const int bv = rv * kRowUnits;                                          \
+      const uint4 va = v_lds[bv + ((lds_f0(t * 2) + rv) & (kRowUnits - 1))];   \
+      const uint4 vb =                                                        \
+          v_lds[bv + ((lds_f0(t * 2 + 1) + rv) & (kRowUnits - 1))];            \
+      const float w = pr[j2];                                                 \
+      float2 f;                                                               \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&va.x));            \
+      acc[0] = fmaf(w, f.x, acc[0]);                                          \
+      acc[1] = fmaf(w, f.y, acc[1]);                                          \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&va.y));            \
+      acc[2] = fmaf(w, f.x, acc[2]);                                          \
+      acc[3] = fmaf(w, f.y, acc[3]);                                          \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&va.z));            \
+      acc[4] = fmaf(w, f.x, acc[4]);                                          \
+      acc[5] = fmaf(w, f.y, acc[5]);                                          \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&va.w));            \
+      acc[6] = fmaf(w, f.x, acc[6]);                                          \
+      acc[7] = fmaf(w, f.y, acc[7]);                                          \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.x));            \
+      acc[8] = fmaf(w, f.x, acc[8]);                                          \
+      acc[9] = fmaf(w, f.y, acc[9]);                                          \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.y));            \
+      acc[10] = fmaf(w, f.x, acc[10]);                                        \
+      acc[11] = fmaf(w, f.y, acc[11]);                                        \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.z));            \
+      acc[12] = fmaf(w, f.x, acc[12]);                                        \
+      acc[13] = fmaf(w, f.y, acc[13]);                                        \
+      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.w));            \
+      acc[14] = fmaf(w, f.x, acc[14]);                                        \
+      acc[15] = fmaf(w, f.y, acc[15]);                                        \
+    }                                                                         \
+  }
+    S77_HALF(0, sa, 0)
+    if (has_h1) S77_HALF(1, sb, kTile)
+#undef S77_HALF
 
-#pragma unroll 2
-    for (int j2 = 0; j2 < kTile; ++j2) {
-      const uint4 va = v_lds[cur][lds_slot(j2, t * 2)];
-      const uint4 vb =
-          v_lds[cur][lds_slot(j2, t * 2 + 1)];
-      const float w = pr[j2];
-      float2 f;
-      f = __half22float2(*reinterpret_cast<const __half2*>(&va.x));
-      acc[0] = fmaf(w, f.x, acc[0]);
-      acc[1] = fmaf(w, f.y, acc[1]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&va.y));
-      acc[2] = fmaf(w, f.x, acc[2]);
-      acc[3] = fmaf(w, f.y, acc[3]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&va.z));
-      acc[4] = fmaf(w, f.x, acc[4]);
-      acc[5] = fmaf(w, f.y, acc[5]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&va.w));
-      acc[6] = fmaf(w, f.x, acc[6]);
-      acc[7] = fmaf(w, f.y, acc[7]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.x));
-      acc[8] = fmaf(w, f.x, acc[8]);
-      acc[9] = fmaf(w, f.y, acc[9]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.y));
-      acc[10] = fmaf(w, f.x, acc[10]);
-      acc[11] = fmaf(w, f.y, acc[11]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.z));
-      acc[12] = fmaf(w, f.x, acc[12]);
-      acc[13] = fmaf(w, f.y, acc[13]);
-      f = __half22float2(*reinterpret_cast<const __half2*>(&vb.w));
-      acc[14] = fmaf(w, f.x, acc[14]);
-      acc[15] = fmaf(w, f.y, acc[15]);
+    // ---- stage the next 32-key group into the single buffer ----
+    // No register prefetch: it would need 8 live uint4 across the compute and
+    // pushes the kernel to vgpr 128 + spill. The exposed latency is covered by
+    // the other resident CTA (2 CTA/CU). K lands first, then V, so at most four
+    // uint4 are transient.
+    __syncthreads();
+    if (jn < j_hi) {
+      const int pg = st_half ? page_b : page_a;
+      const int of = st_half ? off_b : off_a;
+      const bool st_ok = jn * kTile + st_row < seq_len;
+      const int r = st_row * kRowUnits;
+      const uint4* ksrc = reinterpret_cast<const uint4*>(
+          key_cache + ((size_t)pg * kv_page_stride +
+                       (size_t)kvh * kv_head_stride +
+                       (size_t)(of + st_rr) * kv_token_stride) / 2);
+      const uint4* vsrc = reinterpret_cast<const uint4*>(
+          value_cache + ((size_t)pg * kv_page_stride +
+                         (size_t)kvh * kv_head_stride +
+                         (size_t)(of + st_rr) * kv_token_stride) / 2);
+      kreg0 = st_ok ? ksrc[st_cu0 + 0] : zero4;
+      kreg1 = st_ok ? ksrc[st_cu0 + 1] : zero4;
+      kreg2 = st_ok ? ksrc[st_cu0 + 2] : zero4;
+      kreg3 = st_ok ? ksrc[st_cu0 + 3] : zero4;
+      k_lds[r + ((lds_f0(st_cu0 + 0) + st_row) & (kRowUnits - 1))] = kreg0;
+      k_lds[r + ((lds_f0(st_cu0 + 1) + st_row) & (kRowUnits - 1))] = kreg1;
+      k_lds[r + ((lds_f0(st_cu0 + 2) + st_row) & (kRowUnits - 1))] = kreg2;
+      k_lds[r + ((lds_f0(st_cu0 + 3) + st_row) & (kRowUnits - 1))] = kreg3;
+      vreg0 = st_ok ? vsrc[st_cu0 + 0] : zero4;
+      vreg1 = st_ok ? vsrc[st_cu0 + 1] : zero4;
+      vreg2 = st_ok ? vsrc[st_cu0 + 2] : zero4;
+      vreg3 = st_ok ? vsrc[st_cu0 + 3] : zero4;
+      v_lds[r + ((lds_f0(st_cu0 + 0) + st_row) & (kRowUnits - 1))] = vreg0;
+      v_lds[r + ((lds_f0(st_cu0 + 1) + st_row) & (kRowUnits - 1))] = vreg1;
+      v_lds[r + ((lds_f0(st_cu0 + 2) + st_row) & (kRowUnits - 1))] = vreg2;
+      v_lds[r + ((lds_f0(st_cu0 + 3) + st_row) & (kRowUnits - 1))] = vreg3;
     }
-
-    // ---- drain tile j+1 into buf[nxt]; single barrier makes it visible ----
-    k_lds[nxt][lds_slot(st_row, st_cu0)] = kreg0;
-    k_lds[nxt][lds_slot(st_row, st_cu0 + 1)] = kreg1;
-    v_lds[nxt][lds_slot(st_row, st_cu0)] = vreg0;
-    v_lds[nxt][lds_slot(st_row, st_cu0 + 1)] = vreg1;
     __syncthreads();
   }
 

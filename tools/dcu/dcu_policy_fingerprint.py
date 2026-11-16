@@ -309,6 +309,25 @@ KNOBS: list[dict] = [
         post="fp16_min_m",
         note=">0 overrides _DEFAULT_MIN_M=4096 at gfx906_fp16_prefill.py:86",
     ),
+    # S99 (adopted 2026-11-15): per-channel int8 prefill GEMM + in-op staging.
+    # Read directly in scaled_mm/gfx906_fp8.py (not via vllm/envs.py), so these
+    # are `envs=False`: the fingerprint takes the raw environment value.
+    dict(
+        name="VLLM_DCU_PREFILL_INT8_PC",
+        kind="bool",
+        default=False,
+        src="scaled_mm/gfx906_fp8.py:_INT8_PC_ENABLED",
+        envs=False,
+        note="int8 prefill arm; default off, production env turns it on",
+    ),
+    dict(
+        name="VLLM_DCU_PREFILL_INT8_PC_MIN_M",
+        kind="int_e",
+        default=2048,
+        src="scaled_mm/gfx906_fp8.py:_INT8_PC_MIN_M",
+        envs=False,
+        note="token threshold; decode (M<=12) never reaches it",
+    ),
     dict(
         name="VLLM_DCU_FP16_WS_BYTES",
         kind="int_e",

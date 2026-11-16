@@ -46,6 +46,7 @@ import os
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -108,6 +109,153 @@ _PREFILL_CFG_ENV = "VLLM_DCU_FP8_PREFILL_CFG"
 # path must not pay a getenv per call (the W8A16 route used to read it on every
 # layer of every step, including decode where the value is unused).
 _PREFILL_CFG_RAW = os.environ.get(_PREFILL_CFG_ENV, "0").strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# S99: per-channel int8 prefill GEMM with in-op fp8 staging.
+#
+# Default off.  When enabled (and the loaded extension carries the S99 ops),
+# prefill-shaped calls with a 128x128 block geometry are served by
+# `_rocm_C::fp8_emu_mm_int8_pc` instead of the W8A16 fp8-emulation path; every
+# other call (decode, M < min_m, other block shapes, exempt shapes) falls
+# through to the unchanged W8A16 route -- there is no third branch.
+#
+# Isolation: the decision is on the runtime M, so it has to live inside an
+# opaque custom_op body under torch.compile (S11k), exactly like the existing
+# `fp8_emu_mm_block_w8a16_auto`.  The decode path is structurally unreachable
+# here: `apply_weights` only routes prefill to this function and the M gate
+# (`>= _INT8_PC_MIN_M`) excludes every decode call.
+# ---------------------------------------------------------------------------
+_INT8_PC_ENV = "VLLM_DCU_PREFILL_INT8_PC"
+_INT8_PC_ENABLED = os.environ.get(_INT8_PC_ENV, "0").strip().lower() in (
+    "1", "true", "on")
+_INT8_PC_MIN_M = int(os.environ.get("VLLM_DCU_PREFILL_INT8_PC_MIN_M", "2048"))
+# G-WP1b/G-WP1d exemption table: (N, K) pairs that stay on W8A16.  Empty:
+# attn.k/v (1024x5120) is the only Gate-1d shape below the 70% rule and it is
+# still 20.5 TOPS (M=2048) vs the W8A16 arm's ~12 TF/s, so exempting it would
+# leave performance on the table.  Populate this set (and re-measure) before
+# enabling the switch in production.
+_INT8_PC_EXEMPT: frozenset[tuple[int, int]] = frozenset()
+
+
+def ops_available_int8_pc() -> bool:
+    """Whether the loaded extension carries the S99 per-channel int8 entry."""
+    return hasattr(torch.ops._rocm_C, "fp8_emu_mm_int8_pc")
+
+
+_INT8_PC_AVAILABLE = ops_available_int8_pc()
+
+
+def _int8_pc_eligible(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    out_dtype: torch.dtype,
+) -> bool:
+    """Cheap routing predicate for the S99 arm (runtime values, opaque body).
+
+    ``a`` may be ``[*leading, K]`` here (the fp16-prefill router passes the
+    caller's tensor through), so the token count is ``numel / K`` -- using
+    ``shape[0]`` would silently disable the arm for a ``[1, S, K]`` activation.
+    """
+    return (
+        _INT8_PC_ENABLED
+        and _INT8_PC_AVAILABLE
+        and out_dtype == torch.float16
+        and a.dtype == torch.float16
+        and a.numel() // max(a.shape[-1], 1) >= _INT8_PC_MIN_M
+        and (block_n, block_k) == (128, 128)
+        and w.element_size() == 1
+        and (w.shape[0], w.shape[1]) not in _INT8_PC_EXEMPT
+    )
+
+
+def _fp8_emu_mm_int8_pc_impl(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    w_s: torch.Tensor,
+    lut: torch.Tensor,
+    block_n: int,
+    block_k: int,
+) -> torch.Tensor:
+    """Quantize the activation per-token and issue the S99 op."""
+    x_q, x_s, _ = ops.scaled_int8_quant(a.contiguous(), None, None, symmetric=True)
+    return torch.ops._rocm_C.fp8_emu_mm_int8_pc(
+        x_q, w, w_s, x_s.reshape(-1), lut, None, a.dtype, block_n, block_k
+    )
+
+
+def _int8_pc_prefill(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    block_n: int,
+    block_k: int,
+) -> torch.Tensor | None:
+    """S99 prefill arm for the fp16-materialization router.
+
+    Production prefill does *not* run the W8A16 tile kernel: with
+    ``VLLM_DCU_FP16_PREFILL=auto`` above a per-role M threshold the weight is
+    dequantized to fp16 and rocBLAS runs the GEMM (the S99 design's
+    "insertion point = _apply_block_scaled_mm_w8a16" was written before that
+    route was taken into account).  This helper is called from
+    ``gfx906_fp16_prefill._try_prefill`` right before the materialization, so
+    the int8 arm replaces rocBLAS rather than the emu tile.
+
+    Returns:
+        The ``[M, N]`` output in ``out_dtype`` with the bias folded in, or
+        None when the caller must use the incumbent route.
+
+    """
+    if not _int8_pc_eligible(x, w, block_n, block_k, out_dtype):
+        return None
+    K = x.shape[-1]
+    lut = _device_lut(w.dtype, x.device)
+    out = _fp8_emu_mm_int8_pc_impl(
+        x.reshape(-1, K), w, w_s, lut, block_n, block_k
+    )
+    if bias is not None:
+        out = out + bias.to(dtype=out.dtype)
+    return out.view(*x.shape[:-1], w.shape[0])
+
+
+def _register_fp8_emu_mm_int8_pc_auto() -> None:
+    """``custom_op`` wrapper so the S99 M branch stays opaque to Dynamo."""
+    if hasattr(torch.ops.vllm, "fp8_emu_mm_int8_pc_auto"):
+        return
+
+    @torch.library.custom_op("vllm::fp8_emu_mm_int8_pc_auto", mutates_args=())
+    def fp8_emu_mm_int8_pc_auto(
+        a: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        block_n: int,
+        block_k: int,
+    ) -> torch.Tensor:
+        lut = _device_lut(w.dtype, a.device)
+        if _int8_pc_eligible(a, w, block_n, block_k, a.dtype):
+            return _fp8_emu_mm_int8_pc_impl(a, w, w_s, lut, block_n, block_k)
+        cfg = (
+            _prefill_cfg(a.shape[0], w.shape[0])
+            if a.shape[0] > _GEMV_MAX_M
+            else 0
+        )
+        return _fp8_emu_mm_block_w8a16_impl(
+            a, w, w_s, lut, None, a.dtype, _GEMV_THREADS, cfg, block_n, block_k
+        )
+
+    @fp8_emu_mm_int8_pc_auto.register_fake
+    def _(
+        a: torch.Tensor,
+        w: torch.Tensor,
+        w_s: torch.Tensor,
+        block_n: int,
+        block_k: int,
+    ) -> torch.Tensor:
+        return a.new_empty((a.shape[0], w.shape[0]), dtype=a.dtype)
 
 
 def _prefill_cfg(M: int, N: int) -> int:
@@ -786,6 +934,7 @@ if ops_available_block_quant():
 if hasattr(torch.ops._rocm_C, "fp8_emu_gemm_block_w8a16"):
     _register_fp8_emu_mm_block_w8a16()
     _register_fp8_emu_mm_block_w8a16_auto()
+    _register_fp8_emu_mm_int8_pc_auto()
     _register_gfx906_w8a16_silu_mul_down()
 
 _register_fp8_emu_lut()
@@ -1080,6 +1229,10 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         # LUT lookup and the ``A.shape[0] > _GEMV_MAX_M`` cfg choice are both
         # Python-level on a symbolic M, so tracing them bakes the first hint.
         if torch.compiler.is_compiling():
+            if _INT8_PC_ENABLED:
+                return torch.ops.vllm.fp8_emu_mm_int8_pc_auto(
+                    A, w, w_s, block_n, block_k
+                )
             return torch.ops.vllm.fp8_emu_mm_block_w8a16_auto(
                 A,
                 w,
@@ -1091,6 +1244,8 @@ class Gfx906Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
                 _FORCE_TILE_MIN_M,
             )
         lut = _device_lut(w.dtype, A.device)
+        if _int8_pc_eligible(A, w, block_n, block_k, self.config.out_dtype):
+            return _fp8_emu_mm_int8_pc_impl(A, w, w_s, lut, block_n, block_k)
         # The decode arm always passes cfg 0 (the kernel's auto rule picks the
         # exact-M tile); only the M > GEMV arm looks at the prefill knob, so a
         # decode call must not even evaluate it (no env read on the hot path).
