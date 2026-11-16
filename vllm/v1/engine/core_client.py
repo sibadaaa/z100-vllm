@@ -458,9 +458,6 @@ class InprocClient(EngineCoreClient):
         async with self._ensure_async_lock():
             self.abort_requests(request_ids)
 
-    def shutdown(self) -> None:
-        self.resources.engine_dead = True
-
     def shutdown(self, timeout: float | None = None) -> None:
         if self._finalizer.detach() is not None:
             self.engine_core.shutdown()
@@ -502,22 +499,13 @@ class InprocClient(EngineCoreClient):
     async def reset_mm_cache_async(self) -> None:
         self.reset_mm_cache()
 
-    def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
-        return self.engine_core.reset_prefix_cache(reset_running_requests)
-
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False
     ) -> bool:
         return self.reset_prefix_cache(reset_running_requests)
 
-    def sleep(self, level: int = 1) -> None:
-        self.engine_core.sleep(level)
-
     async def sleep_async(self, level: int = 1) -> None:
         self.sleep(level)
-
-    def wake_up(self, tags: list[str] | None = None) -> None:
-        self.engine_core.wake_up(tags)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
