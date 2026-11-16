@@ -72,9 +72,9 @@ fp32 反量化参考的 `mean_rel_err` 为 **0.000e+00 ~ 1.465e-07**（全 finit
 
 | # | 文件 | 位置 | 改动摘要 |
 |---|---|---|---|
-| A | [`tests/kernels/quantization/test_w4a16_kernel_selection.py`](../../tests/kernels/quantization/test_w4a16_kernel_selection.py) | `:19-22`、`:27-34`、`:36-49`、`:86-105` | 期望值补 gfx906 分支；新增 `has_g_idx=True ⇒ ValueError` 用例（锁"明确报错而非静默算错"） |
+| A | [`tests/kernels/quantization/test_w4a16_kernel_selection.py`](../../../tests/kernels/quantization/test_w4a16_kernel_selection.py) | `:19-22`、`:27-34`、`:36-49`、`:86-105` | 期望值补 gfx906 分支；新增 `has_g_idx=True ⇒ ValueError` 用例（锁"明确报错而非静默算错"） |
 | B | [`tools/dcu/env.sh`](../../../tools/dcu/env.sh) | `:12`（注释）、`:108-113`（新第 8 节）、`:119`（banner） | 新增 `VLLM_CACHE_ROOT` 默认导出（`/mnt/game/vllm-cache`，`/mnt/game` 不存在或已被外部设置时不覆盖） |
-| C | [`requirements/dcu.txt`](../../requirements/dcu.txt) | `:50-56` | 从 `common.txt` **重述**（不换版本号）`compressed-tensors == 0.15.0.1`，附"镜像自带 0.14.0.1 不够"的原因注释 |
+| C | [`requirements/dcu.txt`](../../../requirements/dcu.txt) | `:50-56` | 从 `common.txt` **重述**（不换版本号）`compressed-tensors == 0.15.0.1`，附"镜像自带 0.14.0.1 不够"的原因注释 |
 | D | [`tools/dcu/README.md`](../../../tools/dcu/README.md) | `env.sh` 第 6 条 + 新增 `## compressed-tensors must be >= 0.15.0.1`、`## s8b_gate.sh` 两节 | 文档同步 |
 | E | `s8b_fp8_block_probe.py` | 新增 511 行 | FP8 选择面 + 17 组用例数值 sweep + 输入量化核 + 全 kernel 路径 + 计时；**带退出码**（全通过 0） |
 | F | `s8b_gate.sh` | 新增 256 行 | 14 项禁用清单/约定检查 + FP8 数值探针 + W4A16 选择测试；`ALL GREEN` 才 exit 0 |

@@ -13,7 +13,7 @@ S18c 已在内核/op 级证明"`M≥2` 走 tiled GEMM 后成本对 M 平坦"，�
 
 ## 2. 配置与开关
 
-- 开关：`_GEMV_MAX_M`（FP8/INT8 各一），现由 [`vllm/envs.py`](../vllm/envs.py) 声明：
+- 开关：`_GEMV_MAX_M`（FP8/INT8 各一），现由 [`vllm/envs.py`](../../../vllm/envs.py) 声明：
   `VLLM_DCU_FP8_GEMV_MAX_M` / `VLLM_DCU_INT8_GEMV_MAX_M`，**默认 8（= 旧行为）**；
   设为 `1` 时 `M≥2` 走 tiled GEMM，`M=1` 仍走 GEMV（`5120×1536` 上 M=1 的 GEMV 快 30%）。
 - 两个 kernel 模块改为从 `envs` 读取（`gfx906_fp8.py` / `gfx906_sdot4.py`）；`.so` 未改。

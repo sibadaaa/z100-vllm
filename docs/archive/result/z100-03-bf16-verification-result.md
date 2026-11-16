@@ -667,8 +667,8 @@ git status --short
 - [Todolist S3 门禁与全局硬约束](../z100-todolist.md)
 - [S3 设计文档](../design/z100-03-bf16-verification.md)
 - [适配记录与实测证据 §2 bf16 专项](../hygon_z100.md)
-- 代码：[`vllm/platforms/hygon_dtk.py`](../../vllm/platforms/hygon_dtk.py)（`bf16_policy` / `dcu_bf16_probe` / `gfx906_bf16_enabled`）、
-  [`vllm/platforms/rocm.py`](../../vllm/platforms/rocm.py)（`_rocm_supported_dtypes`）、
+- 代码：[`vllm/platforms/hygon_dtk.py`](../../../vllm/platforms/hygon_dtk.py)（`bf16_policy` / `dcu_bf16_probe` / `gfx906_bf16_enabled`）、
+  [`vllm/platforms/rocm.py`](../../../vllm/platforms/rocm.py)（`_rocm_supported_dtypes`）、
   [`tools/dcu/check_bf16.py`](../../../tools/dcu/check_bf16.py)、
   [`tools/dcu/env.sh`](../../../tools/dcu/env.sh)、[`tools/dcu/README.md`](../../../tools/dcu/README.md)
 - 映像：`harbor.sourcefind.cn:5443/dcu/admin/base/custom:vllm018-ubuntu22.04-dtk26.04-gemma4-0413`

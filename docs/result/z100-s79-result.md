@@ -1,7 +1,7 @@
 # S79 结果：sdot4 QK 根因定位 + MIN_CTX 角点 + prefill 各阶段测速
 
 日期：2026-11-10。设计/施工图：
-[`s79-sdot4-qk-revival`](../../design/z100/s79-sdot4-qk-revival/)。
+`s79-sdot4-qk-revival`。
 原始数据：`runs/prefill-lctx/s79/`，过程台账：`.s79/`。
 服务态：生产 argv/env，`.so` = `.s77/rocm_c_release`（md5 `e90b0fdb`），
 源 `csrc/rocm/attnd_inner.hip`（md5 `b93db390`，S77 T1）。

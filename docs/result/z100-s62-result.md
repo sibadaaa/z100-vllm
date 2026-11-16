@@ -1,7 +1,7 @@
 # S62 混合 prefill 与图覆盖 · 结果
 
 日期：2026-11-08。执行依据 `docs/design/z100/s62-mixed-prefill/`（设计图 + 施工图）。
-工作目录 [`.s62/`](../../../.s62/)，原始数据 [`runs/s62/`](../../../runs/s62/)。
+工作目录 .s62/，原始数据 runs/s62/。
 
 ## 0. 结论
 
@@ -124,16 +124,16 @@ token，三个档位一个都没命中。
 
 | 文件 | 内容 |
 |---|---|
-| [`.s62/m-adopt.md`](../../../.s62/m-adopt.md) | M 轨判定台账（含两臂实测） |
-| [`.s62/h-hardening.md`](../../../.s62/h-hardening.md) | H 轨台账（日志 + 分段桶补测） |
-| [`.s62/conc_ttft_probe.py`](../../../.s62/conc_ttft_probe.py) | 并发/混合步探针 |
-| [`.s62/decode_tpot.py`](../../../.s62/decode_tpot.py) | 解码并发基线 |
-| [`.s62/round_audit.py`](../../../.s62/round_audit.py) | 按引擎轮次拆图/非图 |
-| [`.s62/prefill_stages.py`](../../../.s62/prefill_stages.py) | 逐 chunk 分环节测试 |
-| [`.s62/h2_tripcount_sweep.py`](../../../.s62/h2_tripcount_sweep.py) | 分段桶 A/B |
-| [`vllm/v1/attention/ops/triton_unified_attention.py`](../../../vllm/v1/attention/ops/triton_unified_attention.py) | H1 日志（`_hip_inner_layout_mismatch` + 两处 `info_once`） |
-| [`tests/v1/attention/test_gfx906_hip_inner_gate.py`](../../../tests/v1/attention/test_gfx906_hip_inner_gate.py) | H1 单测 7 项 |
-| [`runs/s62/`](../../../runs/s62/) | 全部原始数据 |
+| .s62/m-adopt.md | M 轨判定台账（含两臂实测） |
+| .s62/h-hardening.md | H 轨台账（日志 + 分段桶补测） |
+| .s62/conc_ttft_probe.py | 并发/混合步探针 |
+| .s62/decode_tpot.py | 解码并发基线 |
+| .s62/round_audit.py | 按引擎轮次拆图/非图 |
+| .s62/prefill_stages.py | 逐 chunk 分环节测试 |
+| .s62/h2_tripcount_sweep.py | 分段桶 A/B |
+| [`vllm/v1/attention/ops/triton_unified_attention.py`](../../vllm/v1/attention/ops/triton_unified_attention.py) | H1 日志（`_hip_inner_layout_mismatch` + 两处 `info_once`） |
+| [`tests/v1/attention/test_gfx906_hip_inner_gate.py`](../../tests/v1/attention/test_gfx906_hip_inner_gate.py) | H1 单测 7 项 |
+| runs/s62/ | 全部原始数据 |
 
 ## 6. 运维注记
 

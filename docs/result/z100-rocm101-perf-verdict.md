@@ -1,6 +1,6 @@
 # Z100 ROCm 10.1 性能调优——P0–P2 判读（VERDICT）
 
-> 施工依据：[`docs/design/z100-rocm101-perf-construction.md`](../design/z100-rocm101-perf-construction.md) §6.4/§6.5
+> 施工依据：docs/design/z100-rocm101-perf-construction.md §6.4/§6.5
 > 日期：2026-10-24；run 目录：`/mnt/game/port/perf-runs/20261024-*-E{1,2,3,4}`
 > 信任基线：[`z100-rocm101-perf-baseline-freeze.md`](z100-rocm101-perf-baseline-freeze.md)（B1–B4 未重跑）
 

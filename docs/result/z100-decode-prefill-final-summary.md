@@ -1,8 +1,8 @@
 # Z100 decode / prefill 优化施工总结（v1，2026-10-24）
 
-> 设计图：[`z100-decode-prefill-optimization-design.md`](../design/z100-decode-prefill-optimization-design.md)（DESIGN）
-> 施工图：[`z100-decode-prefill-optimization-construction.md`](../design/z100-decode-prefill-optimization-construction.md)（BUILD）
-> 数据依据：[`z100-dual-prefill-reconciliation-projection.md`](../design/z100-dual-prefill-reconciliation-projection.md)（PROJ）
+> 设计图：`z100-decode-prefill-optimization-design.md`（DESIGN）
+> 施工图：`z100-decode-prefill-optimization-construction.md`（BUILD）
+> 数据依据：`z100-dual-prefill-reconciliation-projection.md`（PROJ）
 > 执行日期：2026-10-24（Asia/Shanghai 22:09 起）；树：`/home/lyh/z100-vllm`，分支 `dtk`，
 > **HEAD `7078b5fe137feeab3750ee243daeaf172dc439d8`**（本会话改动的文件见 §9）。
 > 平台：4×Z100/Z100L（gfx906）、DTK **26.04**、torch 2.11.0、Python 3.10、`Qwen3.8-27B-FP8` + DFlash2 k=7、TP=4、MBT 8192、`max_num_seqs=4`、util 0.85。

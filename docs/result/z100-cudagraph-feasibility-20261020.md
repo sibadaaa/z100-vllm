@@ -5,7 +5,7 @@
 > 方法：**只读**——静态阅读源码/配置/历史归档与运行日志，只读枚举卡信息（`hy-smi` 查询、sysfs、`lspci`、`nm`）。
 > 调研期间**未跑任何 GPU 负载**（无 serve/bench/pytest/微基准/roofline/profiler），**未重启或改动生产服务**，**未修改任何卡配置**。现有生产服务全程在跑。
 > 结论标注：**【实测】**=本机日志/归档或只读命令可直接证实；**【推断】**=由实测事实推导、尚未在本机直接验证。
-> 相关归档：[DTK/gfx906 适配记录](../archive/hygon_z100.md) · [生产部署配方](../archive/海光Z100-生产部署配方.md) · [S14 TP=4/graph](../archive/result/z100-14-27b-tp4-result.md) · [S14c 内存归因](../archive/result/z100-14c-tp4-graph-memory-result.md) · [S14d 可复现性](../archive/result/z100-14d-determinism-result.md) · [S23 O7 复核](z100-fp8-emu-optimization-result.md) · [S20 固定开销](../../.s20/S20_FIXED_COST.md)
+> 相关归档：[DTK/gfx906 适配记录](../archive/hygon_z100.md) · [生产部署配方](../archive/海光Z100-生产部署配方.md) · [S14 TP=4/graph](../archive/result/z100-14-27b-tp4-result.md) · [S14c 内存归因](../archive/result/z100-14c-tp4-graph-memory-result.md) · [S14d 可复现性](../archive/result/z100-14d-determinism-result.md) · [S23 O7 复核](z100-fp8-emu-optimization-result.md) · S20 固定开销
 > 行号约定：代码行号以 2026-10-20 当前工作树为准（工作树含未提交改动，后续行号可能漂移；引用同时给函数/文件名）。
 
 ---

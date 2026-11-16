@@ -1,7 +1,7 @@
 # Z100 B0 基线冻结（WP0.1，门 G4 输入）
 
-> 设计依据：[`z100-decode-prefill-optimization-design.md`](../design/z100-decode-prefill-optimization-design.md)（DESIGN）
-> 施工依据：[`z100-decode-prefill-optimization-construction.md`](../design/z100-decode-prefill-optimization-construction.md)（BUILD）§3.2/§3.3/§4 WP0.1
+> 设计依据：`z100-decode-prefill-optimization-design.md`（DESIGN）
+> 施工依据：`z100-decode-prefill-optimization-construction.md`（BUILD）§3.2/§3.3/§4 WP0.1
 > 属主：A（Lead）。日期：2026-10-24。运行时：4×Z100/Z100L（gfx906）、DTK **26.04**（`DTK-26.04-DCC2602-0317`）、torch **2.11.0**、Python 3.10、TP=4、DFlash2 k=7、`max_num_seqs=4`、util 0.85、`--enforce-eager`。
 > 树：`/home/lyh/z100-vllm`，分支 `dtk`，**HEAD `7078b5fe137feeab3750ee243daeaf172dc439d8`**（未提交改动见 §3）。
 > 结果目录：`.s27/p0/`（`.gitignore` 的 `.s*/` 覆盖）；原始 summary JSON 与 serve 日志同目录。

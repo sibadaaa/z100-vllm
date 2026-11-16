@@ -452,7 +452,7 @@ S23，只有 9 个文件被手工替换；而 1595 ms 那次跑的是 DTK。** �
 “W8A16 kernel 慢”与“ROCm 10.1 rocBLAS 慢”分开。
 
 > 具体执行步骤、门禁与 A/B 矩阵见
-> [`docs/design/z100-rocm101-perf-construction.md`](../design/z100-rocm101-perf-construction.md)。
+> docs/design/z100-rocm101-perf-construction.md。
 
 ---
 

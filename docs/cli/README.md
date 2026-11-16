@@ -65,7 +65,7 @@ vllm serve --help=max
     
     Supported arguments include: `--max-model-len`, `--max-num-batched-tokens`, `--max-num-scheduled-tokens`, `--kv-cache-memory-bytes`, `--safetensors-prefetch-block-size`.
 
-See [vllm serve](./serve.md) for the full reference of all available arguments.
+See vllm serve for the full reference of all available arguments.
 
 ## launch
 
@@ -100,7 +100,7 @@ vllm chat --quick "hi"
 vllm chat --stats
 ```
 
-See [vllm chat](./chat.md) for the full reference of all available arguments.
+See vllm chat for the full reference of all available arguments.
 
 ## complete
 
@@ -120,7 +120,7 @@ vllm complete --quick "The future of AI is"
 vllm complete --stats
 ```
 
-See [vllm complete](./complete.md) for the full reference of all available arguments.
+See vllm complete for the full reference of all available arguments.
 
 ## bench
 
@@ -145,7 +145,7 @@ vllm bench forward \
     --case mix=2048,32*1@4096
 ```
 
-See [vllm bench forward](./bench/forward.md) for the full reference of all available arguments.
+See vllm bench forward for the full reference of all available arguments.
 
 ### latency
 
@@ -160,7 +160,7 @@ vllm bench latency \
     --load-format dummy
 ```
 
-See [vllm bench latency](./bench/latency.md) for the full reference of all available arguments.
+See vllm bench latency for the full reference of all available arguments.
 
 ### serve
 
@@ -176,7 +176,7 @@ vllm bench serve \
     --num-prompts  5
 ```
 
-See [vllm bench serve](./bench/serve.md) for the full reference of all available arguments.
+See vllm bench serve for the full reference of all available arguments.
 
 ### throughput
 
@@ -191,7 +191,7 @@ vllm bench throughput \
     --load-format dummy
 ```
 
-See [vllm bench throughput](./bench/throughput.md) for the full reference of all available arguments.
+See vllm bench throughput for the full reference of all available arguments.
 
 ## collect-env
 
@@ -214,7 +214,7 @@ vllm download-kernels
 vllm download-kernels --dry-run
 ```
 
-See [vllm download-kernels](./download-kernels.md) for the full reference of all available arguments.
+See vllm download-kernels for the full reference of all available arguments.
 
 ## run-batch
 
@@ -238,7 +238,7 @@ vllm run-batch \
     --model meta-llama/Meta-Llama-3-8B-Instruct
 ```
 
-See [vllm run-batch](./run-batch.md) for the full reference of all available arguments.
+See vllm run-batch for the full reference of all available arguments.
 
 ## preload
 
@@ -264,7 +264,7 @@ multi-node and speculative-decoding setups. Tensor, expert and data
 parallelism are supported; pipeline parallelism is rejected at launch.
 
 See [Preload](../features/preload.md) for how it works, cache modes, and
-limitations, and [vllm preload](./preload.md) for the full reference of all
+limitations, and [vllm preload](../features/preload.md) for the full reference of all
 available arguments.
 
 ## More Help

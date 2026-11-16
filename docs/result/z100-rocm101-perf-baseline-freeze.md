@@ -1,6 +1,6 @@
 # Z100 ROCm 10.1 性能基线冻结（WP0.1）
 
-> 施工依据：[`docs/design/z100-rocm101-perf-construction.md`](../design/z100-rocm101-perf-construction.md) §1.1 / §4.1
+> 施工依据：docs/design/z100-rocm101-perf-construction.md §1.1 / §4.1
 > 冻结时间：2026-10-24（本会话）
 > **性质：只读归档。本次没有启动任何服务、没有重跑 B1–B4、没有产生新的性能数字。**
 > run 目录来源：`/home/lyh/vllm-test/llm-engine-probe/runs/`

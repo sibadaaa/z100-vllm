@@ -1,8 +1,8 @@
 # Z100-S63 结果：注意力内核带宽/算力配速
 
 > 执行依据 `docs/design/z100/s63-attn-bwp/`（设计图 + 施工图），2026-11-08。
-> 台账 [`.s63/`](../../../.s63/)（`wp0-verdict.md`、`wp1-wp2-verdict.md`），
-> 原始数据 [`runs/prefill-lctx/s63/`](../../../runs/prefill-lctx/s63/)。
+> 台账 .s63/（`wp0-verdict.md`、`wp1-wp2-verdict.md`），
+> 原始数据 runs/prefill-lctx/s63/。
 > 环境：Z100L ×4（gfx906，60 CU，1.606 GHz），生产栈 Qwen3.8-27B-FP8、TP=4、
 > MTP k=2、MBT 8192；服务 :8000。
 

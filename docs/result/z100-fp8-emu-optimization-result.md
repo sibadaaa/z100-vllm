@@ -1,11 +1,11 @@
 # S23 — Z100 fp16-模拟-fp8 优化结果（O1–O7）
 
-> 执行依据：[`docs/design/z100-fp8-emu-optimization-plan.md`](../design/z100-fp8-emu-optimization-plan.md)
+> 执行依据：docs/design/z100-fp8-emu-optimization-plan.md
 > 调研依据：[`docs/result/z100-fp8-emu-fixed-time-investigation.md`](z100-fp8-emu-fixed-time-investigation.md)
 > 平台：4×海光 DCU Z100（gfx906；DCU0/1 = Z100L@1600 MHz，DCU2/3 = Z100@1319 MHz），TP=4，
 > `--enforce-eager`，DFlash2 k=7，模型 Qwen3.8-27B-FP8
 > 分支：`/home/lyh/z100-vllm`，基线 commit `ab2a89b1a`，基线 `.so` md5 `f205be8f43d3ffb1cfb3c6f093bfab4b`
-> 执行协议与探针口径：[`.s23/S23_EXEC_PROTOCOL.md`](../../.s23/S23_EXEC_PROTOCOL.md)
+> 执行协议与探针口径：.s23/S23_EXEC_PROTOCOL.md
 
 ## 0. 一句话结论
 

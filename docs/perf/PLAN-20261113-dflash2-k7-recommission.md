@@ -5,7 +5,7 @@
 > **现役(不中断)**:pid 201811,:8000,MTP k=2 + FULL_DECODE_ONLY 图 + KV int8
 > (s30c 栈,cmdline 实测 2026-11-13)。
 > **一句话警钟**:specbench 实测 DFlash2 k=7 在新栈上是 **22.7 t/s vs 无投机 36.9 vs
-> MTP k=2 51.6**([specbench/REPORT](../../runs/specbench/REPORT.md))。
+> MTP k=2 51.6**(specbench/REPORT)。
 > **50% 接收率翻不了盘**(§1 的账);本专项同时押注"接收率"与"step 时间"两条腿,
 > 缺一条都是净亏损。
 

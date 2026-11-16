@@ -1,7 +1,7 @@
 # S80 结果：sdot4 收官（真因是宿主取错维度）+ MIN_CTX 8192 落地 + prefill 各阶段测速
 
 日期：2026-11-10 晚。设计/施工图：
-[`s80-sdot4-final-minctx`](../../design/z100/s80-sdot4-final-minctx/)。
+`s80-sdot4-final-minctx`。
 原始数据 `runs/prefill-lctx/s80/`，台账 `.s80/`。
 生产态：argv/env 未改（除 MIN_CTX 一项），`csrc/rocm/attnd_inner.hip`
 md5 `b93db390`、`.so` → `.s77/rocm_c_release`（md5 `e90b0fdb`），两者

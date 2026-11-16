@@ -226,4 +226,4 @@ threat model.
 - `SIGINT`/`SIGTERM` to the `vllm preload` process terminates all daemon
   ranks, which unlinks their sockets and releases the GPU memory.
 
-See [vllm preload](../cli/preload.md) for the full CLI reference.
+See vllm preload for the full CLI reference.

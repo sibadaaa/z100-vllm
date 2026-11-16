@@ -95,7 +95,7 @@ TP=4，`--enforce-eager`，MTP `num_speculative_tokens=2`，`--max-num-batched-t
 | 降权重位宽（INT8/更低精度）换速度 | **带宽叙事仍不成立**；但 INT8 `v_dot4_i32_i8` 已在 **S99 prefill GEMM** 采纳（decode 逐位同） | [`s34-wp7`](../design/z100/s34/z100-s34-wp7-int8-ab.md)、[S99 结果](../result/z100-s99-prefill-int8-pc-gemm-result.md) |
 | 测试对象：eager、MTP k=2、MBT 2048 | 2026-11-15 现生产：FULL_DECODE_ONLY 图 [2,3,6,12]、MTP k=2、MBT 8192、max-model-len 262144 | [`DEPLOY`](../../DEPLOY.md) |
 | 硬件：2×Z100L + 2×Z100 混插 | `hy-smi --showproductname` 实测 **4/4 Z100L** | 2026-10-27 现场 |
-| DFlash2 k=7 是生产配方 | **已退役**：新栈上 22.7 t/s，比无投机 36.9 低 38% | [`specbench`](../../runs/specbench/REPORT.md) |
+| DFlash2 k=7 是生产配方 | **已退役**：新栈上 22.7 t/s，比无投机 36.9 低 38% | specbench |
 
 > 本页 §1 的 219.6 ms 基线、§3 的“不要做”清单仍可用于理解 2026-10-13 的
 > 墙位（fp8 GEMM 44%、AR 22%、GDN 16%）；但做新决策时以三份 2026-10-27
